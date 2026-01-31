@@ -135,5 +135,5 @@ class TariffSaverConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(config_entry):
         """Return the options flow handler."""
         from .options_flow import TariffSaverOptionsFlowHandler
-
         return TariffSaverOptionsFlowHandler(config_entry)
+
