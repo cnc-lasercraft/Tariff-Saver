@@ -89,17 +89,22 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        slots = _active_slots(self.coordinator)
+        active = _active_slots(self.coordinator)
+        baseline = _baseline_slots(self.coordinator)
+        baseline_map = {s.start: s.price_chf_per_kwh for s in baseline} if baseline else {}
+
         return {
             "tariff_name": self.coordinator.tariff_name,
             "baseline_tariff_name": self.coordinator.baseline_tariff_name,
-            "slot_count": len(slots),
+            "slot_count": len(active),
             "slots": [
                 {
                     "start": s.start.isoformat(),
                     "price_chf_per_kwh": s.price_chf_per_kwh,
+                    # ✅ important for ApexCharts baseline series + header state
+                    "baseline_chf_per_kwh": baseline_map.get(s.start),
                 }
-                for s in slots
+                for s in active
             ],
         }
 
@@ -180,6 +185,7 @@ class TariffSaverSavingsNext24hSensor(CoordinatorEntity[TariffSaverCoordinator],
         savings = 0.0
         matched = 0
         for s in active:
+            # keep your original behavior (includes 0 baseline if present)
             base = base_map.get(s.start)
             if base is None:
                 continue
@@ -273,7 +279,13 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
     def extra_state_attributes(self) -> dict[str, Any]:
         slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
         baseline = _baseline_slots(self.coordinator)
-        baseline_map = {s.start: s.price_chf_per_kwh for s in baseline} if baseline else {}
+
+        # Optional: ignore 0 baseline values for comparisons
+        baseline_map = (
+            {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
+            if baseline
+            else {}
+        )
 
         return {
             "tariff_name": self.coordinator.tariff_name,
@@ -294,23 +306,18 @@ class _TariffSaverActualBase(CoordinatorEntity[TariffSaverCoordinator], SensorEn
     _attr_has_entity_name = True
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "CHF"
-    _attr_should_poll = True  # we want periodic updates from store
+    _attr_should_poll = True  # periodic update from store
 
     def __init__(self, hass: HomeAssistant, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self.hass = hass
         self.entry = entry
-        self._store: TariffSaverStore | None = None
 
     def _totals(self) -> tuple[float, float, float] | None:
         store = _get_store(self.hass, self.entry)
         if not store:
             return None
         return store.compute_today_totals()
-
-    def update(self) -> None:
-        # called by polling; just refresh internal state by reading store
-        self._store = _get_store(self.hass, self.entry)
 
 
 class TariffSaverActualCostTodaySensor(_TariffSaverActualBase):
@@ -322,6 +329,7 @@ class TariffSaverActualCostTodaySensor(_TariffSaverActualBase):
     def __init__(self, hass: HomeAssistant, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(hass, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_cost_today_chf"
+        self._attr_icon = "mdi:currency-chf"
 
     @property
     def native_value(self) -> float | None:
@@ -341,6 +349,7 @@ class TariffSaverActualBaselineCostTodaySensor(_TariffSaverActualBase):
     def __init__(self, hass: HomeAssistant, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(hass, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_baseline_cost_today_chf"
+        self._attr_icon = "mdi:currency-chf"
 
     @property
     def native_value(self) -> float | None:
@@ -355,11 +364,12 @@ class TariffSaverActualSavingsTodaySensor(_TariffSaverActualBase):
     """Actual savings today vs baseline, CHF."""
 
     _attr_name = "Actual savings today"
-    _attr_state_class = None  # can go up/down depending on day & tariffs
+    _attr_state_class = None  # can go up/down
 
     def __init__(self, hass: HomeAssistant, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(hass, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_savings_today_chf"
+        self._attr_icon = "mdi:piggy-bank-outline"
 
     @property
     def native_value(self) -> float | None:
