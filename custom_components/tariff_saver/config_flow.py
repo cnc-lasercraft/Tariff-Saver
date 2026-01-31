@@ -21,7 +21,7 @@ MODE_MYEKZ = "myekz"
 class TariffSaverConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Tariff Saver."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         self._name: str | None = None
