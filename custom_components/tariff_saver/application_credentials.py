@@ -12,6 +12,6 @@ async def async_get_authorization_server(hass: HomeAssistant) -> AuthorizationSe
     once we copy them from the EKZ documentation (authorize + token URLs).
     """
     return AuthorizationServer(
-        authorize_url="TODO_AUTHORIZE_URL",
-        token_url="TODO_TOKEN_URL",
+        authorize_url="https://login.ekz.ch/auth/realms/myEKZ/protocol/openid-connect/auth",
+        token_url="https://login.ekz.ch/auth/realms/myEKZ/protocol/openid-connect/token",
     )
