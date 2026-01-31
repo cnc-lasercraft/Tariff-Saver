@@ -66,7 +66,13 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
         errors: dict[str, str] = {}
 
         if user_input is None:
-            schema = vol.Schema({vol.Required("tariff_name"): str})
+            schema = vol.Schema(
+                {
+                    vol.Required("tariff_name"): str,
+                    vol.Optional("baseline_tariff_name", default="electricity_standard"): str,
+                }
+            )
+
             return self.async_show_form(step_id="public", data_schema=schema, errors=errors)
 
         tariff_name = user_input["tariff_name"].strip()
