@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
+
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers import selector
@@ -39,34 +40,33 @@ def _parse_hhmm(value: str) -> str:
 
 
 class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle options for Tariff Saver."""
+    """Handle options for Tariff Saver.
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
-        self._errors: dict[str, str] = {}
+    IMPORTANT: no custom __init__ → use HA's base OptionsFlow initializer.
+    """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
-        if user_input is not None:
-            self._errors = {}
+        errors: dict[str, str] = {}
 
+        if user_input is not None:
             # Validate publish_time
             try:
                 user_input[CONF_PUBLISH_TIME] = _parse_hhmm(user_input[CONF_PUBLISH_TIME])
             except vol.Invalid:
-                self._errors[CONF_PUBLISH_TIME] = "invalid_time"
+                errors[CONF_PUBLISH_TIME] = "invalid_time"
 
-            # Validate threshold order
+            # Validate thresholds ordering
             try:
                 t1 = float(user_input[CONF_GRADE_T1])
                 t2 = float(user_input[CONF_GRADE_T2])
                 t3 = float(user_input[CONF_GRADE_T3])
                 t4 = float(user_input[CONF_GRADE_T4])
                 if not (t1 <= t2 <= t3 <= t4):
-                    self._errors[CONF_GRADE_T4] = "threshold_order"
+                    errors[CONF_GRADE_T4] = "threshold_order"
             except Exception:  # noqa: BLE001
-                self._errors[CONF_GRADE_T4] = "threshold_invalid"
+                errors[CONF_GRADE_T4] = "threshold_invalid"
 
-            if not self._errors:
+            if not errors:
                 return self.async_create_entry(title="", data=user_input)
 
         opt = dict(self.config_entry.options)
@@ -96,4 +96,4 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
             }
         )
 
-        return self.async_show_form(step_id="init", data_schema=schema, errors=self._errors)
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
