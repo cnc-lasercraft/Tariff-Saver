@@ -80,7 +80,7 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
             "slots": [
                 {
                     "start": s.start.isoformat(),
-                    "price_chf_per_kwh": round(s.price_chf_per_kwh, 6),
+                    "price_chf_per_kwh": s.price_chf_per_kwh,
                 }
                 for s in slots
             ],
@@ -113,7 +113,7 @@ class TariffSaverPriceNowSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
             else:
                 break
 
-        return round((current or slots[0]).price_chf_per_kwh, 6)
+        return (current or slots[0]).price_chf_per_kwh
 
 
 class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
@@ -131,18 +131,15 @@ class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], Sens
     @property
     def native_value(self) -> float | None:
         slots = _active_slots(self.coordinator)
-        if not slots:
-            return None
-
         now = dt_util.utcnow()
         for s in slots:
             if s.start > now:
-                return round(s.price_chf_per_kwh, 6)
+                return s.price_chf_per_kwh
         return None
 
 
 class TariffSaverSavingsNext24hSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
-    """Estimated savings for next 24h vs baseline (CHF) assuming constant 1 kW load."""
+    """Estimated savings for next 24h vs baseline (CHF), assuming constant 1 kW load."""
 
     _attr_has_entity_name = True
     _attr_name = "Savings next 24h"
@@ -161,7 +158,7 @@ class TariffSaverSavingsNext24hSensor(CoordinatorEntity[TariffSaverCoordinator],
             return None
 
         base_map = {s.start: s.price_chf_per_kwh for s in baseline}
-        kwh_per_slot = 0.25  # 15 minutes
+        kwh_per_slot = 0.25
 
         savings = 0.0
         matched = 0
@@ -174,17 +171,9 @@ class TariffSaverSavingsNext24hSensor(CoordinatorEntity[TariffSaverCoordinator],
 
         return round(savings, 2) if matched else None
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        return {
-            "tariff_name": self.coordinator.tariff_name,
-            "baseline_tariff_name": self.coordinator.baseline_tariff_name,
-            "assumption": "1 kW constant load (0.25 kWh per 15 min)",
-        }
-
 
 class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
-    """Cheapest windows for 30m/1h/2h/3h (based on active price curve)."""
+    """Cheapest windows for 30m / 1h / 2h / 3h."""
 
     _attr_has_entity_name = True
     _attr_name = "Cheapest windows"
@@ -225,10 +214,9 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
                     matched = 0
                     for x in window:
                         base = baseline_map.get(x.start)
-                        if base is None:
-                            continue
-                        save += (base - x.price_chf_per_kwh) * kwh_per_slot
-                        matched += 1
+                        if base is not None:
+                            save += (base - x.price_chf_per_kwh) * kwh_per_slot
+                            matched += 1
                     best_savings = save if matched else None
 
         avg_chf = best_sum / window_slots
@@ -237,21 +225,16 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
         result: dict[str, Any] = {
             "start": best_start.isoformat(),
             "end": best_end.isoformat(),
-            avg_chf = best_sum / window_slots
-            avg_rp = avg_chf * 100
 
-            result: dict[str, Any] = {
-                "start": best_start.isoformat(),
-                "end": best_end.isoformat(),
-                "avg_chf_per_kwh": round(avg_chf, 6),
-    
-                # Mehr Präzision, damit nichts "zu 0.0" rundet:
-                "avg_rp_per_kwh": round(avg_rp, 3),
-    
-                # Rohwerte zum Debuggen (nicht gerundet):
-                "avg_chf_per_kwh_raw": avg_chf,
-                "avg_rp_per_kwh_raw": avg_rp,
-            }
+            # Gerundet (für Anzeige)
+            "avg_chf_per_kwh": round(avg_chf, 6),
+            "avg_rp_per_kwh": round(avg_rp, 3),
+
+            # Rohwerte (Debug / Nachvollziehbarkeit)
+            "avg_chf_per_kwh_raw": avg_chf,
+            "avg_rp_per_kwh_raw": avg_rp,
+        }
+
         if best_savings is not None:
             result["savings_vs_baseline_chf"] = round(best_savings, 2)
 
@@ -259,11 +242,11 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
 
     @property
     def native_value(self) -> float | None:
-        """Use best 1h avg (CHF/kWh) as state so it is never 'unknown' when data exists."""
+        """Use best 1h avg as state (CHF/kWh)."""
         slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
         if not slots:
             return None
-        best_1h = self._best_window(slots, {}, 4)  # 4 * 15min = 1h
+        best_1h = self._best_window(slots, {}, 4)
         return best_1h["avg_chf_per_kwh"] if best_1h else None
 
     @property
