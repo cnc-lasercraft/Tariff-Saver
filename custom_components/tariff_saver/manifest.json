@@ -1,6 +1,7 @@
 {
   "domain": "tariff_saver",
   "name": "Tariff Saver",
+  "dependencies": ["application_credentials", "auth"],
   "config_flow": true,
   "documentation": "https://github.com/cnc-lasercraft/tariff_saver",
   "issue_tracker": "https://github.com/cnc-lasercraft/tariff_saver/issues",
