@@ -3,10 +3,11 @@ from __future__ import annotations
 
 DOMAIN = "tariff_saver"
 
-# Core options / config keys
+# Publish time
 CONF_PUBLISH_TIME = "publish_time"
 DEFAULT_PUBLISH_TIME = "18:15"
 
+# Tariffs (KEEP these names for backward compatibility with config_flow/coordinator)
 CONF_TARIFF_NAME = "tariff_name"
 CONF_BASELINE_TARIFF_NAME = "baseline_tariff_name"
 
@@ -14,7 +15,6 @@ CONF_BASELINE_TARIFF_NAME = "baseline_tariff_name"
 CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
 
 # Grade thresholds (deviation vs daily avg, percent)
-# Grade mapping: 1 (best) ... 5 (worst)
 CONF_GRADE_T1 = "grade_t1_percent"
 CONF_GRADE_T2 = "grade_t2_percent"
 CONF_GRADE_T3 = "grade_t3_percent"
