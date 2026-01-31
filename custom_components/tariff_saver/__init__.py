@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .api import EkzTariffApi
 from .const import DOMAIN
 from .coordinator import TariffSaverCoordinator
 
@@ -14,8 +16,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tariff Saver from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    tariff_name: str = entry.data["tariff_name"]
-    coordinator = TariffSaverCoordinator(hass, tariff_name)
+    session = async_get_clientsession(hass)
+    api = EkzTariffApi(session)
+
+    coordinator = TariffSaverCoordinator(hass, api, config=dict(entry.data))
     await coordinator.async_config_entry_first_refresh()
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
