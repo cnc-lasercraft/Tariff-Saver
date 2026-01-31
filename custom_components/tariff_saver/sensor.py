@@ -15,7 +15,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    CONF_GRADE_THRESHOLDS,
+    DEFAULT_GRADE_THRESHOLDS,
+)
 from .coordinator import TariffSaverCoordinator, PriceSlot
 from .storage import TariffSaverStore
 
@@ -40,6 +44,58 @@ def _get_store(hass: HomeAssistant, entry: ConfigEntry) -> TariffSaverStore | No
     return hass.data.get(DOMAIN, {}).get(f"{entry.entry_id}_store")
 
 
+def _get_grade_thresholds(entry: ConfigEntry) -> list[float]:
+    vals = entry.options.get(CONF_GRADE_THRESHOLDS, DEFAULT_GRADE_THRESHOLDS)
+    if not isinstance(vals, list) or len(vals) != 4:
+        return [float(x) for x in DEFAULT_GRADE_THRESHOLDS]
+    try:
+        t = [float(x) for x in vals]
+        # ensure increasing
+        if not (t[0] < t[1] < t[2] < t[3]):
+            return [float(x) for x in DEFAULT_GRADE_THRESHOLDS]
+        return t
+    except Exception:
+        return [float(x) for x in DEFAULT_GRADE_THRESHOLDS]
+
+
+def _current_slot_start_utc(slots: list[PriceSlot]) -> Any:
+    """Find the current slot start (UTC) using the active slots list."""
+    if not slots:
+        return None
+    now = dt_util.utcnow()
+    current: PriceSlot | None = None
+    for s in slots:
+        if s.start <= now:
+            current = s
+        else:
+            break
+    return (current or slots[0]).start if slots else None
+
+
+def _grade_from_dev(dev_percent: float, t: list[float]) -> int:
+    """Map deviation vs daily avg (percent) to grade 1..5."""
+    t1, t2, t3, t4 = t
+    if dev_percent <= t1:
+        return 1
+    if dev_percent <= t2:
+        return 2
+    if dev_percent < t3:
+        return 3
+    if dev_percent < t4:
+        return 4
+    return 5
+
+
+def _grade_label(g: int) -> str:
+    return {
+        1: "sehr günstig",
+        2: "günstig",
+        3: "durchschnitt",
+        4: "teuer",
+        5: "sehr teuer",
+    }.get(g, "unbekannt")
+
+
 # -------------------------------------------------------------------
 # Setup
 # -------------------------------------------------------------------
@@ -58,6 +114,9 @@ async def async_setup_entry(
             TariffSaverNextPriceSensor(coordinator, entry),
             TariffSaverSavingsNext24hSensor(coordinator, entry),
             TariffSaverCheapestWindowsSensor(coordinator, entry),
+
+            # --- NEW: grade sensor ---
+            TariffSaverTariffGradeNowSensor(coordinator, entry),
 
             # --- NEW: actuals from store ---
             TariffSaverActualCostTodaySensor(hass, coordinator, entry),
@@ -101,7 +160,6 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
                 {
                     "start": s.start.isoformat(),
                     "price_chf_per_kwh": s.price_chf_per_kwh,
-                    # ✅ important for ApexCharts baseline series + header state
                     "baseline_chf_per_kwh": baseline_map.get(s.start),
                 }
                 for s in active
@@ -185,7 +243,6 @@ class TariffSaverSavingsNext24hSensor(CoordinatorEntity[TariffSaverCoordinator],
         savings = 0.0
         matched = 0
         for s in active:
-            # keep your original behavior (includes 0 baseline if present)
             base = base_map.get(s.start)
             if base is None:
                 continue
@@ -213,9 +270,7 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
         baseline_map: dict,
         window_slots: int,
     ) -> dict[str, Any] | None:
-        # ✅ Ignore slots with invalid / unpublished prices (0 CHF/kWh)
         slots = [s for s in slots if s.price_chf_per_kwh > 0]
-
         if len(slots) < window_slots:
             return None
 
@@ -251,12 +306,8 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
         result: dict[str, Any] = {
             "start": best_start.isoformat(),
             "end": best_end.isoformat(),
-
-            # Anzeige-Werte
             "avg_chf_per_kwh": round(avg_chf, 6),
             "avg_rp_per_kwh": round(avg_rp, 3),
-
-            # Rohwerte zum Debuggen
             "avg_chf_per_kwh_raw": avg_chf,
             "avg_rp_per_kwh_raw": avg_rp,
         }
@@ -268,7 +319,6 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
 
     @property
     def native_value(self) -> float | None:
-        """Use best 1h avg as state (CHF/kWh)."""
         slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
         if not slots:
             return None
@@ -279,8 +329,6 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
     def extra_state_attributes(self) -> dict[str, Any]:
         slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
         baseline = _baseline_slots(self.coordinator)
-
-        # Optional: ignore 0 baseline values for comparisons
         baseline_map = (
             {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
             if baseline
@@ -297,16 +345,69 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
         }
 
 
+class TariffSaverTariffGradeNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Tariff grade now (1..5) based on deviation vs daily average."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Tariff grade now"
+    _attr_icon = "mdi:school-outline"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_tariff_grade_now"
+
+    @property
+    def native_value(self) -> int | None:
+        data = self.coordinator.data or {}
+        stats = data.get("stats") or {}
+        dev_map = stats.get("dev_vs_avg_percent") or {}
+
+        slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
+        slot_start = _current_slot_start_utc(slots)
+        if not slot_start:
+            return None
+
+        dev = dev_map.get(slot_start.isoformat())
+        if dev is None:
+            return None
+
+        thresholds = _get_grade_thresholds(self.entry)
+        return _grade_from_dev(float(dev), thresholds)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        stats = data.get("stats") or {}
+        dev_map = stats.get("dev_vs_avg_percent") or {}
+        avg = stats.get("avg_active_chf_per_kwh")
+
+        slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
+        slot_start = _current_slot_start_utc(slots)
+        dev = dev_map.get(slot_start.isoformat()) if slot_start else None
+
+        thresholds = _get_grade_thresholds(self.entry)
+        g = None
+        if dev is not None:
+            g = _grade_from_dev(float(dev), thresholds)
+
+        return {
+            "slot_start_utc": slot_start.isoformat() if slot_start else None,
+            "dev_vs_avg_percent_now": dev,
+            "avg_active_chf_per_kwh": avg,
+            "thresholds_percent": thresholds,
+            "label": _grade_label(g) if g else None,
+        }
+
+
 # -------------------------------------------------------------------
 # NEW: Store-based "actual" sensors
 # -------------------------------------------------------------------
 class _TariffSaverActualBase(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
-    """Base class for store-based sensors (polling)."""
-
     _attr_has_entity_name = True
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "CHF"
-    _attr_should_poll = True  # periodic update from store
+    _attr_should_poll = True
 
     def __init__(self, hass: HomeAssistant, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -321,8 +422,6 @@ class _TariffSaverActualBase(CoordinatorEntity[TariffSaverCoordinator], SensorEn
 
 
 class TariffSaverActualCostTodaySensor(_TariffSaverActualBase):
-    """Actual cost today (dynamic tariff), CHF."""
-
     _attr_name = "Actual cost today"
     _attr_state_class = SensorStateClass.TOTAL
 
@@ -341,8 +440,6 @@ class TariffSaverActualCostTodaySensor(_TariffSaverActualBase):
 
 
 class TariffSaverActualBaselineCostTodaySensor(_TariffSaverActualBase):
-    """Baseline cost today (baseline tariff), CHF."""
-
     _attr_name = "Baseline cost today"
     _attr_state_class = SensorStateClass.TOTAL
 
@@ -361,10 +458,8 @@ class TariffSaverActualBaselineCostTodaySensor(_TariffSaverActualBase):
 
 
 class TariffSaverActualSavingsTodaySensor(_TariffSaverActualBase):
-    """Actual savings today vs baseline, CHF."""
-
     _attr_name = "Actual savings today"
-    _attr_state_class = None  # can go up/down
+    _attr_state_class = None
 
     def __init__(self, hass: HomeAssistant, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(hass, coordinator, entry)
