@@ -70,6 +70,7 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
                 {
                     vol.Required("tariff_name"): str,
                     vol.Optional("baseline_tariff_name", default="electricity_standard"): str,
+                    vol.Optional("publish_time", default=DEFAULT_PUBLISH_TIME): str,  # "HH:MM"
                 }
             )
 
@@ -107,6 +108,7 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
                 "mode": MODE_PUBLIC,
                 "tariff_name": tariff_name,
                 "baseline_tariff_name": baseline_tariff_name,
+                "publish_time": publish_time,
             },
         )
 
