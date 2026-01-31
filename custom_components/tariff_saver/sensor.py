@@ -346,19 +346,55 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
 
 
 class TariffSaverTariffGradeNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
-    """Tariff grade now (1..5) based on deviation vs daily average."""
+    """Tariff grade now (1..5) based on deviation vs daily average.
+
+    State = grade for current 15-min slot (now).
+    Attributes = outlook grades for next 1/2/3/6 hours.
+    """
 
     _attr_has_entity_name = True
-    _attr_name = "Tariff grade now"
+    _attr_name = "Tariff grade"
     _attr_icon = "mdi:school-outline"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self.entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_tariff_grade_now"
+        self._attr_unique_id = f"{entry.entry_id}_tariff_grade"
+
+    def _window_grade(self, hours: int) -> tuple[int | None, float | None, float | None]:
+        """Return (grade, dev_percent, avg_window_price) for the next X hours."""
+        data = self.coordinator.data or {}
+        stats = data.get("stats") or {}
+        avg_day = stats.get("avg_active_chf_per_kwh")
+        if not avg_day or avg_day <= 0:
+            return None, None, None
+
+        slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
+        if not slots:
+            return None, None, None
+
+        now = dt_util.utcnow()
+        end = now + timedelta(hours=hours)
+
+        # Use only published/valid prices (>0)
+        window_prices = [
+            s.price_chf_per_kwh
+            for s in slots
+            if s.price_chf_per_kwh > 0 and s.start >= now and s.start < end
+        ]
+        if not window_prices:
+            return None, None, None
+
+        avg_window = sum(window_prices) / len(window_prices)
+        dev = (avg_window / float(avg_day) - 1.0) * 100.0
+
+        thresholds = _get_grade_thresholds(self.entry)
+        grade = _grade_from_dev(float(dev), thresholds)
+        return grade, float(dev), float(avg_window)
 
     @property
     def native_value(self) -> int | None:
+        """Grade for the current 15-min slot."""
         data = self.coordinator.data or {}
         stats = data.get("stats") or {}
         dev_map = stats.get("dev_vs_avg_percent") or {}
@@ -377,28 +413,45 @@ class TariffSaverTariffGradeNowSensor(CoordinatorEntity[TariffSaverCoordinator],
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        """Explain now-grade + provide outlook grades."""
         data = self.coordinator.data or {}
         stats = data.get("stats") or {}
         dev_map = stats.get("dev_vs_avg_percent") or {}
-        avg = stats.get("avg_active_chf_per_kwh")
+        avg_day = stats.get("avg_active_chf_per_kwh")
 
         slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
         slot_start = _current_slot_start_utc(slots)
-        dev = dev_map.get(slot_start.isoformat()) if slot_start else None
 
+        dev_now = dev_map.get(slot_start.isoformat()) if slot_start else None
         thresholds = _get_grade_thresholds(self.entry)
-        g = None
-        if dev is not None:
-            g = _grade_from_dev(float(dev), thresholds)
+
+        grade_now = None
+        label_now = None
+        if dev_now is not None:
+            grade_now = _grade_from_dev(float(dev_now), thresholds)
+            label_now = _grade_label(grade_now)
+
+        # Outlook windows (avg over window, relative to day's avg)
+        outlook: dict[str, Any] = {}
+        for h in (1, 2, 3, 6):
+            g, dev, avgw = self._window_grade(h)
+            outlook[f"next_{h}h_grade"] = g
+            outlook[f"next_{h}h_dev_vs_avg_percent"] = dev
+            outlook[f"next_{h}h_avg_chf_per_kwh"] = avgw
 
         return {
             "slot_start_utc": slot_start.isoformat() if slot_start else None,
-            "dev_vs_avg_percent_now": dev,
-            "avg_active_chf_per_kwh": avg,
+            "avg_active_chf_per_kwh": avg_day,
             "thresholds_percent": thresholds,
-            "label": _grade_label(g) if g else None,
-        }
 
+            # Now
+            "grade_now": grade_now,
+            "label_now": label_now,
+            "dev_vs_avg_percent_now": dev_now,
+
+            # Outlook
+            **outlook,
+        }
 
 # -------------------------------------------------------------------
 # NEW: Store-based "actual" sensors
