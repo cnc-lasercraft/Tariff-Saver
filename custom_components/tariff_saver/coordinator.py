@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -11,6 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import EkzTariffApi
+from .const import CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +23,12 @@ class PriceSlot:
     price_chf_per_kwh: float
 
 
+def _align_to_15min(dt: datetime) -> datetime:
+    """Align datetime down to 15-min boundary."""
+    minute = (dt.minute // 15) * 15
+    return dt.replace(minute=minute, second=0, microsecond=0)
+
+
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
     """Fetches and stores tariff price curves."""
 
@@ -30,21 +37,27 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         self.api = api
         self.tariff_name: str = config["tariff_name"]
         self.baseline_tariff_name: str | None = config.get("baseline_tariff_name")
+        self.publish_time: str = config.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
+
+        self._last_fetch_date: date | None = None
 
         super().__init__(
             hass,
             _LOGGER,
             name="Tariff Saver",
-            update_interval=timedelta(minutes=15),
+            update_interval=None,  # 👈 only manual/daily trigger refreshes
         )
 
     async def _async_update_data(self) -> dict[str, list[PriceSlot]]:
-        """Fetch active and optional baseline price curves."""
-        now = dt_util.utcnow()
+        """Fetch active and optional baseline price curves (once per day)."""
+        today = dt_util.now().date()
+        if self._last_fetch_date == today:
+            # Already fetched today; return existing data
+            return self.data or {"active": [], "baseline": []}
 
-        # Fetch ~24h with a small buffer
-        start = now - timedelta(minutes=15)
-        end = now + timedelta(hours=24)
+        now = dt_util.utcnow()
+        start = _align_to_15min(now)
+        end = start + timedelta(hours=24)
 
         try:
             raw_active = await self.api.fetch_prices(self.tariff_name, start, end)
@@ -56,7 +69,6 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
 
         data: dict[str, list[PriceSlot]] = {"active": active}
 
-        # Baseline is optional; if it fails, we keep going.
         if self.baseline_tariff_name:
             try:
                 raw_base = await self.api.fetch_prices(self.baseline_tariff_name, start, end)
@@ -67,6 +79,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
         else:
             data["baseline"] = []
 
+        self._last_fetch_date = today
         return data
 
     @staticmethod
@@ -84,11 +97,10 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, list[PriceSlot]]]):
                 continue
 
             dt_start_utc = dt_util.as_utc(dt_start)
-            price = EkzTariffApi.sum_chf_per_kwh(item)
 
+            price = EkzTariffApi.sum_chf_per_kwh(item)
             slots.append(PriceSlot(start=dt_start_utc, price_chf_per_kwh=price))
 
-        # sort + dedup by start
         slots.sort(key=lambda s: s.start)
         dedup: dict[datetime, PriceSlot] = {s.start: s for s in slots}
         return list(dedup.values())
