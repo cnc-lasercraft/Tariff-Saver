@@ -191,7 +191,7 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_cheapest_windows"
 
-    @staticmethod
+        @staticmethod
     def _best_window(
         slots: list[PriceSlot],
         baseline_map: dict,
@@ -209,10 +209,10 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
 
         for i in range(len(slots) - window_slots + 1):
             window = slots[i : i + window_slots]
-            s = sum(x.price_chf_per_kwh for x in window)
+            window_sum = sum(x.price_chf_per_kwh for x in window)
 
-            if s < best_sum:
-                best_sum = s
+            if window_sum < best_sum:
+                best_sum = window_sum
                 best_start = window[0].start
                 best_end = window[-1].start + timedelta(minutes=15)
 
@@ -224,19 +224,24 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
                         if base is not None:
                             save += (base - x.price_chf_per_kwh) * kwh_per_slot
                             matched += 1
-                    best_savings = round(save, 2) if matched else None
+                    best_savings = save if matched else None
 
-        avg = best_sum / window_slots
+        # ⚠️ WICHTIG: hier erst runden, nicht früher
+        avg_chf = best_sum / window_slots
+        avg_rp = avg_chf * 100
+
         result = {
             "start": best_start.isoformat(),
             "end": best_end.isoformat(),
-            "avg_chf_per_kwh": round(avg, 6),
-            "avg_rp_per_kwh": round(avg * 100, 2),
+            "avg_chf_per_kwh": round(avg_chf, 6),
+            "avg_rp_per_kwh": round(avg_rp, 2),
         }
+
         if best_savings is not None:
-            result["savings_vs_baseline_chf"] = best_savings
+            result["savings_vs_baseline_chf"] = round(best_savings, 2)
 
         return result
+
 
     @property
     def native_value(self) -> float | None:
