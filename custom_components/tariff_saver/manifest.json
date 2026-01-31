@@ -1,0 +1,10 @@
+{
+  "domain": "tariff_saver",
+  "name": "Tariff Saver",
+  "config_flow": true,
+  "documentation": "https://github.com/<DEIN_GITHUB_USERNAME>/tariff_saver",
+  "issue_tracker": "https://github.com/<DEIN_GITHUB_USERNAME>/tariff_saver/issues",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "0.0.1"
+}
