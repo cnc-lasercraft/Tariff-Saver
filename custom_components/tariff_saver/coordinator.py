@@ -59,12 +59,10 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._last_fetch_date == today:
             return self.data or {"active": [], "baseline": [], "stats": {}}
 
-        now = dt_util.utcnow()
-        start = _align_to_15min(now)
-        end = start + timedelta(hours=24)
-
         try:
-            raw_active = await self.api.fetch_prices(self.tariff_name, start, end)
+            # 🔹 KEY CHANGE:
+            # Call API WITHOUT start/end → EKZ returns tariffs of the current date (00:00–24:00)
+            raw_active = await self.api.fetch_prices(self.tariff_name)
             active = self._parse_prices(raw_active)
             if not active:
                 raise UpdateFailed(f"No data returned for active tariff '{self.tariff_name}'")
@@ -74,10 +72,14 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         baseline: list[PriceSlot] = []
         if self.baseline_tariff_name:
             try:
-                raw_base = await self.api.fetch_prices(self.baseline_tariff_name, start, end)
+                raw_base = await self.api.fetch_prices(self.baseline_tariff_name)
                 baseline = self._parse_prices(raw_base)
             except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Failed to fetch baseline tariff '%s': %s", self.baseline_tariff_name, err)
+                _LOGGER.warning(
+                    "Failed to fetch baseline tariff '%s': %s",
+                    self.baseline_tariff_name,
+                    err,
+                )
                 baseline = []
 
         stats = self._compute_daily_stats(active, baseline)
