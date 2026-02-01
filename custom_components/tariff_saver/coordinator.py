@@ -7,6 +7,7 @@ from datetime import datetime, date
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -37,19 +38,21 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         hass: HomeAssistant,
         api: EkzTariffApi,
+        entry: ConfigEntry,
         config: dict[str, Any],
-        entry_id: str,
     ) -> None:
         self.hass = hass
         self.api = api
+        self.entry = entry
+
         self.tariff_name: str = config["tariff_name"]
         self.baseline_tariff_name: str | None = config.get("baseline_tariff_name")
         self.publish_time: str = config.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
 
         self._last_fetch_date: date | None = None
 
-        # 🔹 persistent store
-        self.store = TariffSaverStore(hass, entry_id)
+        # ✅ Store korrekt an entry gebunden
+        self.store = TariffSaverStore(hass, entry.entry_id)
 
         super().__init__(
             hass,
@@ -59,18 +62,15 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch active & baseline once per day, then compute daily stats."""
         today = dt_util.now().date()
-
         if self._last_fetch_date == today:
             return self.data or {"active": [], "baseline": [], "stats": {}}
 
-        # load store once per HA runtime
+        # Store einmal laden
         if not self.store.price_slots:
             await self.store.async_load()
 
         try:
-            # API call WITHOUT start/end → full current day
             raw_active = await self.api.fetch_prices(self.tariff_name)
             active = self._parse_prices(raw_active)
             if not active:
@@ -83,7 +83,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             try:
                 raw_base = await self.api.fetch_prices(self.baseline_tariff_name)
                 baseline = self._parse_prices(raw_base)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 _LOGGER.warning(
                     "Failed to fetch baseline tariff '%s': %s",
                     self.baseline_tariff_name,
@@ -91,28 +91,26 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 baseline = []
 
-        # ---------- persist price slots ----------
+        # 🔹 Preise persistent speichern
         active_map = {s.start: s.price_chf_per_kwh for s in active if s.price_chf_per_kwh > 0}
         base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
 
         for start_utc, dyn_price in active_map.items():
             base_price = base_map.get(start_utc)
-            if base_price is None:
-                continue
-            self.store.set_price_slot(start_utc, dyn_price, base_price)
+            if base_price is not None:
+                self.store.set_price_slot(start_utc, dyn_price, base_price)
 
         self.store.trim_price_slots(keep_days=3)
         if self.store.dirty:
             await self.store.async_save()
 
         stats = self._compute_daily_stats(active, baseline)
-
         self._last_fetch_date = today
+
         return {"active": active, "baseline": baseline, "stats": stats}
 
     @staticmethod
     def _parse_prices(raw_prices: list[dict[str, Any]]) -> list[PriceSlot]:
-        """Parse EKZ price items to sorted, de-duplicated UTC slots."""
         slots: list[PriceSlot] = []
 
         for item in raw_prices:
@@ -124,44 +122,34 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if dt_start is None:
                 continue
 
-            dt_start_utc = dt_util.as_utc(dt_start)
-            price = EkzTariffApi.sum_chf_per_kwh(item)
+            slots.append(
+                PriceSlot(
+                    start=dt_util.as_utc(dt_start),
+                    price_chf_per_kwh=EkzTariffApi.sum_chf_per_kwh(item),
+                )
+            )
 
-            slots.append(PriceSlot(start=dt_start_utc, price_chf_per_kwh=price))
-
-        dedup = {s.start: s for s in sorted(slots, key=lambda s: s.start)}
-        return list(dedup.values())
+        return list({s.start: s for s in sorted(slots, key=lambda s: s.start)}.values())
 
     @staticmethod
     def _compute_daily_stats(
         active: list[PriceSlot],
         baseline: list[PriceSlot],
     ) -> dict[str, Any]:
-        """Compute daily averages and per-slot deviations."""
         active_valid = [s for s in active if s.price_chf_per_kwh > 0]
         base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
 
         avg_active = _avg([s.price_chf_per_kwh for s in active_valid])
+        avg_baseline = _avg([base_map[s.start] for s in active_valid if s.start in base_map]) if base_map else None
 
-        avg_baseline = None
-        if base_map:
-            common_vals = [
-                base_map[s.start]
-                for s in active_valid
-                if s.start in base_map
-            ]
-            avg_baseline = _avg(common_vals)
-
-        dev_vs_avg: dict[str, float] = {}
-        dev_vs_baseline: dict[str, float] = {}
+        dev_vs_avg = {}
+        dev_vs_baseline = {}
 
         for s in active_valid:
-            if avg_active and avg_active > 0:
-                dev_vs_avg[s.start.isoformat()] = (s.price_chf_per_kwh / avg_active - 1.0) * 100.0
-
-            base = base_map.get(s.start)
-            if base and base > 0:
-                dev_vs_baseline[s.start.isoformat()] = (s.price_chf_per_kwh / base - 1.0) * 100.0
+            if avg_active:
+                dev_vs_avg[s.start.isoformat()] = (s.price_chf_per_kwh / avg_active - 1) * 100
+            if s.start in base_map:
+                dev_vs_baseline[s.start.isoformat()] = (s.price_chf_per_kwh / base_map[s.start] - 1) * 100
 
         return {
             "calculated_at": dt_util.utcnow().isoformat(),
