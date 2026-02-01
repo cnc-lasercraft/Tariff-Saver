@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -12,6 +12,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import EkzTariffApi
 from .const import CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME
+from .storage import TariffSaverStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,11 +24,6 @@ class PriceSlot:
     price_chf_per_kwh: float
 
 
-def _align_to_15min(dt: datetime) -> datetime:
-    minute = (dt.minute // 15) * 15
-    return dt.replace(minute=minute, second=0, microsecond=0)
-
-
 def _avg(values: list[float]) -> float | None:
     if not values:
         return None
@@ -37,7 +33,13 @@ def _avg(values: list[float]) -> float | None:
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Fetches and stores tariff price curves + daily derived stats."""
 
-    def __init__(self, hass: HomeAssistant, api: EkzTariffApi, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: EkzTariffApi,
+        config: dict[str, Any],
+        entry_id: str,
+    ) -> None:
         self.hass = hass
         self.api = api
         self.tariff_name: str = config["tariff_name"]
@@ -45,6 +47,9 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.publish_time: str = config.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
 
         self._last_fetch_date: date | None = None
+
+        # 🔹 persistent store
+        self.store = TariffSaverStore(hass, entry_id)
 
         super().__init__(
             hass,
@@ -56,12 +61,16 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch active & baseline once per day, then compute daily stats."""
         today = dt_util.now().date()
+
         if self._last_fetch_date == today:
             return self.data or {"active": [], "baseline": [], "stats": {}}
 
+        # load store once per HA runtime
+        if not self.store.price_slots:
+            await self.store.async_load()
+
         try:
-            # 🔹 KEY CHANGE:
-            # Call API WITHOUT start/end → EKZ returns tariffs of the current date (00:00–24:00)
+            # API call WITHOUT start/end → full current day
             raw_active = await self.api.fetch_prices(self.tariff_name)
             active = self._parse_prices(raw_active)
             if not active:
@@ -81,6 +90,20 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     err,
                 )
                 baseline = []
+
+        # ---------- persist price slots ----------
+        active_map = {s.start: s.price_chf_per_kwh for s in active if s.price_chf_per_kwh > 0}
+        base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
+
+        for start_utc, dyn_price in active_map.items():
+            base_price = base_map.get(start_utc)
+            if base_price is None:
+                continue
+            self.store.set_price_slot(start_utc, dyn_price, base_price)
+
+        self.store.trim_price_slots(keep_days=3)
+        if self.store.dirty:
+            await self.store.async_save()
 
         stats = self._compute_daily_stats(active, baseline)
 
@@ -102,18 +125,19 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
 
             dt_start_utc = dt_util.as_utc(dt_start)
-
             price = EkzTariffApi.sum_chf_per_kwh(item)
+
             slots.append(PriceSlot(start=dt_start_utc, price_chf_per_kwh=price))
 
-        slots.sort(key=lambda s: s.start)
-        dedup: dict[datetime, PriceSlot] = {s.start: s for s in slots}
+        dedup = {s.start: s for s in sorted(slots, key=lambda s: s.start)}
         return list(dedup.values())
 
     @staticmethod
-    def _compute_daily_stats(active: list[PriceSlot], baseline: list[PriceSlot]) -> dict[str, Any]:
+    def _compute_daily_stats(
+        active: list[PriceSlot],
+        baseline: list[PriceSlot],
+    ) -> dict[str, Any]:
         """Compute daily averages and per-slot deviations."""
-        # ignore unpublished/invalid 0 prices
         active_valid = [s for s in active if s.price_chf_per_kwh > 0]
         base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
 
@@ -121,8 +145,11 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         avg_baseline = None
         if base_map:
-            common = [base_map.get(s.start) for s in active_valid if s.start in base_map]
-            common_vals = [v for v in common if isinstance(v, float)]
+            common_vals = [
+                base_map[s.start]
+                for s in active_valid
+                if s.start in base_map
+            ]
             avg_baseline = _avg(common_vals)
 
         dev_vs_avg: dict[str, float] = {}
