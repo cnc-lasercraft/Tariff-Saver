@@ -38,23 +38,21 @@ def _parse_hhmm(value: str) -> str:
 
 
 class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle options for Tariff Saver."""
+    """Handle options for Tariff Saver.
 
-    def _entry(self) -> config_entries.ConfigEntry:
-        """Return config entry across HA versions."""
-        # Some HA versions expose read-only property .config_entry
-        ce = getattr(self, "config_entry", None)
-        if ce is not None:
-            return ce
-        # Other versions keep it private
-        ce = getattr(self, "_config_entry", None)
-        if ce is not None:
-            return ce
-        raise RuntimeError("Config entry not available in OptionsFlow")
+    IMPORTANT:
+    - HA calls TariffSaverOptionsFlowHandler(config_entry)
+    - Do NOT assign self.config_entry (read-only property in your HA)
+    - Store entry on our own attribute.
+    """
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        # Do not call super().__init__(config_entry) because in your HA it may take no args.
+        # Do not set self.config_entry (read-only).
+        self._ts_entry = config_entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         errors: dict[str, str] = {}
-        entry = self._entry()
 
         if user_input is not None:
             # Validate publish_time
@@ -77,8 +75,8 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
             if not errors:
                 return self.async_create_entry(title="", data=user_input)
 
-        opt = dict(entry.options)
-        dat = dict(entry.data)
+        opt = dict(self._ts_entry.options)
+        dat = dict(self._ts_entry.data)
 
         schema = vol.Schema(
             {
