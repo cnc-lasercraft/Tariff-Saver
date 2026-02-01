@@ -186,10 +186,11 @@ def _price_for_now_from_store(coordinator: TariffSaverCoordinator) -> tuple[floa
 
     dyn = p.get("dyn")
     base = p.get("base")
-    if not isinstance(dyn, (int, float)) or not isinstance(base, (int, float)):
-        return None, None
 
-    return float(dyn), float(base)
+    active_price = float(dyn) if isinstance(dyn, (int, float)) and dyn > 0 else None
+    baseline_price = float(base) if isinstance(base, (int, float)) and base > 0 else None
+
+    return active_price, baseline_price
 
 
 # -------------------------------------------------------------------
@@ -237,13 +238,15 @@ async def async_setup_entry(
 
             # ✅ use persistent store prices (dyn + baseline)
             active_price, baseline_price = _price_for_now_from_store(coordinator)
-            if active_price is None or baseline_price is None:
+            if active_price is None:
                 tracker.last_energy_kwh = new_val
                 return
-
+            
             tracker.active_cost_chf_today += delta * active_price
-            tracker.baseline_cost_chf_today += delta * baseline_price
-            tracker.has_baseline = True
+            
+            if baseline_price is not None:
+                tracker.baseline_cost_chf_today += delta * baseline_price
+                tracker.has_baseline = True
 
             tracker.last_energy_kwh = new_val
 
