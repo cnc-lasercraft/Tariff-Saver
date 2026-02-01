@@ -7,12 +7,11 @@ from datetime import datetime, date
 from typing import Any
 
 from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .api import EkzTariffApi
-from .const import CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME
+from .const import DOMAIN, CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME
 from .storage import TariffSaverStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,6 +31,7 @@ def _avg(values: list[float]) -> float | None:
 
 
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Fetches and stores tariff price curves + daily derived stats."""
 
     def __init__(
         self,
@@ -48,26 +48,34 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._last_fetch_date: date | None = None
 
-        # ✅ Store wird später initialisiert
-        self.store = None
+        # 🔹 Store wird lazy initialisiert
+        self.store: TariffSaverStore | None = None
 
         super().__init__(
             hass,
             _LOGGER,
             name="Tariff Saver",
-            update_interval=None,
+            update_interval=None,  # daily trigger will call refresh
         )
 
-
     async def _async_update_data(self) -> dict[str, Any]:
+        # ------------------------------------------------------------------
+        # Lazy init of store (binds to entry_id from hass.data[DOMAIN])
+        # ------------------------------------------------------------------
+        if self.store is None:
+            for entry_id, coord in self.hass.data.get(DOMAIN, {}).items():
+                if coord is self:
+                    self.store = TariffSaverStore(self.hass, entry_id)
+                    await self.store.async_load()
+                    break
+
         today = dt_util.now().date()
         if self._last_fetch_date == today:
             return self.data or {"active": [], "baseline": [], "stats": {}}
 
-        # Store einmal laden
-        if not self.store.price_slots:
-            await self.store.async_load()
-
+        # ------------------------------------------------------------------
+        # Fetch active tariff (full current day)
+        # ------------------------------------------------------------------
         try:
             raw_active = await self.api.fetch_prices(self.tariff_name)
             active = self._parse_prices(raw_active)
@@ -76,6 +84,9 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             raise UpdateFailed(f"Active tariff update failed: {err}") from err
 
+        # ------------------------------------------------------------------
+        # Fetch baseline tariff (optional)
+        # ------------------------------------------------------------------
         baseline: list[PriceSlot] = []
         if self.baseline_tariff_name:
             try:
@@ -89,26 +100,36 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 baseline = []
 
-        # 🔹 Preise persistent speichern
-        active_map = {s.start: s.price_chf_per_kwh for s in active if s.price_chf_per_kwh > 0}
-        base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
+        # ------------------------------------------------------------------
+        # Persist price slots (UTC, 15-min)
+        # ------------------------------------------------------------------
+        if self.store is not None:
+            active_map = {s.start: s.price_chf_per_kwh for s in active if s.price_chf_per_kwh > 0}
+            base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
 
-        for start_utc, dyn_price in active_map.items():
-            base_price = base_map.get(start_utc)
-            if base_price is not None:
-                self.store.set_price_slot(start_utc, dyn_price, base_price)
+            for start_utc, dyn_price in active_map.items():
+                base_price = base_map.get(start_utc)
+                if base_price is not None:
+                    self.store.set_price_slot(start_utc, dyn_price, base_price)
 
-        self.store.trim_price_slots(keep_days=3)
-        if self.store.dirty:
-            await self.store.async_save()
+            self.store.trim_price_slots(keep_days=3)
+            if self.store.dirty:
+                await self.store.async_save()
 
+        # ------------------------------------------------------------------
+        # Compute daily stats
+        # ------------------------------------------------------------------
         stats = self._compute_daily_stats(active, baseline)
         self._last_fetch_date = today
 
         return {"active": active, "baseline": baseline, "stats": stats}
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _parse_prices(raw_prices: list[dict[str, Any]]) -> list[PriceSlot]:
+        """Parse EKZ price items to sorted, de-duplicated UTC slots."""
         slots: list[PriceSlot] = []
 
         for item in raw_prices:
@@ -127,6 +148,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             )
 
+        # de-duplicate by slot start
         return list({s.start: s for s in sorted(slots, key=lambda s: s.start)}.values())
 
     @staticmethod
@@ -134,20 +156,27 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         active: list[PriceSlot],
         baseline: list[PriceSlot],
     ) -> dict[str, Any]:
+        """Compute daily averages and per-slot deviations."""
         active_valid = [s for s in active if s.price_chf_per_kwh > 0]
         base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
 
         avg_active = _avg([s.price_chf_per_kwh for s in active_valid])
-        avg_baseline = _avg([base_map[s.start] for s in active_valid if s.start in base_map]) if base_map else None
+        avg_baseline = (
+            _avg([base_map[s.start] for s in active_valid if s.start in base_map])
+            if base_map
+            else None
+        )
 
-        dev_vs_avg = {}
-        dev_vs_baseline = {}
+        dev_vs_avg: dict[str, float] = {}
+        dev_vs_baseline: dict[str, float] = {}
 
         for s in active_valid:
-            if avg_active:
-                dev_vs_avg[s.start.isoformat()] = (s.price_chf_per_kwh / avg_active - 1) * 100
-            if s.start in base_map:
-                dev_vs_baseline[s.start.isoformat()] = (s.price_chf_per_kwh / base_map[s.start] - 1) * 100
+            if avg_active and avg_active > 0:
+                dev_vs_avg[s.start.isoformat()] = (s.price_chf_per_kwh / avg_active - 1.0) * 100.0
+
+            base = base_map.get(s.start)
+            if base and base > 0:
+                dev_vs_baseline[s.start.isoformat()] = (s.price_chf_per_kwh / base - 1.0) * 100.0
 
         return {
             "calculated_at": dt_util.utcnow().isoformat(),
