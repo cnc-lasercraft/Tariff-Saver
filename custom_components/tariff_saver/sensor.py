@@ -94,6 +94,51 @@ def _floor_15min_utc(ts: datetime) -> datetime:
     return ts.replace(minute=minute, second=0, microsecond=0)
 
 
+def _avg(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _avg_future_from_now(slots: list[PriceSlot]) -> float | None:
+    """Average active price from now (UTC) until end of available data."""
+    now = dt_util.utcnow()
+    vals = [s.price_chf_per_kwh for s in slots if s.price_chf_per_kwh > 0 and s.start >= now]
+    return _avg(vals)
+
+
+def _avg_day_from_stats(coordinator: TariffSaverCoordinator) -> float | None:
+    data = coordinator.data or {}
+    stats = data.get("stats") or {}
+    avg_day = stats.get("avg_active_chf_per_kwh")
+    if isinstance(avg_day, (int, float)) and avg_day > 0:
+        return float(avg_day)
+    return None
+
+
+def _stars_for_horizon(coordinator: TariffSaverCoordinator, minutes: int) -> tuple[str | None, int | None, float | None]:
+    """Stars for average price from now until now+minutes, vs today's average."""
+    avg_day = _avg_day_from_stats(coordinator)
+    if not avg_day:
+        return None, None, None
+
+    now = dt_util.utcnow()
+    end = now + timedelta(minutes=minutes)
+
+    prices = [
+        s.price_chf_per_kwh
+        for s in _active_slots(coordinator)
+        if s.price_chf_per_kwh > 0 and now <= s.start < end
+    ]
+    if not prices:
+        return None, None, None
+
+    avg_window = sum(prices) / len(prices)
+    dev = (avg_window / float(avg_day) - 1.0) * 100.0
+    grade = _grade_from_dev(float(dev))
+    return _stars_from_grade(grade), grade, float(dev)
+
+
 # -------------------------------------------------------------------
 # Cost tracking (today) based on energy sensor deltas
 # -------------------------------------------------------------------
@@ -164,6 +209,7 @@ async def async_setup_entry(
     # Track energy-based costs if configured
     energy_entity = entry.options.get(CONF_CONSUMPTION_ENERGY_ENTITY) or entry.data.get(CONF_CONSUMPTION_ENERGY_ENTITY)
     if isinstance(energy_entity, str) and energy_entity:
+
         @callback
         def _on_energy_change(event: Event) -> None:
             new_state = event.data.get("new_state")
@@ -209,7 +255,6 @@ async def async_setup_entry(
         unsub = async_track_state_change_event(hass, [energy_entity], _on_energy_change)
         hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_cost"] = unsub
 
-    # ✅ ADD ALL ENTITIES (as before)
     async_add_entities(
         [
             # prices & forecast
@@ -220,11 +265,11 @@ async def async_setup_entry(
             TariffSaverCheapestWindowsSensor(coordinator, entry),
             # grading
             TariffSaverTariffGradeSensor(coordinator, entry),
+
+            # ⭐ stars (clean: 2 entities)
             TariffSaverTariffStarsNowSensor(coordinator, entry),
-            TariffSaverTariffStarsHorizonSensor(coordinator, entry, 1),
-            TariffSaverTariffStarsHorizonSensor(coordinator, entry, 2),
-            TariffSaverTariffStarsHorizonSensor(coordinator, entry, 3),
-            TariffSaverTariffStarsHorizonSensor(coordinator, entry, 6),
+            TariffSaverTariffStarsOutlookSensor(coordinator, entry),
+
             # costs (today)
             TariffSaverActualCostTodaySensor(coordinator, entry),
             TariffSaverBaselineCostTodaySensor(coordinator, entry),
@@ -352,7 +397,7 @@ class TariffSaverSavingsNext24hSensor(CoordinatorEntity[TariffSaverCoordinator],
 
 
 class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
-    """Cheapest windows for 30m / 1h / 2h / 3h (with optional savings vs baseline)."""
+    """Cheapest windows for 30m / 1h / 2h / 3h, enriched with stars vs future average."""
 
     _attr_has_entity_name = True
     _attr_name = "Cheapest windows"
@@ -364,79 +409,85 @@ class TariffSaverCheapestWindowsSensor(CoordinatorEntity[TariffSaverCoordinator]
         self._attr_unique_id = f"{entry.entry_id}_cheapest_windows"
 
     @staticmethod
-    def _best_window(
-        slots: list[PriceSlot],
-        baseline_map: dict,
-        window_slots: int,
-    ) -> dict[str, Any] | None:
+    def _best_window(slots: list[PriceSlot], window_slots: int) -> dict[str, Any] | None:
         slots = [s for s in slots if s.price_chf_per_kwh > 0]
         if len(slots) < window_slots:
             return None
 
         best_sum = float("inf")
-        best_start = None
-        best_end = None
-        best_savings = None
-
-        kwh_per_slot = 0.25
+        best_start: datetime | None = None
+        best_end: datetime | None = None
 
         for i in range(len(slots) - window_slots + 1):
             window = slots[i : i + window_slots]
             window_sum = sum(x.price_chf_per_kwh for x in window)
-
             if window_sum < best_sum:
                 best_sum = window_sum
                 best_start = window[0].start
                 best_end = window[-1].start + timedelta(minutes=15)
 
-                if baseline_map:
-                    save = 0.0
-                    matched = 0
-                    for x in window:
-                        base = baseline_map.get(x.start)
-                        if base is not None:
-                            save += (base - x.price_chf_per_kwh) * kwh_per_slot
-                            matched += 1
-                    best_savings = save if matched else None
+        if best_start is None or best_end is None:
+            return None
 
         avg_chf = best_sum / window_slots
         avg_rp = avg_chf * 100
 
-        result: dict[str, Any] = {
+        return {
             "start": best_start.isoformat(),
             "end": best_end.isoformat(),
             "avg_chf_per_kwh": round(avg_chf, 6),
             "avg_rp_per_kwh": round(avg_rp, 3),
-            "avg_chf_per_kwh_raw": avg_chf,
-            "avg_rp_per_kwh_raw": avg_rp,
+            "avg_chf_per_kwh_raw": float(avg_chf),
+            "avg_rp_per_kwh_raw": float(avg_rp),
         }
 
-        if best_savings is not None:
-            result["savings_vs_baseline_chf"] = round(best_savings, 2)
+    @staticmethod
+    def _decorate_with_stars(window: dict[str, Any] | None, ref_avg: float | None) -> dict[str, Any] | None:
+        """Add stars/grade/dev_vs_ref_percent using ref_avg (future avg)."""
+        if not window or not ref_avg or ref_avg <= 0:
+            return window
 
-        return result
+        p = window.get("avg_chf_per_kwh_raw") or window.get("avg_chf_per_kwh")
+        if not isinstance(p, (int, float)) or p <= 0:
+            return window
+
+        dev = (float(p) / float(ref_avg) - 1.0) * 100.0
+        grade = _grade_from_dev(dev)
+
+        out = dict(window)
+        out["dev_vs_ref_percent"] = round(dev, 2)
+        out["grade"] = grade
+        out["stars"] = _stars_from_grade(grade)
+        return out
 
     @property
     def native_value(self) -> float | None:
         slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
         if not slots:
             return None
-        best_1h = self._best_window(slots, {}, 4)
+        best_1h = self._best_window(slots, 4)
         return best_1h["avg_chf_per_kwh"] if best_1h else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         slots = sorted(_active_slots(self.coordinator), key=lambda s: s.start)
-        baseline = _baseline_slots(self.coordinator)
-        baseline_map = {s.start: s.price_chf_per_kwh for s in baseline} if baseline else {}
+
+        ref_avg = _avg_future_from_now(slots)
+
+        best_30m = self._decorate_with_stars(self._best_window(slots, 2), ref_avg)
+        best_1h = self._decorate_with_stars(self._best_window(slots, 4), ref_avg)
+        best_2h = self._decorate_with_stars(self._best_window(slots, 8), ref_avg)
+        best_3h = self._decorate_with_stars(self._best_window(slots, 12), ref_avg)
 
         return {
             "tariff_name": getattr(self.coordinator, "tariff_name", None),
             "baseline_tariff_name": getattr(self.coordinator, "baseline_tariff_name", None),
-            "best_30m": self._best_window(slots, baseline_map, 2),
-            "best_1h": self._best_window(slots, baseline_map, 4),
-            "best_2h": self._best_window(slots, baseline_map, 8),
-            "best_3h": self._best_window(slots, baseline_map, 12),
+            "ref_scope": "future",
+            "ref_avg_chf_per_kwh": round(ref_avg, 6) if ref_avg else None,
+            "best_30m": best_30m,
+            "best_1h": best_1h,
+            "best_2h": best_2h,
+            "best_3h": best_3h,
         }
 
 
@@ -469,7 +520,7 @@ class TariffSaverTariffGradeSensor(CoordinatorEntity[TariffSaverCoordinator], Se
 
 
 class TariffSaverTariffStarsNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
-    """Stars for current 15-min grade."""
+    """Stars for current 15-min grade (keeps the same unique_id/entity_id)."""
 
     _attr_has_entity_name = True
     _attr_name = "Tariff stars now"
@@ -477,6 +528,7 @@ class TariffSaverTariffStarsNowSensor(CoordinatorEntity[TariffSaverCoordinator],
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
+        # keep stable
         self._attr_unique_id = f"{entry.entry_id}_tariff_stars_now"
 
     @property
@@ -496,42 +548,57 @@ class TariffSaverTariffStarsNowSensor(CoordinatorEntity[TariffSaverCoordinator],
         grade = _grade_from_dev(float(dev))
         return _stars_from_grade(grade)
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        stats = data.get("stats") or {}
+        dev_map = stats.get("dev_vs_avg_percent") or {}
+        slot = _current_slot(_active_slots(self.coordinator))
+        if not slot:
+            return {}
+        dev = dev_map.get(slot.start.isoformat())
+        if dev is None:
+            return {}
+        grade = _grade_from_dev(float(dev))
+        return {
+            "slot_start_utc": slot.start.isoformat(),
+            "dev_vs_avg_percent": round(float(dev), 2),
+            "grade": grade,
+            "label": _label_from_grade(grade),
+        }
 
-class TariffSaverTariffStarsHorizonSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
-    """Stars for outlook window (next Nh), computed vs today's average."""
+
+class TariffSaverTariffStarsOutlookSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Outlook stars bundled as attributes; state defaults to next_1h."""
 
     _attr_has_entity_name = True
+    _attr_name = "Tariff stars outlook"
     _attr_icon = "mdi:star-outline"
 
-    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry, hours: int) -> None:
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
-        self.hours = hours
-        self._attr_name = f"Tariff stars next {hours}h"
-        self._attr_unique_id = f"{entry.entry_id}_tariff_stars_next_{hours}h"
+        self._attr_unique_id = f"{entry.entry_id}_tariff_stars_outlook"
 
     @property
     def native_value(self) -> str | None:
-        data = self.coordinator.data or {}
-        stats = data.get("stats") or {}
-        avg_day = stats.get("avg_active_chf_per_kwh")
-        if not avg_day or avg_day <= 0:
-            return None
+        stars, _grade, _dev = _stars_for_horizon(self.coordinator, minutes=60)
+        return stars
 
-        now = dt_util.utcnow()
-        end = now + timedelta(hours=self.hours)
-
-        prices = [
-            s.price_chf_per_kwh
-            for s in _active_slots(self.coordinator)
-            if s.price_chf_per_kwh > 0 and now <= s.start < end
-        ]
-        if not prices:
-            return None
-
-        avg_window = sum(prices) / len(prices)
-        dev = (avg_window / float(avg_day) - 1.0) * 100.0
-        grade = _grade_from_dev(float(dev))
-        return _stars_from_grade(grade)
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for minutes, key in [
+            (30, "next_30m"),
+            (60, "next_1h"),
+            (120, "next_2h"),
+            (180, "next_3h"),
+            (360, "next_6h"),
+        ]:
+            stars, grade, dev = _stars_for_horizon(self.coordinator, minutes=minutes)
+            out[key] = stars
+            out[f"{key}_grade"] = grade
+            out[f"{key}_dev_vs_avg_percent"] = round(dev, 2) if isinstance(dev, (int, float)) else None
+        return out
 
 
 # -------------------------------------------------------------------
