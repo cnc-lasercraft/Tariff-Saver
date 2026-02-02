@@ -1,14 +1,5 @@
 {
-  "config": {
-    "abort": {
-      "single_instance_allowed": "Only one Tariff Saver instance is allowed."
-    },
-    "error": {
-      "cannot_connect": "Could not connect to the tariff API. Please try again.",
-      "no_data": "No price data returned for this tariff name. Please check the name and try again.",
-      "unknown": "Unexpected error. Please check the logs for details."
-    }
-    "options": {
+  "options": {
     "step": {
       "init": {
         "title": "Tariff Saver options",
@@ -23,7 +14,7 @@
           "baseline_value": "Baseline price (per kWh)",
           "baseline_entity": "Baseline entity",
           "price_scale": "Price scale (multiplier)",
-          "ignore_zero_prices": "Ignore zero/negative prices",
+          "ignore_zero_prices": "Ignore zero or negative prices",
           "solar_enabled": "Solar system enabled",
           "solar_provider": "Solar forecast provider",
           "solar_forecast_entity": "Solar forecast entity",
@@ -73,6 +64,6 @@
         "30": "30 minutes",
         "60": "60 minutes"
       }
-
+    }
   }
 }
