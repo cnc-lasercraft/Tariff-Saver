@@ -22,7 +22,10 @@ class BookedSlot:
 class TariffSaverStore:
     """Persists recent energy samples, price slots and finalized 15-min slots."""
 
-    STORAGE_VERSION = 3  # bumped due to schema extension: last_api_success_utc
+    # IMPORTANT:
+    # Do NOT bump version unless you also provide a storage migration.
+    # We keep the existing version and load the new field opportunistically.
+    STORAGE_VERSION = 2
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self.hass = hass
@@ -54,7 +57,7 @@ class TariffSaverStore:
         if not data:
             return
 
-        # ---- last api success ----
+        # ---- last api success (optional) ----
         self.last_api_success_utc = None
         try:
             ts_str = data.get("last_api_success_utc")
