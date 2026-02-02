@@ -175,7 +175,15 @@ async def async_setup_entry(
                     "sensor.baseline_cost_today",
                     "sensor.actual_savings_today",
                 ):
-                    hass.async_create_task(hass.helpers.entity_component.async_update_entity(ent))
+                    hass.async_create_task(
+                        hass.services.async_call(
+                            "homeassistant",
+                            "update_entity",
+                            {"entity_id": ent},
+                            blocking=False,
+                        )
+                    )
+
 
         unsub = async_track_state_change_event(hass, [energy_entity], _on_energy_change)
         hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_cost"] = unsub
