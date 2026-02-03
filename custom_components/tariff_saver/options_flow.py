@@ -1,19 +1,16 @@
 """Options flow for Tariff Saver.
 
-Key points:
-- Multi-step to avoid invalid selector validation for unused fields.
-- Baseline: api/entity/fixed/none.
-- Price source: fetch(api) or import(existing entities).
-- Solar installation and forecast provider are separate:
-  - solar_installed: just informational (future use)
-  - solar_forecast_provider: none/solcast/(future)
-- Solar energy cost (Rp/kWh) is only asked when a forecast provider is enabled.
+Requirements implemented:
+- Solar forecast can only be configured if a solar system is enabled (solar_installed == True).
+- Solar energy cost (Rp/kWh) is requested whenever solar_installed == True,
+  independent of whether a forecast provider is used.
 
-Steps:
-1) init: common options (no entity selectors)
+Multi-step routing (to avoid invalid selectors for unused fields):
+1) init: common options + solar_installed
 2) import: only if price_mode == "import"
-3) baseline_entity or baseline_fixed: only if baseline_mode requires it
-4) solar_forecast: only if solar_forecast_provider != "none"
+3) baseline_entity / baseline_fixed: only if baseline_mode requires it
+4) solar: only if solar_installed == True (asks solar_cost + forecast_provider)
+5) solar_forecast: only if forecast_provider != "none"
 """
 from __future__ import annotations
 
@@ -42,14 +39,14 @@ OPT_PRICE_SCALE = "price_scale"
 OPT_IGNORE_ZERO_PRICES = "ignore_zero_prices"
 
 # Solar / PV
-OPT_SOLAR_INSTALLED = "solar_installed"  # NEW: just whether you have PV
+OPT_SOLAR_INSTALLED = "solar_installed"  # True if PV exists
+OPT_SOLAR_COST_RP_KWH = "solar_cost_rp_per_kwh"  # Rp/kWh (always if solar_installed)
 OPT_SOLAR_FORECAST_PROVIDER = "solar_forecast_provider"  # "none" | "solcast" | (future)
 
-# Forecast mapping + cost (only if provider != none)
+# Forecast mapping (only if provider != none)
 OPT_SOLAR_FORECAST_ENTITY = "solar_forecast_entity"
 OPT_SOLAR_FORECAST_ATTRIBUTE = "solar_forecast_attribute"
 OPT_SOLAR_INTERVAL_MIN = "solar_interval_minutes"
-OPT_SOLAR_COST_RP_KWH = "solar_cost_rp_per_kwh"  # Rp/kWh
 
 
 def _sensor_entity_selector() -> selector.EntitySelector:
@@ -67,8 +64,10 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
         self._entry = config_entry
         self._pending: dict[str, object] = {}
 
+    # -----------------------------
+    # Step 1: Common options
+    # -----------------------------
     async def async_step_init(self, user_input=None):
-        """Common options (no selectors that could be invalid when unused)."""
         if user_input is not None:
             self._pending = dict(user_input)
             return await self._next_step()
@@ -98,7 +97,7 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                     {"repeat": "Repeat to 15-minute slots"}
                 ),
 
-                # Baseline source (API must be present)
+                # Baseline source
                 vol.Required(OPT_BASELINE_MODE, default=opts.get(OPT_BASELINE_MODE, "api")): vol.In(
                     {
                         "api": "From API / source",
@@ -112,24 +111,16 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Required(OPT_PRICE_SCALE, default=float(opts.get(OPT_PRICE_SCALE, 1.0))): vol.Coerce(float),
                 vol.Required(OPT_IGNORE_ZERO_PRICES, default=bool(opts.get(OPT_IGNORE_ZERO_PRICES, True))): bool,
 
-                # Solar (separate from forecast)
+                # Solar installed (gate for any PV forecast settings)
                 vol.Required(OPT_SOLAR_INSTALLED, default=bool(opts.get(OPT_SOLAR_INSTALLED, False))): bool,
-                vol.Required(
-                    OPT_SOLAR_FORECAST_PROVIDER,
-                    default=opts.get(OPT_SOLAR_FORECAST_PROVIDER, "none"),
-                ): vol.In(
-                    {
-                        "none": "No forecast (disabled)",
-                        "solcast": "Solcast PV Forecast",
-                    }
-                ),
             }
         )
-
         return self.async_show_form(step_id="init", data_schema=schema)
 
+    # -----------------------------
+    # Step 2: Import entities
+    # -----------------------------
     async def async_step_import(self, user_input=None):
-        """Import mode mapping (shown only if price_mode == import)."""
         if user_input is not None:
             self._pending.update(user_input)
             return await self._next_step()
@@ -143,8 +134,10 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
         )
         return self.async_show_form(step_id="import", data_schema=schema)
 
+    # -----------------------------
+    # Step 3a: Baseline entity
+    # -----------------------------
     async def async_step_baseline_entity(self, user_input=None):
-        """Baseline from entity (only if baseline_mode == entity)."""
         if user_input is not None:
             self._pending.update(user_input)
             return await self._next_step()
@@ -157,8 +150,10 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
         )
         return self.async_show_form(step_id="baseline_entity", data_schema=schema)
 
+    # -----------------------------
+    # Step 3b: Baseline fixed
+    # -----------------------------
     async def async_step_baseline_fixed(self, user_input=None):
-        """Baseline fixed value (only if baseline_mode == fixed)."""
         if user_input is not None:
             self._pending.update(user_input)
             return await self._next_step()
@@ -174,14 +169,42 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
         )
         return self.async_show_form(step_id="baseline_fixed", data_schema=schema)
 
-    async def async_step_solar_forecast(self, user_input=None):
-        """Solar forecast mapping and cost (only if provider != none)."""
+    # -----------------------------
+    # Step 4: Solar basics (cost + forecast provider)
+    # -----------------------------
+    async def async_step_solar(self, user_input=None):
         if user_input is not None:
             self._pending.update(user_input)
             return await self._next_step()
 
         opts = dict(self._entry.options)
+        schema = vol.Schema(
+            {
+                # Always requested when solar_installed == True
+                vol.Required(OPT_SOLAR_COST_RP_KWH, default=float(opts.get(OPT_SOLAR_COST_RP_KWH, 0.0))): vol.Coerce(float),
+                # Forecast provider suggests whether to add mapping step
+                vol.Required(
+                    OPT_SOLAR_FORECAST_PROVIDER,
+                    default=opts.get(OPT_SOLAR_FORECAST_PROVIDER, "none"),
+                ): vol.In(
+                    {
+                        "none": "No forecast (disabled)",
+                        "solcast": "Solcast PV Forecast",
+                    }
+                ),
+            }
+        )
+        return self.async_show_form(step_id="solar", data_schema=schema)
 
+    # -----------------------------
+    # Step 5: Forecast mapping (only if provider != none)
+    # -----------------------------
+    async def async_step_solar_forecast(self, user_input=None):
+        if user_input is not None:
+            self._pending.update(user_input)
+            return await self._next_step()
+
+        opts = dict(self._entry.options)
         schema = vol.Schema(
             {
                 vol.Required(OPT_SOLAR_FORECAST_ENTITY, default=opts.get(OPT_SOLAR_FORECAST_ENTITY, "")): _sensor_entity_selector(),
@@ -189,16 +212,17 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Required(OPT_SOLAR_INTERVAL_MIN, default=int(opts.get(OPT_SOLAR_INTERVAL_MIN, 30))): vol.In(
                     {30: "30 minutes"}
                 ),
-                vol.Required(OPT_SOLAR_COST_RP_KWH, default=float(opts.get(OPT_SOLAR_COST_RP_KWH, 0.0))): vol.Coerce(float),
             }
         )
-
         return self.async_show_form(step_id="solar_forecast", data_schema=schema)
 
+    # -----------------------------
+    # Step routing
+    # -----------------------------
     async def _next_step(self):
-        """Route to the next required step based on pending data."""
         price_mode = str(self._pending.get(OPT_PRICE_MODE, "fetch"))
         baseline_mode = str(self._pending.get(OPT_BASELINE_MODE, "api"))
+        solar_installed = bool(self._pending.get(OPT_SOLAR_INSTALLED, False))
         forecast_provider = str(self._pending.get(OPT_SOLAR_FORECAST_PROVIDER, "none"))
 
         # 1) Import mapping
@@ -208,15 +232,18 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
         # 2) Baseline details
         if baseline_mode == "entity" and OPT_BASELINE_ENTITY not in self._pending:
             return await self.async_step_baseline_entity()
-
         if baseline_mode == "fixed" and OPT_BASELINE_FIXED_RP_KWH not in self._pending:
             return await self.async_step_baseline_fixed()
 
-        # 3) Solar forecast details
-        if forecast_provider != "none" and OPT_SOLAR_FORECAST_ENTITY not in self._pending:
+        # 3) Solar basics (gated by solar_installed)
+        if solar_installed and OPT_SOLAR_COST_RP_KWH not in self._pending:
+            return await self.async_step_solar()
+
+        # 4) Forecast mapping (only if enabled and solar_installed)
+        if solar_installed and forecast_provider != "none" and OPT_SOLAR_FORECAST_ENTITY not in self._pending:
             return await self.async_step_solar_forecast()
 
-        # Cleanup stale values (keeps options tidy)
+        # -------- cleanup stale values --------
         if price_mode != "import":
             self._pending.pop(OPT_IMPORT_ENTITY_DYN, None)
             self._pending.pop(OPT_IMPORT_ENTITY_BASE, None)
@@ -226,10 +253,16 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
         if baseline_mode != "fixed":
             self._pending.pop(OPT_BASELINE_FIXED_RP_KWH, None)
 
-        if forecast_provider == "none":
+        if not solar_installed:
+            self._pending.pop(OPT_SOLAR_COST_RP_KWH, None)
+            self._pending.pop(OPT_SOLAR_FORECAST_PROVIDER, None)
             self._pending.pop(OPT_SOLAR_FORECAST_ENTITY, None)
             self._pending.pop(OPT_SOLAR_FORECAST_ATTRIBUTE, None)
             self._pending.pop(OPT_SOLAR_INTERVAL_MIN, None)
-            self._pending.pop(OPT_SOLAR_COST_RP_KWH, None)
+        else:
+            if forecast_provider == "none":
+                self._pending.pop(OPT_SOLAR_FORECAST_ENTITY, None)
+                self._pending.pop(OPT_SOLAR_FORECAST_ATTRIBUTE, None)
+                self._pending.pop(OPT_SOLAR_INTERVAL_MIN, None)
 
         return self.async_create_entry(title="", data=self._pending)
