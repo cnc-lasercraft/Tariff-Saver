@@ -1,13 +1,14 @@
 """Config flow for Tariff Saver (Public + myEKZ OAuth2).
 
-Fixes:
-- Implements the required 'logger' property for AbstractOAuth2FlowHandler
-  (otherwise HA throws: Can't instantiate abstract class ... missing 'logger').
+This Home Assistant version uses the OAuth2 helper step name: 'auth'
+(not 'oauth'). Therefore:
+- start OAuth with: await self.async_step_auth()
+- create entry with: async_step_auth_create_entry()
 
 Behavior:
 - Public mode: creates entry immediately.
 - myEKZ mode: asks for redirect_uri + publish_time, generates ems_instance_id,
-  then starts OAuth2, and only after success creates the entry.
+  then starts OAuth2 and only after success creates the entry.
 
 IMPORTANT:
 - Requires oauth2.py + application_credentials.py to exist.
@@ -49,7 +50,6 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
 
     @property
     def logger(self) -> logging.Logger:
-        """Return logger (required by AbstractOAuth2FlowHandler)."""
         return _LOGGER
 
     def __init__(self) -> None:
@@ -120,8 +120,8 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
             self._publish_time = user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
             self._ems_instance_id = _generate_ems_instance_id()
 
-            # Start OAuth2. On success HA calls async_step_oauth_create_entry().
-            return await self.async_step_oauth()
+            # Start OAuth2. On success HA calls async_step_auth_create_entry().
+            return await self.async_step_auth()
 
         default_redirect = (self.hass.config.external_url or "").rstrip("/") + "/"
         return self.async_show_form(
@@ -134,7 +134,8 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
             ),
         )
 
-    async def async_step_oauth_create_entry(self, data: dict[str, Any]):
+    async def async_step_auth_create_entry(self, data: dict[str, Any]):
+        # data contains OAuth token info; HA stores auth_implementation in entry.data automatically
         return self.async_create_entry(
             title=self._name or "Tariff Saver",
             data={
