@@ -83,9 +83,15 @@ class TariffSaverConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data={
                     CONF_NAME: self._name,
                     "mode": MODE_MYEKZ,
+            
+                    # ✅ Defaults damit bestehender Coordinator nicht crasht
+                    "tariff_name": "myEKZ",
+                    "baseline_tariff_name": None,
+            
                     CONF_PUBLISH_TIME: user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME),
                 },
             )
+
 
         schema = vol.Schema({vol.Optional(CONF_PUBLISH_TIME, default=DEFAULT_PUBLISH_TIME): str})
         return self.async_show_form(step_id="myekz", data_schema=schema)
