@@ -2,11 +2,13 @@
   "domain": "tariff_saver",
   "name": "Tariff Saver",
   "dependencies": ["application_credentials", "auth"],
+  "oauth2": true
+  "application_credentials": true
   "config_flow": true,
   "documentation": "https://github.com/cnc-lasercraft/tariff_saver",
   "issue_tracker": "https://github.com/cnc-lasercraft/tariff_saver/issues",
   "iot_class": "cloud_polling",
   "codeowners": ["@cnc-lasercraft"],
   "requirements": [],
-  "version": "0.0.66"
+  "version": "0.0.67"
 }
