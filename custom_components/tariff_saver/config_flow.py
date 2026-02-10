@@ -1,14 +1,18 @@
 """Config flow for Tariff Saver (Public + myEKZ OAuth2).
 
-This Home Assistant version uses the OAuth2 helper step name: 'auth'
-(not 'oauth'). Therefore:
-- start OAuth with: await self.async_step_auth()
-- create entry with: async_step_auth_create_entry()
+Fix for HA versions where AbstractOAuth2FlowHandler requires choosing an
+implementation before starting auth:
+
+- Start OAuth with: await self.async_step_pick_implementation()
+  (this sets self.flow_impl), then HA continues to async_step_auth.
+
+This matches the HA OAuth2 helper design.
 
 Behavior:
 - Public mode: creates entry immediately.
 - myEKZ mode: asks for redirect_uri + publish_time, generates ems_instance_id,
-  then starts OAuth2 and only after success creates the entry.
+  then starts OAuth2 and only after success creates the entry via
+  async_step_auth_create_entry().
 
 IMPORTANT:
 - Requires oauth2.py + application_credentials.py to exist.
@@ -53,6 +57,7 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
         return _LOGGER
 
     def __init__(self) -> None:
+        super().__init__()
         self._name: str | None = None
         self._mode: str | None = None
         self._redirect_uri: str | None = None
@@ -120,8 +125,9 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
             self._publish_time = user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
             self._ems_instance_id = _generate_ems_instance_id()
 
-            # Start OAuth2. On success HA calls async_step_auth_create_entry().
-            return await self.async_step_auth()
+            # IMPORTANT:
+            # Pick implementation first (sets self.flow_impl), then HA continues to auth.
+            return await self.async_step_pick_implementation()
 
         default_redirect = (self.hass.config.external_url or "").rstrip("/") + "/"
         return self.async_show_form(
@@ -135,7 +141,6 @@ class TariffSaverConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, 
         )
 
     async def async_step_auth_create_entry(self, data: dict[str, Any]):
-        # data contains OAuth token info; HA stores auth_implementation in entry.data automatically
         return self.async_create_entry(
             title=self._name or "Tariff Saver",
             data={
