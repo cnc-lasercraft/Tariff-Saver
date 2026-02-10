@@ -38,6 +38,10 @@ OPT_BASELINE_FIXED_RP_KWH = "baseline_value"  # Rp/kWh (keep this key to match e
 OPT_PRICE_SCALE = "price_scale"
 OPT_IGNORE_ZERO_PRICES = "ignore_zero_prices"
 
+# Consumption / energy input (required for cost calculation)
+# Keep this key EXACTLY stable because sensor.py reads it.
+OPT_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
+
 # Solar / PV
 OPT_SOLAR_INSTALLED = "solar_installed"  # True if PV exists
 OPT_SOLAR_COST_RP_KWH = "solar_cost_rp_per_kwh"  # Rp/kWh (always if solar_installed)
@@ -69,7 +73,9 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
     # -----------------------------
     async def async_step_init(self, user_input=None):
         if user_input is not None:
-            self._pending = dict(user_input)
+            # IMPORTANT: merge, don't replace — otherwise non-form keys get deleted.
+            self._pending = dict(self._entry.options)
+            self._pending.update(user_input)
             return await self._next_step()
 
         opts = dict(self._entry.options)
@@ -106,6 +112,12 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                         "none": "No baseline",
                     }
                 ),
+
+                # Consumption / energy entity (kWh total) used for cost calculation
+                vol.Required(
+                    OPT_CONSUMPTION_ENERGY_ENTITY,
+                    default=opts.get(OPT_CONSUMPTION_ENERGY_ENTITY, ""),
+                ): _sensor_entity_selector(),
 
                 # Scaling / hygiene
                 vol.Required(OPT_PRICE_SCALE, default=float(opts.get(OPT_PRICE_SCALE, 1.0))): vol.Coerce(float),
