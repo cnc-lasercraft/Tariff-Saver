@@ -5,6 +5,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers import config_entry_oauth2_flow
 
 from .api import EkzTariffApi
 from .const import DOMAIN, CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME
@@ -30,15 +31,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tariff Saver from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    session = async_get_clientsession(hass)
-    api = EkzTariffApi(session)
-
     # IMPORTANT: merge data + options into a single config dict
     config = dict(entry.data)
     config.update(dict(entry.options))
 
-    coordinator = TariffSaverCoordinator(hass, api, config=config)
+    session = async_get_clientsession(hass)
 
+    # ------------------------------------------------------------------
+    # OAuth2Session (myEKZ)
+    # ------------------------------------------------------------------
+    oauth_session = None
+    if config.get("mode") == "myekz":
+        # This requires:
+        # - manifest.json: "oauth2": true, "application_credentials": true
+        # - oauth2.py + application_credentials.py
+        oauth_session = config_entry_oauth2_flow.OAuth2Session(hass, entry)
+
+    api = EkzTariffApi(session, oauth_session=oauth_session)
+
+    coordinator = TariffSaverCoordinator(hass, api, config=config)
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     # Schedule: refresh only once per day at publish_time (options override data)
