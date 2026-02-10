@@ -163,16 +163,15 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 baseline = []
 
         # Persist price slots (UTC, 15-min)
+        # FIX: always store dynamic prices; baseline is optional per slot.
         if self.store is not None:
             active_map = {s.start: s.price_chf_per_kwh for s in active if s.price_chf_per_kwh > 0}
             base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
 
             for start_utc, dyn_price in active_map.items():
-                base_price = base_map.get(start_utc)
-                if base_price is not None:
-                    self.store.set_price_slot(start_utc, dyn_price, base_price)
+                self.store.set_price_slot(start_utc, dyn_price, base_map.get(start_utc))
 
-            self.store.trim_price_slots(keep_days=3)
+            self.store.trim_price_slots(keep_days=7)
             if self.store.dirty:
                 await self.store.async_save()
 
