@@ -1,4 +1,17 @@
-"""Coordinator for Tariff Saver."""
+"""Coordinator for Tariff Saver (Public + myEKZ linking).
+
+Public mode:
+- unchanged: fetch_prices(tariff_name) -> 15-min slots
+
+myEKZ mode:
+- calls /v1/emsLinkStatus
+- surfaces link_status + linking_process_redirect_uri in coordinator.data["myekz"]
+- does NOT call /v1/customerTariffs yet (next step)
+
+IMPORTANT:
+- No entities renamed.
+- Public behavior remains intact.
+"""
 from __future__ import annotations
 
 import logging
@@ -11,7 +24,15 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import EkzTariffApi
-from .const import DOMAIN, CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME
+from .const import (
+    DOMAIN,
+    CONF_PUBLISH_TIME,
+    DEFAULT_PUBLISH_TIME,
+    CONF_MODE,
+    MODE_MYEKZ,
+    CONF_EMS_INSTANCE_ID,
+    CONF_REDIRECT_URI,
+)
 from .storage import TariffSaverStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,9 +63,17 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass = hass
         self.api = api
 
-        self.tariff_name: str = config["tariff_name"]
+        # NOTE: tariff_name is required for public mode.
+        # In myEKZ mode we keep a placeholder to avoid crashes.
+        self.tariff_name: str = config.get("tariff_name", "myEKZ")
         self.baseline_tariff_name: str | None = config.get("baseline_tariff_name")
         self.publish_time: str = config.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
+
+        self.mode: str = config.get(CONF_MODE, "public")
+
+        # myEKZ linking inputs (required for /v1/emsLinkStatus)
+        self.ems_instance_id: str | None = config.get(CONF_EMS_INSTANCE_ID)
+        self.redirect_uri: str | None = config.get(CONF_REDIRECT_URI)
 
         self._last_fetch_date: date | None = None
 
@@ -71,11 +100,43 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         today = dt_util.now().date()
         if self._last_fetch_date == today:
-            return self.data or {"active": [], "baseline": [], "stats": {}}
+            return self.data or {"active": [], "baseline": [], "stats": {}, "myekz": {}}
 
         # ------------------------------------------------------------------
-        # Fetch active tariff (full current day)
+        # myEKZ mode: check linking status
         # ------------------------------------------------------------------
+        if self.mode == MODE_MYEKZ:
+            if not self.ems_instance_id or not self.redirect_uri:
+                raise UpdateFailed(
+                    "myEKZ mode requires ems_instance_id and redirect_uri "
+                    "(see config flow / EKZ docs)."
+                )
+
+            try:
+                status = await self.api.fetch_ems_link_status(
+                    ems_instance_id=self.ems_instance_id,
+                    redirect_uri=self.redirect_uri,
+                )
+            except Exception as err:
+                raise UpdateFailed(f"myEKZ emsLinkStatus failed: {err}") from err
+
+            self._last_fetch_date = today
+
+            return {
+                "active": [],
+                "baseline": [],
+                "stats": {},
+                "myekz": {
+                    "link_status": status.get("link_status"),
+                    "linking_process_redirect_uri": status.get("linking_process_redirect_uri"),
+                    "raw": status,
+                },
+            }
+
+        # ------------------------------------------------------------------
+        # Public mode: unchanged
+        # ------------------------------------------------------------------
+        active: list[PriceSlot] = []
         try:
             raw_active = await self.api.fetch_prices(self.tariff_name)
             active = self._parse_prices(raw_active)
@@ -88,9 +149,6 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.store is not None:
             self.store.set_last_api_success(dt_util.utcnow())
 
-        # ------------------------------------------------------------------
-        # Fetch baseline tariff (optional)
-        # ------------------------------------------------------------------
         baseline: list[PriceSlot] = []
         if self.baseline_tariff_name:
             try:
@@ -104,9 +162,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 baseline = []
 
-        # ------------------------------------------------------------------
         # Persist price slots (UTC, 15-min)
-        # ------------------------------------------------------------------
         if self.store is not None:
             active_map = {s.start: s.price_chf_per_kwh for s in active if s.price_chf_per_kwh > 0}
             base_map = {s.start: s.price_chf_per_kwh for s in baseline if s.price_chf_per_kwh > 0}
@@ -120,13 +176,10 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.store.dirty:
                 await self.store.async_save()
 
-        # ------------------------------------------------------------------
-        # Compute daily stats
-        # ------------------------------------------------------------------
         stats = self._compute_daily_stats(active, baseline)
         self._last_fetch_date = today
 
-        return {"active": active, "baseline": baseline, "stats": stats}
+        return {"active": active, "baseline": baseline, "stats": stats, "myekz": {}}
 
     # ------------------------------------------------------------------
     # Helpers
