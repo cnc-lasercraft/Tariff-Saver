@@ -1,25 +1,21 @@
 """Config flow for Tariff Saver (Public + myEKZ OAuth2).
 
-Fix:
-- Force OAuth authorize redirect_uri to HA External URL callback:
-    <external_url>/auth/external/callback
-  This avoids the My Home Assistant proxy redirect:
-    https://my.home-assistant.io/redirect/oauth
-  which EKZ/Keycloak rejects unless explicitly whitelisted.
+This version keeps the working handler/registration setup and fixes ONLY:
+- ems_instance_id generation: no hardcoded value; generate a unique UUID per setup.
 
-How:
-- Override AbstractOAuth2FlowHandler.async_get_redirect_uri() in THIS config flow
-  (this is the actual flow handler).
+Notes:
+- myEKZ form field 'redirect_uri' is for EKZ /v1/emsLinkStatus linking flow (return URI),
+  NOT the OAuth redirect_uri (that one is managed by HA/OAuth flow).
+- No entity renames.
+- Public flow unchanged.
 
-Behavior:
-- Public mode: creates entry immediately.
-- myEKZ mode: asks for redirect_uri (for EKZ linking endpoint) + publish_time,
-  generates ems_instance_id, then starts OAuth2 via async_step_pick_implementation().
-- After OAuth success: async_step_auth_create_entry creates the entry.
-
-IMPORTANT:
-- Settings → System → Network → External URL must be set (Nabu Casa URL).
-- Requires oauth2.py + application_credentials.py.
+Requirements (already in your setup):
+- oauth2.py + application_credentials.py exist
+- manifest.json includes:
+    "config_flow": true,
+    "oauth2": true,
+    "application_credentials": true
+  and dependencies include "application_credentials" and "auth"
 """
 from __future__ import annotations
 
@@ -31,7 +27,6 @@ import voluptuous as vol
 
 from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_entry_oauth2_flow
 
 from .const import DOMAIN, DEFAULT_PUBLISH_TIME, CONF_PUBLISH_TIME
@@ -43,32 +38,20 @@ MODE_MYEKZ = "myekz"
 
 
 def _generate_ems_instance_id() -> str:
+    """Generate a unique, persistent EMS instance id (per HA installation)."""
     return f"ha-{uuid.uuid4().hex}"
-
-
-def _ha_external_oauth_callback(hass) -> str:
-    external = hass.config.external_url
-    if not external:
-        raise HomeAssistantError(
-            "External URL is not set. Please set it to your Nabu Casa URL under "
-            "Settings → System → Network → External URL."
-        )
-    return external.rstrip("/") + "/auth/external/callback"
 
 
 class ConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN):
     """Handle a config flow for Tariff Saver."""
 
+    # Some HA versions require this attribute too
     DOMAIN = DOMAIN
     VERSION = 2
 
     @property
     def logger(self) -> logging.Logger:
         return _LOGGER
-
-    async def async_get_redirect_uri(self) -> str:
-        """Return redirect_uri used in the Keycloak authorize URL."""
-        return _ha_external_oauth_callback(self.hass)
 
     def __init__(self) -> None:
         super().__init__()
@@ -135,15 +118,13 @@ class ConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMA
 
     async def async_step_myekz(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
-            # This redirect_uri is for EKZ /v1/emsLinkStatus linking flow,
-            # NOT the OAuth redirect_uri.
             self._redirect_uri = str(user_input["redirect_uri"]).strip()
             self._publish_time = user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
+
+            # Generate ONCE for this config entry
             self._ems_instance_id = _generate_ems_instance_id()
 
-            # Ensure external URL is set early, to avoid confusing Keycloak errors.
-            _ha_external_oauth_callback(self.hass)
-
+            # Pick implementation first (sets self.flow_impl), then HA continues to auth.
             return await self.async_step_pick_implementation()
 
         default_redirect = (self.hass.config.external_url or "").rstrip("/") + "/"
