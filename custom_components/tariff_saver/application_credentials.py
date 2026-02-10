@@ -1,17 +1,32 @@
-"""Application Credentials platform for Tariff Saver (OAuth2)."""
+"""Application credentials support for Tariff Saver (myEKZ OAuth2).
+
+Stores client_id/client_secret in Home Assistant's Application Credentials UI.
+"""
 from __future__ import annotations
 
-from homeassistant.components.application_credentials import AuthorizationServer
+from homeassistant.components.application_credentials import AuthorizationServer, ClientCredential
 from homeassistant.core import HomeAssistant
+
+from .const import DOMAIN
+
+AUTH_BASE = "https://login.ekz.ch/auth"
+REALM = "myEKZ"
+
+AUTH_URL = f"{AUTH_BASE}/realms/{REALM}/protocol/openid-connect/auth"
+TOKEN_URL = f"{AUTH_BASE}/realms/{REALM}/protocol/openid-connect/token"
 
 
 async def async_get_authorization_server(hass: HomeAssistant) -> AuthorizationServer:
-    """Return the OAuth2 authorization server configuration.
-
-    NOTE: We will fill the exact EKZ/Keycloak endpoints in the next step
-    once we copy them from the EKZ documentation (authorize + token URLs).
-    """
+    """Return the authorization server for myEKZ (Keycloak)."""
     return AuthorizationServer(
-        authorize_url="https://login.ekz.ch/auth/realms/myEKZ/protocol/openid-connect/auth",
-        token_url="https://login.ekz.ch/auth/realms/myEKZ/protocol/openid-connect/token",
+        authorize_url=AUTH_URL,
+        token_url=TOKEN_URL,
+    )
+
+
+async def async_get_client_credential(hass: HomeAssistant) -> ClientCredential:
+    """Return the client credential name shown in HA UI."""
+    return ClientCredential(
+        name="myEKZ (Tariff Saver)",
+        domain=DOMAIN,
     )
