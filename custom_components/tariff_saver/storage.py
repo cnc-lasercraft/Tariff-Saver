@@ -1,24 +1,31 @@
-"""Persistent storage for Tariff Saver (with HA Store migration, robust across HA versions).
+"""Persistent storage for Tariff Saver (migration-safe).
 
-Fixes:
-- Prevents NotImplementedError during storage migration by providing a migrate func.
-- Uses a compatibility shim because HA Store argument name differs between versions
-  (async_migrate_func vs migrate_func).
+You are hitting:
+  NotImplementedError (helpers/storage.py:_async_migrate_func)
 
-Schema:
-v2 (legacy): samples: [[iso, kwh_total], ...], booked_slots: {iso: {...}}, price_slots: {iso: {"dyn":float,"base":float}}
-v4 (current): samples: [{"ts": epoch, "kwh": float}], booked: [{"start": iso, "kwh":..., "dyn":{...}, ...}], price_slots: {iso: {"dyn":{...},"base":{...}}}
+That ONLY happens when Home Assistant needs to migrate a Store file
+(version changed) but the Store instance was created WITHOUT a migrate callback.
+
+This file fixes that by:
+- Detecting the correct keyword argument name for the current HA version
+  (async_migrate_func vs migrate_func) using inspect.signature
+- Registering the migration callback reliably.
+
+Legacy supported:
+v2: price_slots {iso: {"dyn": float, "base": float}}, samples [[iso,kwh]], booked_slots {iso:{...}}
+v4: price_slots {iso: {"dyn":{...},"base":{...},"api_integrated":...}}, samples [{"ts":epoch,"kwh":...}], booked [ {...} ]
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any, Callable, Awaitable
+import inspect
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-# Components included in "all-in" sum for import costs (feed_in is export, excluded)
+# Components included in "all-in" import cost (feed_in is export; excluded)
 IMPORT_ALLIN_COMPONENTS = [
     "electricity",
     "grid",
@@ -37,8 +44,7 @@ class TariffSaverStore:
         self.hass = hass
         self.entry_id = entry_id
 
-        # --- robust Store init across HA versions ---
-        self._store = self._make_store(hass, entry_id)
+        self._store = self._create_store()
 
         self.price_slots: dict[str, dict[str, Any]] = {}
         self.samples: list[dict[str, float]] = []
@@ -46,32 +52,27 @@ class TariffSaverStore:
         self.last_api_success_utc: datetime | None = None
         self.dirty: bool = False
 
-    def _make_store(self, hass: HomeAssistant, entry_id: str) -> Store:
-        """Create HA Store with migration callback (compat across HA versions)."""
-        key = f"{self.STORAGE_KEY}.{entry_id}"
+    def _create_store(self) -> Store:
+        key = f"{self.STORAGE_KEY}.{self.entry_id}"
 
-        # Newer HA uses async_migrate_func, older used migrate_func (seen in custom forks).
-        for arg_name in ("async_migrate_func", "migrate_func"):
-            try:
-                kwargs = {
-                    "minor_version": self.STORAGE_MINOR_VERSION,
-                    arg_name: self._async_migrate,  # type: ignore[dict-item]
-                }
-                return Store(hass, self.STORAGE_VERSION, key, **kwargs)  # type: ignore[arg-type]
-            except TypeError:
-                continue
+        sig = inspect.signature(Store.__init__)
+        kwargs: dict[str, Any] = {"minor_version": self.STORAGE_MINOR_VERSION}
 
-        # If neither keyword exists, fall back (but then HA may NotImplementedError on version mismatch).
-        # We still return a Store; user would need to delete the storage file in that extreme case.
-        return Store(hass, self.STORAGE_VERSION, key, minor_version=self.STORAGE_MINOR_VERSION)
+        # HA core (modern) uses async_migrate_func. Some forks/older builds used migrate_func.
+        if "async_migrate_func" in sig.parameters:
+            kwargs["async_migrate_func"] = self._async_migrate
+        elif "migrate_func" in sig.parameters:
+            kwargs["migrate_func"] = self._async_migrate
+
+        return Store(self.hass, self.STORAGE_VERSION, key, **kwargs)
 
     # -------------------------
-    # Migration
+    # Migration callback
     # -------------------------
     async def _async_migrate(self, old_version: int, old_minor: int, old_data: dict[str, Any]) -> dict[str, Any]:
         data = dict(old_data or {})
 
-        # If stored is newer than our code, do NOT attempt to down-migrate; keep payload as-is.
+        # If stored is newer than our code, don't down-migrate.
         if old_version > self.STORAGE_VERSION:
             return data
 
@@ -154,8 +155,14 @@ class TariffSaverStore:
                 sav = float(payload.get("savings_chf", payload.get("sav", 0.0)) or 0.0)
                 status = str(payload.get("status", "ok" if dyn or base else "unpriced"))
                 new_booked.append(
-                    {"start": start_iso, "kwh": kwh, "status": status,
-                     "dyn": {"electricity": dyn}, "base": {"electricity": base}, "sav": {"electricity": sav}}
+                    {
+                        "start": start_iso,
+                        "kwh": kwh,
+                        "status": status,
+                        "dyn": {"electricity": dyn},
+                        "base": {"electricity": base},
+                        "sav": {"electricity": sav},
+                    }
                 )
             new_booked.sort(key=lambda x: str(x.get("start", "")))
 
@@ -213,7 +220,7 @@ class TariffSaverStore:
         }
 
     # -------------------------
-    # Public API
+    # Public helpers used by coordinator/sensors
     # -------------------------
     def set_last_api_success(self, when_utc: datetime) -> None:
         self.last_api_success_utc = dt_util.as_utc(when_utc)
@@ -234,7 +241,11 @@ class TariffSaverStore:
         if base_components_chf_per_kwh:
             base = {k: float(v) for k, v in base_components_chf_per_kwh.items() if isinstance(v, (int, float))}
 
-        self.price_slots[key] = {"dyn": dyn, "base": base, "api_integrated": float(api_integrated) if isinstance(api_integrated, (int, float)) else None}
+        self.price_slots[key] = {
+            "dyn": dyn,
+            "base": base,
+            "api_integrated": float(api_integrated) if isinstance(api_integrated, (int, float)) else None,
+        }
         self.dirty = True
 
     def get_price_components(self, start_utc: datetime) -> tuple[dict[str, float] | None, dict[str, float] | None, float | None]:
@@ -278,7 +289,7 @@ class TariffSaverStore:
         return ts_utc.replace(minute=minute, second=0, microsecond=0)
 
     def finalize_due_slots(self, now_utc: datetime) -> int:
-        # Keep implementation from prior version (unchanged):
+        # Keep the booking algorithm identical to the last working version.
         from datetime import timedelta as _td
 
         now_utc = dt_util.as_utc(now_utc)
@@ -348,7 +359,6 @@ class TariffSaverStore:
             base_cost: dict[str, float] = {}
             if base_prices:
                 base_cost = {c: delta * float(p) for c, p in base_prices.items() if isinstance(p, (int, float)) and float(p) != 0.0}
-
             sav_cost: dict[str, float] = {c: base_cost[c] - dyn_cost[c] for c in base_cost if c in dyn_cost}
 
             self.booked.append({"start": cursor.isoformat(), "kwh": delta, "status": "ok" if dyn_cost else "unpriced", "dyn": dyn_cost, "base": base_cost, "sav": sav_cost})
@@ -356,7 +366,6 @@ class TariffSaverStore:
             cursor += _td(minutes=15)
 
         if newly:
-            # trim booked
             cutoff_b = dt_util.utcnow() - timedelta(days=400)
             out = []
             for b in self.booked:
@@ -365,6 +374,7 @@ class TariffSaverStore:
                     out.append(b)
             self.booked = out
             self.dirty = True
+
         return newly
 
     def compute_period_breakdown(self, period: str) -> dict[str, dict[str, float]]:
