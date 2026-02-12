@@ -30,7 +30,7 @@ class TariffSaverStore:
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self.hass = hass
         self.entry_id = entry_id
-        self._store = Store(hass, self.STORAGE_VERSION, f"{self.STORAGE_KEY}.{entry_id}", minor_version=1)
+        self._store = Store(hass, self.STORAGE_VERSION, f"{self.STORAGE_KEY}.{entry_id}", minor_version=1, migrate_func=self._async_migrate)
 
         # price slots: iso -> dict with totals + optional component maps
         # {
