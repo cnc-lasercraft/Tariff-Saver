@@ -17,6 +17,27 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
+def _make_store(hass: HomeAssistant, version: int, key: str, minor_version: int, migrate_func):
+    """Create HA Store with the right migrate kwarg for this HA version."""
+    try:
+        # Newer HA versions
+        return Store(
+            hass,
+            version,
+            key,
+            minor_version=minor_version,
+            migrate_func=migrate_func,
+        )
+    except TypeError:
+        # Older HA versions used a different kwarg name
+        return Store(
+            hass,
+            version,
+            key,
+            minor_version=minor_version,
+            async_migrate_func=migrate_func,
+        )
+
 from homeassistant.util import dt as dt_util
 
 
@@ -25,12 +46,13 @@ class TariffSaverStore:
 
     # IMPORTANT: do NOT bump STORE version unless you also provide a migrate func.
     STORAGE_VERSION = 2
+    STORAGE_MINOR_VERSION = 1
     STORAGE_KEY = "tariff_saver"
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self.hass = hass
         self.entry_id = entry_id
-        self._store = Store(hass, self.STORAGE_VERSION, f"{self.STORAGE_KEY}.{entry_id}", minor_version=1, migrate_func=self._async_migrate)
+        self._store = _make_store(hass, self.STORAGE_VERSION, f"{self.STORAGE_KEY}.{entry_id}", self.STORAGE_MINOR_VERSION, self._async_migrate)
 
         # price slots: iso -> dict with totals + optional component maps
         # {
@@ -54,6 +76,39 @@ class TariffSaverStore:
     # -------------------------
     # Persistence
     # -------------------------
+
+    async def _async_migrate(self, old_version: int, old_minor_version: int, old_data: dict) -> dict:
+        """Migrate stored data to the current schema (permissive)."""
+        data = dict(old_data or {})
+
+        # required keys
+        data.setdefault("last_api_success_utc", None)
+        data.setdefault("samples", [])
+        data.setdefault("booked_slots", {})
+        data.setdefault("price_slots", {})
+
+        # Normalize legacy keys
+        if "booked" in data and "booked_slots" not in data:
+            data["booked_slots"] = data.pop("booked")
+
+        # Normalize price_slots structure
+        ps = data.get("price_slots") or {}
+        if isinstance(ps, dict):
+            for _k, v in ps.items():
+                if not isinstance(v, dict):
+                    continue
+                v.setdefault("dyn", None)
+                v.setdefault("base", None)
+                # New: component breakdown + totals
+                v.setdefault("components", {})
+                v.setdefault("baseline_components", {})
+                v.setdefault("total", None)
+                v.setdefault("baseline_total", None)
+        data["price_slots"] = ps
+
+        return data
+
+
     async def async_load(self) -> None:
         data = await self._store.async_load() or {}
 
