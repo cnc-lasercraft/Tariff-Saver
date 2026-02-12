@@ -153,6 +153,12 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             comps = EkzTariffApi.parse_components_chf_per_kwh(item)
             elec = float(comps.get("electricity", 0.0) or 0.0)
 
+            # Public API often returns only `electricity`. For cost calculations we need a usable
+            # total CHF/kWh. In public mode we therefore treat electricity as the total by
+            # injecting an `integrated` component if the API doesn't provide one.
+            if elec > 0 and "integrated" not in comps:
+                comps["integrated"] = elec
+
             slots.append(
                 PriceSlot(
                     start=dt_util.as_utc(dt_start),
