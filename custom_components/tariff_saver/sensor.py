@@ -695,7 +695,7 @@ class TariffSaverActualCostWeekSensor(TariffSaverActualCostTodaySensor):
     _store_fn_name = "compute_week_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_cost_week"
 
@@ -705,7 +705,7 @@ class TariffSaverBaselineCostWeekSensor(TariffSaverBaselineCostTodaySensor):
     _store_fn_name = "compute_week_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_baseline_cost_week"
 
@@ -715,7 +715,7 @@ class TariffSaverActualSavingsWeekSensor(TariffSaverActualSavingsTodaySensor):
     _store_fn_name = "compute_week_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_savings_week"
 
@@ -726,7 +726,7 @@ class TariffSaverActualCostMonthSensor(TariffSaverActualCostTodaySensor):
     _store_fn_name = "compute_month_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_cost_month"
 
@@ -736,7 +736,7 @@ class TariffSaverBaselineCostMonthSensor(TariffSaverBaselineCostTodaySensor):
     _store_fn_name = "compute_month_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_baseline_cost_month"
 
@@ -746,7 +746,7 @@ class TariffSaverActualSavingsMonthSensor(TariffSaverActualSavingsTodaySensor):
     _store_fn_name = "compute_month_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_savings_month"
 
@@ -757,7 +757,7 @@ class TariffSaverActualCostYearSensor(TariffSaverActualCostTodaySensor):
     _store_fn_name = "compute_year_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_cost_year"
 
@@ -767,7 +767,7 @@ class TariffSaverBaselineCostYearSensor(TariffSaverBaselineCostTodaySensor):
     _store_fn_name = "compute_year_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_baseline_cost_year"
 
@@ -777,7 +777,7 @@ class TariffSaverActualSavingsYearSensor(TariffSaverActualSavingsTodaySensor):
     _store_fn_name = "compute_year_totals"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
-        super(_BasePeriodCostSensor, self).__init__()  # type: ignore[misc]
+        CoordinatorEntity.__init__(self, coordinator)
         _BasePeriodCostSensor.__init__(self, coordinator, entry)
         self._attr_unique_id = f"{entry.entry_id}_actual_savings_year"
 
