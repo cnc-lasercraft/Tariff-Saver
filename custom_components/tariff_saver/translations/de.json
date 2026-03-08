@@ -1,70 +1,44 @@
 {
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tariff Saver Einrichtung",
+        "data": {
+          "name": "Name",
+          "consumption_energy_entity": "Verbrauchsenergie-Entität",
+          "ekz_entry_id": "EKZ Entry ID",
+          "pv_forecast_entity": "PV-Forecast Entität",
+          "pv_forecast_attribute": "PV-Forecast Attribut",
+          "feed_in_price_mode": "Einspeisepreis Modus",
+          "feed_in_fixed_price": "Fester Einspeisepreis (CHF/kWh)",
+          "feed_in_price_entity": "Einspeisepreis Entität",
+          "publish_time": "Publikationszeit"
+        }
+      }
+    }
+  },
   "options": {
     "step": {
       "init": {
         "title": "Tariff Saver Optionen",
-        "description": "Preisquelle, Baseline und optionalen Solar-Forecast konfigurieren.",
         "data": {
-          "price_mode": "Preisquelle",
-          "import_provider": "Import-Anbieter",
-          "source_interval_minutes": "Tarif-Intervall",
-          "normalization_mode": "Normalisierung",
-          "import_entity_dyn": "Importierte dynamische Preis-Entität",
-          "baseline_mode": "Baseline-Quelle",
-          "baseline_value": "Baseline-Preis (pro kWh)",
-          "baseline_entity": "Baseline-Entität",
-          "price_scale": "Preisskalierung (Multiplikator)",
-          "ignore_zero_prices": "0-/Negative Preise ignorieren",
-          "solar_enabled": "Solaranlage vorhanden",
-          "solar_provider": "Solar-Forecast Anbieter",
-          "solar_forecast_entity": "Solar-Forecast Entität",
-          "solar_forecast_attribute": "Solar-Forecast Attribut",
-          "solar_interval_minutes": "Solar-Forecast Intervall",
-          "feed_in_energy_rp_per_kwh": "Einspeisetarif Energie (Rp/kWh)",
-          "feed_in_hkn_rp_per_kwh": "HKN Vergütung (Rp/kWh)"
+          "consumption_energy_entity": "Verbrauchsenergie-Entität",
+          "ekz_entry_id": "EKZ Entry ID",
+          "pv_forecast_entity": "PV-Forecast Entität",
+          "pv_forecast_attribute": "PV-Forecast Attribut",
+          "feed_in_price_mode": "Einspeisepreis Modus",
+          "feed_in_fixed_price": "Fester Einspeisepreis (CHF/kWh)",
+          "feed_in_price_entity": "Einspeisepreis Entität",
+          "publish_time": "Publikationszeit"
         }
       }
     }
   },
   "selector": {
-    "price_mode": {
+    "feed_in_price_mode": {
       "options": {
-        "api": "API",
-        "import": "Import aus Entität"
-      }
-    },
-    "import_provider": {
-      "options": {
-        "ekz_api": "EKZ (API)"
-      }
-    },
-    "source_interval": {
-      "options": {
-        "15": "15 Minuten",
-        "60": "60 Minuten"
-      }
-    },
-    "normalization_mode": {
-      "options": {
-        "repeat": "Auf 15-Minuten-Slots replizieren"
-      }
-    },
-    "baseline_mode": {
-      "options": {
-        "api": "Aus API",
-        "fixed": "Fixer Wert",
-        "entity": "Aus Entität"
-      }
-    },
-    "solar_provider": {
-      "options": {
-        "solcast": "Solcast PV Forecast"
-      }
-    },
-    "solar_interval": {
-      "options": {
-        "30": "30 Minuten",
-        "60": "60 Minuten"
+        "fixed": "Fester Wert",
+        "entity": "Entität"
       }
     }
   }
