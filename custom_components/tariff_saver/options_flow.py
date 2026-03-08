@@ -5,7 +5,8 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant import config_entries, selector
+from homeassistant import config_entries
+from homeassistant.helpers import selector
 
 from .const import (
     CONF_CONSUMPTION_ENERGY_ENTITY,
