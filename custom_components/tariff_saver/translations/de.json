@@ -1,37 +1,70 @@
 {
-  "config": {
-    "step": {
-      "user": {
-        "title": "Tariff Saver",
-        "description": "Erstellt eine neue Tariff Saver Instanz.",
-        "data": {
-          "name": "Name"
-        }
-      }
-    }
-  },
   "options": {
     "step": {
       "init": {
         "title": "Tariff Saver Optionen",
-        "description": "Wähle, woher Tariff Saver seine Slots bezieht.",
+        "description": "Preisquelle, Baseline und optionalen Solar-Forecast konfigurieren.",
         "data": {
-          "source_type": "Slot-Quelle",
-          "consumption_energy_entity": "Verbrauchs-Energie Entität",
-          "publish_time": "Tägliche Aktualisierungszeit",
-          "price_scale": "Preisskalierung",
-          "ignore_zero_prices": "Null- oder negative Preise ignorieren"
-        }
-      },
-      "entities": {
-        "title": "Entitätsbasierte Slot-Quelle",
-        "description": "Konfiguriere bestehende Entitäten, die bereits Slot-Listen enthalten.",
-        "data": {
-          "price_entity": "Dynamische Preis-Entität",
-          "price_attribute": "Attribut für dynamische Preise",
+          "price_mode": "Preisquelle",
+          "import_provider": "Import-Anbieter",
+          "source_interval_minutes": "Tarif-Intervall",
+          "normalization_mode": "Normalisierung",
+          "import_entity_dyn": "Importierte dynamische Preis-Entität",
+          "baseline_mode": "Baseline-Quelle",
+          "baseline_value": "Baseline-Preis (pro kWh)",
           "baseline_entity": "Baseline-Entität",
-          "baseline_attribute": "Attribut für Baseline"
+          "price_scale": "Preisskalierung (Multiplikator)",
+          "ignore_zero_prices": "0-/Negative Preise ignorieren",
+          "solar_enabled": "Solaranlage vorhanden",
+          "solar_provider": "Solar-Forecast Anbieter",
+          "solar_forecast_entity": "Solar-Forecast Entität",
+          "solar_forecast_attribute": "Solar-Forecast Attribut",
+          "solar_interval_minutes": "Solar-Forecast Intervall",
+          "feed_in_energy_rp_per_kwh": "Einspeisetarif Energie (Rp/kWh)",
+          "feed_in_hkn_rp_per_kwh": "HKN Vergütung (Rp/kWh)"
         }
+      }
+    }
+  },
+  "selector": {
+    "price_mode": {
+      "options": {
+        "api": "API",
+        "import": "Import aus Entität"
+      }
+    },
+    "import_provider": {
+      "options": {
+        "ekz_api": "EKZ (API)"
+      }
+    },
+    "source_interval": {
+      "options": {
+        "15": "15 Minuten",
+        "60": "60 Minuten"
+      }
+    },
+    "normalization_mode": {
+      "options": {
+        "repeat": "Auf 15-Minuten-Slots replizieren"
+      }
+    },
+    "baseline_mode": {
+      "options": {
+        "api": "Aus API",
+        "fixed": "Fixer Wert",
+        "entity": "Aus Entität"
+      }
+    },
+    "solar_provider": {
+      "options": {
+        "solcast": "Solcast PV Forecast"
+      }
+    },
+    "solar_interval": {
+      "options": {
+        "30": "30 Minuten",
+        "60": "60 Minuten"
       }
     }
   }
