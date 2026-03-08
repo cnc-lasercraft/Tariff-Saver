@@ -1,7 +1,7 @@
 """Sensor platform for Tariff Saver (prices + costs)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
@@ -10,7 +10,7 @@ from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
@@ -68,31 +68,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     energy_entity = entry.options.get(CONF_CONSUMPTION_ENERGY_ENTITY) or entry.data.get(CONF_CONSUMPTION_ENERGY_ENTITY)
     if isinstance(energy_entity, str) and energy_entity:
 
+        def _process_energy_state(state: Any, *, when_utc: datetime | None = None) -> None:
+            if state is None:
+                return
+            try:
+                kwh_total = float(state.state)
+            except Exception:
+                return
+
+            store = getattr(coordinator, "store", None)
+            if store is None:
+                return
+
+            now_utc = when_utc or dt_util.utcnow()
+            added = store.add_sample(now_utc, kwh_total)
+            newly = store.finalize_due_slots(now_utc)
+
+            if store.dirty:
+                hass.async_create_task(store.async_save())
+            if added or newly > 0:
+                async_dispatcher_send(hass, f"{SIGNAL_STORE_UPDATED}_{entry.entry_id}")
+
         @callback
         def _on_energy_change(event: Event) -> None:
             new_state = event.data.get("new_state")
             if new_state is None:
                 return
-            try:
-                kwh_total = float(new_state.state)
-            except Exception:
-                return
-            store = getattr(coordinator, "store", None)
-            if store is None:
-                return
+            _process_energy_state(new_state)
 
-            now_utc = dt_util.utcnow()
-            if not store.add_sample(now_utc, kwh_total):
+        @callback
+        def _periodic_energy_tick(now: datetime) -> None:
+            state = hass.states.get(energy_entity)
+            if state is None:
                 return
+            _process_energy_state(state, when_utc=dt_util.as_utc(now))
 
-            newly = store.finalize_due_slots(now_utc)
-            if store.dirty:
-                hass.async_create_task(store.async_save())
-            if newly > 0:
-                async_dispatcher_send(hass, f"{SIGNAL_STORE_UPDATED}_{entry.entry_id}")
+        unsub_state = async_track_state_change_event(hass, [energy_entity], _on_energy_change)
+        unsub_tick = async_track_time_interval(hass, _periodic_energy_tick, timedelta(minutes=5))
+        hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_cost"] = lambda: (unsub_state(), unsub_tick())
 
-        unsub = async_track_state_change_event(hass, [energy_entity], _on_energy_change)
-        hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_cost"] = unsub
+        current_state = hass.states.get(energy_entity)
+        if current_state is not None:
+            _process_energy_state(current_state)
 
     entities: list[SensorEntity] = [
         TariffSaverPriceCurveSensor(coordinator, entry),

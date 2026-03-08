@@ -158,6 +158,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unsub = hass.data.get(DOMAIN, {}).pop(f"{entry.entry_id}_unsub_energy_cost", None)
     if unsub:
         unsub()
+    unsub = hass.data.get(DOMAIN, {}).pop(f"{entry.entry_id}_unsub_energy_cost_tick", None)
+    if unsub:
+        unsub()
     if unload_ok and DOMAIN in hass.data:
         hass.data[DOMAIN].pop(entry.entry_id, None)
         remaining_entries = [
