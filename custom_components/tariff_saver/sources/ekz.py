@@ -5,12 +5,11 @@ It only reads data already exposed by the separate ha-ekz-tariff integration.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
 from homeassistant.exceptions import HomeAssistantError
 
-from ..const import EKZ_DOMAIN
 from ..models import PriceSlot
 from ..slot_helpers import normalize_slots
 from .base import SlotSource
@@ -19,96 +18,60 @@ from .base import SlotSource
 class EkzSlotSource(SlotSource):
     """Read slots from the standalone EKZ tariff provider integration."""
 
-    def _iter_candidates(self, value: Any, seen: set[int] | None = None, depth: int = 0):
-        """Walk nested hass.data structures and yield possible provider objects."""
-        if value is None or depth > 6:
-            return
-        if seen is None:
-            seen = set()
-        obj_id = id(value)
-        if obj_id in seen:
-            return
-        seen.add(obj_id)
-
-        yield value
-
-        if isinstance(value, Mapping):
-            for nested in value.values():
-                yield from self._iter_candidates(nested, seen, depth + 1)
-            return
-
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            for nested in value:
-                yield from self._iter_candidates(nested, seen, depth + 1)
-            return
-
-        for attr in (
-            "coordinator",
-            "api",
-            "client",
-            "entry",
-            "provider",
-            "source",
-            "data",
-            "runtime_data",
-        ):
-            if hasattr(value, attr):
-                try:
-                    nested = getattr(value, attr)
-                except Exception:
-                    continue
-                yield from self._iter_candidates(nested, seen, depth + 1)
-
-    def _extract_raw_slots(self, candidate: Any, field_name: str) -> list[Any] | None:
-        """Try many common provider/coordinator layouts."""
-        if candidate is None:
+    def _unwrap_payload(self, obj: Any) -> dict[str, Any] | None:
+        """Try to unwrap the actual provider payload dict."""
+        if obj is None:
             return None
 
-        if isinstance(candidate, Mapping):
-            raw = candidate.get(field_name)
-            if isinstance(raw, list):
-                return raw
-            data = candidate.get("data")
-            if isinstance(data, Mapping):
-                raw = data.get(field_name)
-                if isinstance(raw, list):
-                    return raw
-            coordinator = candidate.get("coordinator")
-            if coordinator is not None:
-                raw = self._extract_raw_slots(coordinator, field_name)
-                if raw is not None:
-                    return raw
-            return None
+        if isinstance(obj, Mapping):
+            if isinstance(obj.get("slots_today"), list) or isinstance(obj.get("baseline_slots"), list):
+                return dict(obj)
 
-        raw = getattr(candidate, field_name, None)
-        if isinstance(raw, list):
-            return raw
+            for key in ("data", "provider_data", "payload", "coordinator_data"):
+                nested = obj.get(key)
+                unwrapped = self._unwrap_payload(nested)
+                if unwrapped is not None:
+                    return unwrapped
 
-        data = getattr(candidate, "data", None)
-        if isinstance(data, Mapping):
-            raw = data.get(field_name)
-            if isinstance(raw, list):
-                return raw
+        for attr in ("data", "provider_data", "payload", "coordinator_data"):
+            nested = getattr(obj, attr, None)
+            unwrapped = self._unwrap_payload(nested)
+            if unwrapped is not None:
+                return unwrapped
 
         return None
 
-    def _find_raw_slots(self, field_name: str) -> list[Any] | None:
-        domain_data = self.hass.data.get(EKZ_DOMAIN)
-        if domain_data is None:
-            return None
+    def _get_provider_payload(self) -> dict[str, Any] | None:
+        """Return provider payload from the EKZ integration helper API."""
+        try:
+            from custom_components.ekz_tariff import (  # type: ignore
+                get_first_provider_data,
+                get_provider_data,
+            )
+        except Exception as err:  # pragma: no cover - import depends on runtime HA setup
+            raise HomeAssistantError(
+                "Could not import EKZ Tariff provider helpers from custom_components.ekz_tariff"
+            ) from err
 
-        for candidate in self._iter_candidates(domain_data):
-            raw = self._extract_raw_slots(candidate, field_name)
-            if isinstance(raw, list) and raw:
-                return raw
-        return None
+        entry_id = self.config.get("ekz_entry_id")
+        provider_obj = None
+
+        if isinstance(entry_id, str) and entry_id.strip():
+            provider_obj = get_provider_data(self.hass, entry_id.strip())
+        else:
+            provider_obj = get_first_provider_data(self.hass)
+
+        return self._unwrap_payload(provider_obj)
 
     async def async_get_price_slots(self) -> list[PriceSlot]:
-        raw_slots = self._find_raw_slots("slots_today")
-        if raw_slots is None:
+        provider_data = self._get_provider_payload()
+        if provider_data is None:
+            raise HomeAssistantError("No EKZ Tariff provider data available")
+
+        raw_slots = provider_data.get("slots_today")
+        if not isinstance(raw_slots, list):
             raise HomeAssistantError(
-                "EKZ Tariff provider does not expose slots_today in hass.data; "
-                "check sources/ekz.py against the provider's real runtime structure"
+                "EKZ Tariff provider payload does not contain slots_today"
             )
 
         slots = normalize_slots(raw_slots, price_scale=1.0, ignore_zero_prices=True)
@@ -118,15 +81,30 @@ class EkzSlotSource(SlotSource):
         raise HomeAssistantError("EKZ Tariff slots_today was found but could not be parsed")
 
     async def async_get_baseline_slots(self) -> list[PriceSlot]:
-        raw_slots = self._find_raw_slots("baseline_slots")
-        if raw_slots is None:
+        provider_data = self._get_provider_payload()
+        if provider_data is None:
             return []
+
+        raw_slots = provider_data.get("baseline_slots")
+        if not isinstance(raw_slots, list):
+            return []
+
         return normalize_slots(raw_slots, price_scale=1.0, ignore_zero_prices=True)
 
     async def async_get_metadata(self) -> dict[str, Any]:
+        provider_data = self._get_provider_payload()
+        if provider_data is None:
+            return {
+                "source_type": "ekz",
+                "provider_available": False,
+            }
+
         return {
             "source_type": "ekz",
-            "provider_domain": EKZ_DOMAIN,
-            "slots_today_found": self._find_raw_slots("slots_today") is not None,
-            "baseline_slots_found": self._find_raw_slots("baseline_slots") is not None,
+            "provider_available": True,
+            "slots_today_found": isinstance(provider_data.get("slots_today"), list),
+            "baseline_slots_found": isinstance(provider_data.get("baseline_slots"), list),
+            "publication_timestamp": provider_data.get("publication_timestamp"),
+            "baseline_publication_timestamp": provider_data.get("baseline_publication_timestamp"),
+            "link_status": provider_data.get("link_status"),
         }
