@@ -9,9 +9,6 @@ from homeassistant.config_entries import ConfigEntry, OptionsFlow
 from homeassistant.helpers.selector import (
     EntitySelector,
     EntitySelectorConfig,
-    NumberSelector,
-    NumberSelectorConfig,
-    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -29,7 +26,6 @@ from .const import (
     CONF_PUBLISH_TIME,
     CONF_PV_FORECAST_ATTRIBUTE,
     CONF_PV_FORECAST_ENTITY,
-    SOURCE_EKZ,
 )
 
 
@@ -46,23 +42,43 @@ class TariffSaverOptionsFlow(OptionsFlow):
         options = dict(self.config_entry.options)
 
         if user_input is not None:
-            mode = user_input.get(CONF_FEED_IN_PRICE_MODE, "fixed")
-            feed_in_entity = str(user_input.get(CONF_FEED_IN_PRICE_ENTITY, "") or "").strip()
+            cleaned = dict(user_input)
 
-            # Empty entity is allowed unless entity mode is selected.
-            if mode == "entity" and not feed_in_entity:
+            cleaned[CONF_EKZ_ENTRY_ID] = str(
+                cleaned.get(CONF_EKZ_ENTRY_ID, "") or ""
+            ).strip()
+            cleaned[CONF_PV_FORECAST_ATTRIBUTE] = str(
+                cleaned.get(CONF_PV_FORECAST_ATTRIBUTE, "detailedForecast") or "detailedForecast"
+            ).strip()
+            cleaned[CONF_PUBLISH_TIME] = str(
+                cleaned.get(CONF_PUBLISH_TIME, "18:15") or "18:15"
+            ).strip()
+            cleaned[CONF_FEED_IN_PRICE_MODE] = str(
+                cleaned.get(CONF_FEED_IN_PRICE_MODE, "fixed") or "fixed"
+            ).strip()
+            cleaned[CONF_FEED_IN_PRICE_ENTITY] = str(
+                cleaned.get(CONF_FEED_IN_PRICE_ENTITY, "") or ""
+            ).strip()
+
+            raw_fixed = str(cleaned.get(CONF_FEED_IN_FIXED_PRICE, "") or "").strip()
+
+            # Accept decimals with dot OR comma.
+            if raw_fixed == "":
+                cleaned[CONF_FEED_IN_FIXED_PRICE] = 0.0
+            else:
+                try:
+                    cleaned[CONF_FEED_IN_FIXED_PRICE] = float(raw_fixed.replace(",", "."))
+                except ValueError:
+                    errors[CONF_FEED_IN_FIXED_PRICE] = "invalid_number"
+
+            # Only require an entity when entity mode is selected.
+            if (
+                cleaned.get(CONF_FEED_IN_PRICE_MODE) == "entity"
+                and not cleaned.get(CONF_FEED_IN_PRICE_ENTITY)
+            ):
                 errors[CONF_FEED_IN_PRICE_ENTITY] = "required"
 
             if not errors:
-                cleaned = dict(user_input)
-                cleaned[CONF_EKZ_ENTRY_ID] = str(cleaned.get(CONF_EKZ_ENTRY_ID, "") or "").strip()
-                cleaned[CONF_PV_FORECAST_ATTRIBUTE] = str(
-                    cleaned.get(CONF_PV_FORECAST_ATTRIBUTE, "") or ""
-                ).strip()
-                cleaned[CONF_FEED_IN_PRICE_ENTITY] = feed_in_entity
-                cleaned[CONF_PUBLISH_TIME] = str(
-                    cleaned.get(CONF_PUBLISH_TIME, "18:15") or "18:15"
-                ).strip()
                 return self.async_create_entry(title="", data=cleaned)
 
         schema = vol.Schema(
@@ -70,9 +86,7 @@ class TariffSaverOptionsFlow(OptionsFlow):
                 vol.Optional(
                     CONF_CONSUMPTION_ENERGY_ENTITY,
                     default=options.get(CONF_CONSUMPTION_ENERGY_ENTITY),
-                ): EntitySelector(
-                    EntitySelectorConfig(domain="sensor")
-                ),
+                ): EntitySelector(EntitySelectorConfig(domain="sensor")),
                 vol.Optional(
                     CONF_EKZ_ENTRY_ID,
                     default=options.get(CONF_EKZ_ENTRY_ID, ""),
@@ -80,15 +94,11 @@ class TariffSaverOptionsFlow(OptionsFlow):
                 vol.Optional(
                     CONF_PV_FORECAST_ENTITY,
                     default=options.get(CONF_PV_FORECAST_ENTITY),
-                ): EntitySelector(
-                    EntitySelectorConfig(domain="sensor")
-                ),
+                ): EntitySelector(EntitySelectorConfig(domain="sensor")),
                 vol.Optional(
                     CONF_PV_FORECAST_ATTRIBUTE,
                     default=options.get(CONF_PV_FORECAST_ATTRIBUTE, "detailedForecast"),
-                ): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.TEXT)
-                ),
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
                 vol.Required(
                     CONF_FEED_IN_PRICE_MODE,
                     default=options.get(CONF_FEED_IN_PRICE_MODE, "fixed"),
@@ -98,31 +108,20 @@ class TariffSaverOptionsFlow(OptionsFlow):
                         mode=SelectSelectorMode.DROPDOWN,
                     )
                 ),
+                # Text field on purpose: this avoids integer-only browser widgets.
                 vol.Optional(
                     CONF_FEED_IN_FIXED_PRICE,
-                    default=float(options.get(CONF_FEED_IN_FIXED_PRICE, 0.0) or 0.0),
-                ): NumberSelector(
-                    NumberSelectorConfig(
-                        min=-10.0,
-                        max=10.0,
-                        step=0.001,
-                        mode=NumberSelectorMode.BOX,
-                    )
-                ),
-                # Use TextSelector on purpose so an empty value is accepted.
-                # Validation is handled manually above only when mode == "entity".
+                    default=str(options.get(CONF_FEED_IN_FIXED_PRICE, "0.0")),
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+                # Text field on purpose: empty value must be allowed.
                 vol.Optional(
                     CONF_FEED_IN_PRICE_ENTITY,
                     default=options.get(CONF_FEED_IN_PRICE_ENTITY, ""),
-                ): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.TEXT)
-                ),
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
                 vol.Optional(
                     CONF_PUBLISH_TIME,
                     default=options.get(CONF_PUBLISH_TIME, "18:15"),
-                ): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.TEXT)
-                ),
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
             }
         )
 
