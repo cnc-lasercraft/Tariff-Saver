@@ -48,6 +48,16 @@ def _windows(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
     return data.get("windows", {}) if isinstance(data, dict) else {}
 
 
+def _pv(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
+    data = coordinator.data or {}
+    return data.get("pv", {}) if isinstance(data, dict) else {}
+
+
+def _feed_in(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
+    data = coordinator.data or {}
+    return data.get("feed_in", {}) if isinstance(data, dict) else {}
+
+
 def _current_slot(slots: list[PriceSlot]) -> PriceSlot | None:
     if not slots:
         return None
@@ -159,6 +169,9 @@ async def async_setup_entry(
         TariffSaverScoreStarsSensor(coordinator, entry, 10),
         TariffSaverDayScoreSensor(coordinator, entry),
         TariffSaverDayScoreStarsSensor(coordinator, entry, 5),
+        TariffSaverPvForecastCurveSensor(coordinator, entry),
+        TariffSaverPvForecastRemainingSensor(coordinator, entry),
+        TariffSaverFeedInPriceSensor(coordinator, entry),
         PeriodCostSensor(entry, coordinator, "today", "dyn", "actual_cost_today", "Actual cost today"),
         PeriodCostSensor(entry, coordinator, "today", "base", "baseline_cost_today", "Baseline cost today", icon="mdi:cash-multiple"),
         PeriodCostSensor(entry, coordinator, "today", "sav", "actual_savings_today", "Savings today", icon="mdi:piggy-bank", state_class="measurement"),
@@ -346,6 +359,84 @@ class TariffSaverDayScoreStarsSensor(CoordinatorEntity[TariffSaverCoordinator], 
     def native_value(self) -> int | None:
         score = _stats(self.coordinator).get("day_score_0_100")
         return _stars(score if isinstance(score, int) else None, self.scale)
+
+
+class TariffSaverPvForecastCurveSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "PV forecast curve"
+    _attr_icon = "mdi:solar-power-variant-outline"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_pv_forecast_curve"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> int | None:
+        value = _pv(self.coordinator).get("slot_count")
+        return int(value) if isinstance(value, int) else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        pv = _pv(self.coordinator)
+        slots = pv.get("slots") or []
+        return {
+            "configured": pv.get("configured"),
+            "entity_id": pv.get("entity_id"),
+            "attribute": pv.get("attribute"),
+            "interval_minutes": pv.get("interval_minutes"),
+            "remaining_energy_kwh": pv.get("remaining_energy_kwh"),
+            "slots": [
+                {
+                    "start": slot.get("start").isoformat() if isinstance(slot.get("start"), datetime) else slot.get("start"),
+                    "pv_power_kw": slot.get("pv_power_kw"),
+                    "pv_energy_kwh": slot.get("pv_energy_kwh"),
+                }
+                for slot in slots
+            ],
+        }
+
+
+class TariffSaverPvForecastRemainingSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "PV forecast remaining"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_icon = "mdi:weather-sunny"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_pv_forecast_remaining"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> float | None:
+        value = _pv(self.coordinator).get("remaining_energy_kwh")
+        return round(float(value), 3) if isinstance(value, (int, float)) and value >= 0 else None
+
+
+class TariffSaverFeedInPriceSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Feed-in price"
+    _attr_native_unit_of_measurement = "CHF/kWh"
+    _attr_icon = "mdi:transmission-tower-export"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_feed_in_price"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> float | None:
+        value = _feed_in(self.coordinator).get("price_chf_per_kwh")
+        return round(float(value), 6) if isinstance(value, (int, float)) and value >= 0 else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        feed_in = _feed_in(self.coordinator)
+        return {
+            "mode": feed_in.get("mode"),
+            "entity_id": feed_in.get("entity_id"),
+        }
 
 
 class BestWindowStartSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
