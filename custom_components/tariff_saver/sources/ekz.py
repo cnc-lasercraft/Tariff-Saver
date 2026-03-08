@@ -5,113 +5,128 @@ It only reads data already exposed by the separate ha-ekz-tariff integration.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.util import dt as dt_util
 
 from ..const import EKZ_DOMAIN
 from ..models import PriceSlot
+from ..slot_helpers import normalize_slots
 from .base import SlotSource
 
 
 class EkzSlotSource(SlotSource):
     """Read slots from the standalone EKZ tariff provider integration."""
 
-    def _find_provider_coordinator(self) -> Any:
-        domain_data = self.hass.data.get(EKZ_DOMAIN)
-        if not isinstance(domain_data, dict):
+    def _iter_candidates(self, value: Any, seen: set[int] | None = None, depth: int = 0):
+        """Walk nested hass.data structures and yield possible provider objects."""
+        if value is None or depth > 6:
+            return
+        if seen is None:
+            seen = set()
+        obj_id = id(value)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        yield value
+
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                yield from self._iter_candidates(nested, seen, depth + 1)
+            return
+
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for nested in value:
+                yield from self._iter_candidates(nested, seen, depth + 1)
+            return
+
+        for attr in (
+            "coordinator",
+            "api",
+            "client",
+            "entry",
+            "provider",
+            "source",
+            "data",
+            "runtime_data",
+        ):
+            if hasattr(value, attr):
+                try:
+                    nested = getattr(value, attr)
+                except Exception:
+                    continue
+                yield from self._iter_candidates(nested, seen, depth + 1)
+
+    def _extract_raw_slots(self, candidate: Any, field_name: str) -> list[Any] | None:
+        """Try many common provider/coordinator layouts."""
+        if candidate is None:
             return None
-        for value in domain_data.values():
-            if hasattr(value, "data") or hasattr(value, "slots_today") or hasattr(value, "baseline_slots"):
-                return value
+
+        if isinstance(candidate, Mapping):
+            raw = candidate.get(field_name)
+            if isinstance(raw, list):
+                return raw
+            data = candidate.get("data")
+            if isinstance(data, Mapping):
+                raw = data.get(field_name)
+                if isinstance(raw, list):
+                    return raw
+            coordinator = candidate.get("coordinator")
+            if coordinator is not None:
+                raw = self._extract_raw_slots(coordinator, field_name)
+                if raw is not None:
+                    return raw
+            return None
+
+        raw = getattr(candidate, field_name, None)
+        if isinstance(raw, list):
+            return raw
+
+        data = getattr(candidate, "data", None)
+        if isinstance(data, Mapping):
+            raw = data.get(field_name)
+            if isinstance(raw, list):
+                return raw
+
         return None
 
-    @staticmethod
-    def _from_provider_slot(slot: Any) -> PriceSlot | None:
-        start = getattr(slot, "start", None)
-        if start is None:
+    def _find_raw_slots(self, field_name: str) -> list[Any] | None:
+        domain_data = self.hass.data.get(EKZ_DOMAIN)
+        if domain_data is None:
             return None
-        start = dt_util.as_utc(start)
 
-        components = getattr(slot, "components_chf_per_kwh", None)
-        if not isinstance(components, dict):
-            components = {}
-
-        electricity = getattr(slot, "electricity", None)
-        if not isinstance(electricity, (int, float)):
-            electricity = getattr(slot, "electricity_chf_per_kwh", None)
-        if not isinstance(electricity, (int, float)):
-            electricity = float(components.get("electricity", 0.0) or 0.0)
-
-        grid = getattr(slot, "grid", None)
-        if not isinstance(grid, (int, float)):
-            grid = float(components.get("grid", 0.0) or 0.0)
-
-        regional_fees = getattr(slot, "regional_fees", None)
-        if not isinstance(regional_fees, (int, float)):
-            regional_fees = float(components.get("regional_fees", 0.0) or 0.0)
-
-        integrated = getattr(slot, "integrated", None)
-        if not isinstance(integrated, (int, float)):
-            integrated = float(components.get("integrated", 0.0) or 0.0)
-
-        return PriceSlot(
-            start=start,
-            electricity=float(electricity or 0.0),
-            grid=float(grid or 0.0),
-            regional_fees=float(regional_fees or 0.0),
-            integrated=float(integrated or 0.0),
-            components={str(k): float(v) for k, v in components.items() if isinstance(v, (int, float))},
-        )
-
-    def _convert_slots(self, raw_slots: Any) -> list[PriceSlot]:
-        if not isinstance(raw_slots, list):
-            return []
-        slots: dict[str, PriceSlot] = {}
-        for raw in raw_slots:
-            slot = self._from_provider_slot(raw)
-            if slot is None:
-                continue
-            if slot.electricity_chf_per_kwh <= 0 and slot.integrated <= 0:
-                continue
-            slots[slot.start.isoformat()] = slot
-        return [slots[key] for key in sorted(slots)]
+        for candidate in self._iter_candidates(domain_data):
+            raw = self._extract_raw_slots(candidate, field_name)
+            if isinstance(raw, list) and raw:
+                return raw
+        return None
 
     async def async_get_price_slots(self) -> list[PriceSlot]:
-        provider = self._find_provider_coordinator()
-        if provider is None:
-            raise HomeAssistantError("EKZ Tariff provider integration not found")
+        raw_slots = self._find_raw_slots("slots_today")
+        if raw_slots is None:
+            raise HomeAssistantError(
+                "EKZ Tariff provider does not expose slots_today in hass.data; "
+                "check sources/ekz.py against the provider's real runtime structure"
+            )
 
-        data = getattr(provider, "data", None)
-        if isinstance(data, dict) and isinstance(data.get("slots_today"), list):
-            return self._convert_slots(data.get("slots_today"))
+        slots = normalize_slots(raw_slots, price_scale=1.0, ignore_zero_prices=True)
+        if slots:
+            return slots
 
-        slots_today = getattr(provider, "slots_today", None)
-        if isinstance(slots_today, list):
-            return self._convert_slots(slots_today)
-
-        raise HomeAssistantError("EKZ Tariff provider does not expose slots_today")
+        raise HomeAssistantError("EKZ Tariff slots_today was found but could not be parsed")
 
     async def async_get_baseline_slots(self) -> list[PriceSlot]:
-        provider = self._find_provider_coordinator()
-        if provider is None:
+        raw_slots = self._find_raw_slots("baseline_slots")
+        if raw_slots is None:
             return []
-
-        data = getattr(provider, "data", None)
-        if isinstance(data, dict) and isinstance(data.get("baseline_slots"), list):
-            return self._convert_slots(data.get("baseline_slots"))
-
-        baseline_slots = getattr(provider, "baseline_slots", None)
-        if isinstance(baseline_slots, list):
-            return self._convert_slots(baseline_slots)
-
-        return []
+        return normalize_slots(raw_slots, price_scale=1.0, ignore_zero_prices=True)
 
     async def async_get_metadata(self) -> dict[str, Any]:
-        provider = self._find_provider_coordinator()
         return {
             "source_type": "ekz",
             "provider_domain": EKZ_DOMAIN,
-            "provider_found": provider is not None,
+            "slots_today_found": self._find_raw_slots("slots_today") is not None,
+            "baseline_slots_found": self._find_raw_slots("baseline_slots") is not None,
         }
