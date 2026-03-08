@@ -1,7 +1,7 @@
 """Lightweight persistent storage for Tariff Saver."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -9,8 +9,6 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 
-# Work-price components in CHF/kWh.
-# integrated/all_in are fallbacks only and must not be added on top.
 IMPORT_ALLIN_COMPONENTS: tuple[str, ...] = (
     "electricity",
     "grid",
@@ -23,7 +21,7 @@ _FALLBACK_TOTAL_KEYS: tuple[str, ...] = ("integrated", "all_in")
 class TariffSaverStore:
     """Persists recent energy samples, price slots and finalized 15-min slots."""
 
-    STORAGE_VERSION = 3
+    STORAGE_VERSION = 4
     STORAGE_MINOR_VERSION = 0
     STORAGE_KEY = "tariff_saver"
 
@@ -42,6 +40,7 @@ class TariffSaverStore:
         self.price_slots: dict[str, dict[str, Any]] = {}
         self.samples: list[dict[str, float]] = []
         self.booked: list[dict[str, Any]] = []
+        self.day_average_prices: dict[str, float] = {}
 
         self.last_api_success_utc: datetime | None = None
         self.energy_baseline_kwh: float | None = None
@@ -54,6 +53,7 @@ class TariffSaverStore:
         data.setdefault("price_slots", {})
         data.setdefault("samples", [])
         data.setdefault("booked", [])
+        data.setdefault("day_average_prices", {})
         data.setdefault("last_api_success_utc", None)
         data.setdefault("energy_baseline_kwh", None)
         data.setdefault("energy_baseline_timestamp_utc", None)
@@ -77,6 +77,10 @@ class TariffSaverStore:
         else:
             data["price_slots"] = {}
 
+        dap = data.get("day_average_prices")
+        if not isinstance(dap, dict):
+            data["day_average_prices"] = {}
+
         return data
 
     async def async_load(self) -> None:
@@ -85,6 +89,11 @@ class TariffSaverStore:
         self.price_slots = dict(data.get("price_slots") or {})
         self.samples = list(data.get("samples") or [])
         self.booked = list(data.get("booked") or [])
+        self.day_average_prices = {
+            str(k): float(v)
+            for k, v in (data.get("day_average_prices") or {}).items()
+            if isinstance(v, (int, float))
+        }
 
         ts = data.get("last_api_success_utc")
         if isinstance(ts, str):
@@ -114,6 +123,7 @@ class TariffSaverStore:
             "price_slots": self.price_slots,
             "samples": self.samples,
             "booked": self.booked,
+            "day_average_prices": self.day_average_prices,
             "last_api_success_utc": self.last_api_success_utc.isoformat() if self.last_api_success_utc else None,
             "energy_baseline_kwh": self.energy_baseline_kwh,
             "energy_baseline_timestamp_utc": self.energy_baseline_timestamp_utc.isoformat() if self.energy_baseline_timestamp_utc else None,
@@ -122,6 +132,34 @@ class TariffSaverStore:
     def set_last_api_success(self, when_utc: datetime) -> None:
         self.last_api_success_utc = dt_util.as_utc(when_utc)
         self.dirty = True
+
+    def set_day_average_price(self, local_day: date, avg_price_chf_per_kwh: float) -> None:
+        key = local_day.isoformat()
+        value = float(avg_price_chf_per_kwh)
+        if self.day_average_prices.get(key) != value:
+            self.day_average_prices[key] = value
+            self.dirty = True
+
+    def trim_day_average_prices(self, keep_days: int = 400) -> None:
+        cutoff = dt_util.now().date() - timedelta(days=keep_days)
+        before = len(self.day_average_prices)
+        self.day_average_prices = {
+            k: v for k, v in self.day_average_prices.items() if k >= cutoff.isoformat()
+        }
+        if len(self.day_average_prices) != before:
+            self.dirty = True
+
+    def get_year_day_average_prices(self, reference_local_day: date | None = None) -> list[float]:
+        target_year = (reference_local_day or dt_util.now().date()).year
+        values: list[float] = []
+        for key, value in self.day_average_prices.items():
+            try:
+                day = date.fromisoformat(str(key))
+            except ValueError:
+                continue
+            if day.year == target_year and isinstance(value, (int, float)):
+                values.append(float(value))
+        return values
 
     @staticmethod
     def _work_total_from_components(comps: dict[str, float] | None) -> float | None:

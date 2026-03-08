@@ -25,11 +25,14 @@ class PriceSlot:
     components_chf_per_kwh: dict[str, float]
 
 
+WINDOW_HOURS: tuple[int, ...] = (1, 2, 3, 6)
+
+
 def _avg(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def _slot_all_in(comps: dict[str, float] | None) -> float | None:
+def _slot_total_price(comps: dict[str, float] | None) -> float | None:
     if not comps:
         return None
     total = 0.0
@@ -46,6 +49,18 @@ def _slot_all_in(comps: dict[str, float] | None) -> float | None:
         if isinstance(value, (int, float)) and float(value) > 0:
             return float(value)
     return None
+
+
+def score_from_prices(current_price: float | None, min_price: float | None, max_price: float | None) -> int | None:
+    """Return score where 0 is cheapest and 100 is most expensive."""
+    if not isinstance(current_price, (int, float)) or current_price < 0:
+        return None
+    if not isinstance(min_price, (int, float)) or not isinstance(max_price, (int, float)):
+        return None
+    if max_price <= min_price:
+        return 50
+    score = ((float(current_price) - float(min_price)) / (float(max_price) - float(min_price))) * 100.0
+    return max(0, min(100, int(round(score))))
 
 
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -106,15 +121,24 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     base_components_chf_per_kwh=base_map.get(s.start),
                 )
             self.store.trim_price_slots(keep_days=7)
+
+        stats = self._compute_daily_stats(active, baseline)
+        if self.store is not None:
+            slot_day = stats.get("slot_day_local")
+            avg_active = stats.get("avg_active_chf_per_kwh")
+            if isinstance(slot_day, date) and isinstance(avg_active, (int, float)) and avg_active > 0:
+                self.store.set_day_average_price(slot_day, float(avg_active))
+                self.store.trim_day_average_prices(keep_days=400)
             if self.store.dirty:
                 await self.store.async_save()
 
-        stats = self._compute_daily_stats(active, baseline)
+        windows = self._compute_best_windows(active)
         self._last_fetch_date = today
         return {
             "active": active,
             "baseline": baseline,
             "stats": stats,
+            "windows": windows,
             "provider": {
                 "entry_id": provider_data.get("entry_id"),
                 "provider": provider_data.get("provider"),
@@ -161,39 +185,85 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             components_chf_per_kwh=components,
         )
 
-    @staticmethod
-    def _compute_daily_stats(active: list[PriceSlot], baseline: list[PriceSlot]) -> dict[str, Any]:
-        active_map = {
-            s.start: _slot_all_in(s.components_chf_per_kwh)
-            for s in active
-        }
-        active_values = [v for v in active_map.values() if isinstance(v, (int, float)) and v > 0]
+    def _compute_daily_stats(self, active: list[PriceSlot], baseline: list[PriceSlot]) -> dict[str, Any]:
+        active_map = {s.start: _slot_total_price(s.components_chf_per_kwh) for s in active}
+        active_values = [float(v) for v in active_map.values() if isinstance(v, (int, float)) and v >= 0]
 
-        base_map = {
-            s.start: _slot_all_in(s.components_chf_per_kwh)
-            for s in baseline
-        }
-        base_values = [v for v in base_map.values() if isinstance(v, (int, float)) and v > 0]
+        base_map = {s.start: _slot_total_price(s.components_chf_per_kwh) for s in baseline}
+        base_values = [float(v) for v in base_map.values() if isinstance(v, (int, float)) and v >= 0]
 
-        avg_active = _avg([float(v) for v in active_values])
-        avg_baseline = _avg([float(v) for v in base_values])
+        min_active = min(active_values) if active_values else None
+        max_active = max(active_values) if active_values else None
+        avg_active = _avg(active_values)
+        avg_baseline = _avg(base_values)
 
-        dev_vs_avg: dict[str, float] = {}
-        dev_vs_baseline: dict[str, float] = {}
+        current_slot = next((s for s in reversed(sorted(active, key=lambda s: s.start)) if s.start <= dt_util.utcnow()), None)
+        if current_slot is None and active:
+            current_slot = active[0]
+        current_price = _slot_total_price(current_slot.components_chf_per_kwh) if current_slot else None
+        current_baseline = _slot_total_price(base_map and next((b.components_chf_per_kwh for b in baseline if current_slot and b.start == current_slot.start), None)) if current_slot else None
 
-        for s in active:
-            active_price = active_map.get(s.start)
-            if isinstance(active_price, (int, float)) and active_price > 0:
-                if avg_active and avg_active > 0:
-                    dev_vs_avg[s.start.isoformat()] = (float(active_price) / avg_active - 1.0) * 100.0
-                base_price = base_map.get(s.start)
-                if isinstance(base_price, (int, float)) and base_price > 0:
-                    dev_vs_baseline[s.start.isoformat()] = (float(active_price) / float(base_price) - 1.0) * 100.0
+        slot_day_local = dt_util.as_local(active[0].start).date() if active else None
+        year_prices = self.store.get_year_day_average_prices(slot_day_local) if self.store and isinstance(slot_day_local, date) else []
+        year_min = min(year_prices) if year_prices else None
+        year_max = max(year_prices) if year_prices else None
+        day_score = score_from_prices(avg_active, year_min, year_max)
+
+        dev_vs_baseline_percent = None
+        if isinstance(current_price, (int, float)) and isinstance(current_baseline, (int, float)) and current_baseline > 0:
+            dev_vs_baseline_percent = ((float(current_price) / float(current_baseline)) - 1.0) * 100.0
 
         return {
             "calculated_at": dt_util.utcnow().isoformat(),
+            "slot_day_local": slot_day_local,
+            "min_active_chf_per_kwh": min_active,
+            "max_active_chf_per_kwh": max_active,
             "avg_active_chf_per_kwh": avg_active,
             "avg_baseline_chf_per_kwh": avg_baseline,
-            "dev_vs_avg_percent": dev_vs_avg,
-            "dev_vs_baseline_percent": dev_vs_baseline,
+            "current_price_chf_per_kwh": current_price,
+            "current_baseline_chf_per_kwh": current_baseline,
+            "current_score_0_100": score_from_prices(current_price, min_active, max_active),
+            "price_vs_baseline_percent": dev_vs_baseline_percent,
+            "day_score_0_100": day_score,
+            "year_min_day_avg_chf_per_kwh": year_min,
+            "year_max_day_avg_chf_per_kwh": year_max,
+            "year_day_samples": len(year_prices),
         }
+
+    @staticmethod
+    def _compute_best_windows(active: list[PriceSlot]) -> dict[str, Any]:
+        ordered = sorted(active, key=lambda s: s.start)
+        prices = [_slot_total_price(s.components_chf_per_kwh) for s in ordered]
+        valid_prices = [float(v) for v in prices if isinstance(v, (int, float)) and v >= 0]
+        min_price = min(valid_prices) if valid_prices else None
+        max_price = max(valid_prices) if valid_prices else None
+
+        out: dict[str, Any] = {}
+        now_utc = dt_util.utcnow()
+
+        for hours in WINDOW_HOURS:
+            slot_count = hours * 4
+            candidates: list[tuple[datetime, float]] = []
+            for idx in range(0, len(ordered) - slot_count + 1):
+                window_slots = ordered[idx : idx + slot_count]
+                if window_slots[-1].start < now_utc:
+                    continue
+                window_prices = [_slot_total_price(s.components_chf_per_kwh) for s in window_slots]
+                if any(not isinstance(v, (int, float)) or float(v) < 0 for v in window_prices):
+                    continue
+                avg_price = sum(float(v) for v in window_prices) / slot_count
+                candidates.append((window_slots[0].start, avg_price))
+
+            key = f"{hours}h"
+            if not candidates:
+                out[key] = {"start": None, "avg_price_chf_per_kwh": None, "score_0_100": None}
+                continue
+
+            best_start, best_avg = min(candidates, key=lambda item: (item[1], item[0]))
+            out[key] = {
+                "start": best_start,
+                "avg_price_chf_per_kwh": round(best_avg, 6),
+                "score_0_100": score_from_prices(best_avg, min_price, max_price),
+            }
+
+        return out

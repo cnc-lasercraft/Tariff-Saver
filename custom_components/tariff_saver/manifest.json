@@ -8,5 +8,5 @@
   "iot_class": "calculated",
   "codeowners": ["@cnc-lasercraft"],
   "requirements": [],
-  "version": "0.3.10"
+  "version": "0.2.0"
 }

@@ -21,13 +21,11 @@ from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
 
 CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
 SIGNAL_STORE_UPDATED = "tariff_saver_store_updated"
+WINDOW_HOURS: tuple[int, ...] = (1, 2, 3, 6)
 
 
 def _device_info(entry: ConfigEntry) -> dict[str, Any]:
-    return {
-        "identifiers": {(DOMAIN, entry.entry_id)},
-        "name": entry.title,
-    }
+    return {"identifiers": {(DOMAIN, entry.entry_id)}, "name": entry.title}
 
 
 def _active_slots(coordinator: TariffSaverCoordinator) -> list[PriceSlot]:
@@ -38,6 +36,16 @@ def _active_slots(coordinator: TariffSaverCoordinator) -> list[PriceSlot]:
 def _baseline_slots(coordinator: TariffSaverCoordinator) -> list[PriceSlot]:
     data = coordinator.data or {}
     return data.get("baseline", []) if isinstance(data, dict) else []
+
+
+def _stats(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
+    data = coordinator.data or {}
+    return data.get("stats", {}) if isinstance(data, dict) else {}
+
+
+def _windows(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
+    data = coordinator.data or {}
+    return data.get("windows", {}) if isinstance(data, dict) else {}
 
 
 def _current_slot(slots: list[PriceSlot]) -> PriceSlot | None:
@@ -73,6 +81,12 @@ def _all_in_from_slot(slot: PriceSlot | None) -> float | None:
         if isinstance(value, (int, float)) and float(value) > 0:
             return float(value)
     return None
+
+
+def _stars(score: int | None, scale: int) -> int | None:
+    if score is None:
+        return None
+    return max(0, min(scale, int(round(((100 - score) / 100) * scale))))
 
 
 async def async_setup_entry(
@@ -135,28 +149,37 @@ async def async_setup_entry(
             hass, _periodic_tick, timedelta(minutes=5)
         )
 
-    async_add_entities(
-        [
-            TariffSaverPriceCurveSensor(coordinator, entry),
-            TariffSaverPriceAllInNowSensor(coordinator, entry),
-            TariffSaverNextPriceSensor(coordinator, entry),
-            PeriodCostSensor(entry, coordinator, "today", "dyn", "actual_cost_today", "Actual cost today"),
-            PeriodCostSensor(entry, coordinator, "today", "base", "baseline_cost_today", "Baseline cost today", icon="mdi:cash-multiple"),
-            PeriodCostSensor(entry, coordinator, "today", "sav", "actual_savings_today", "Savings today", icon="mdi:piggy-bank", state_class="measurement"),
-            PeriodCostSensor(entry, coordinator, "week", "dyn", "actual_cost_week", "Actual cost week"),
-            PeriodCostSensor(entry, coordinator, "week", "base", "baseline_cost_week", "Baseline cost week", icon="mdi:cash-multiple"),
-            PeriodCostSensor(entry, coordinator, "week", "sav", "actual_savings_week", "Savings week", icon="mdi:piggy-bank", state_class="measurement"),
-            PeriodCostSensor(entry, coordinator, "month", "dyn", "actual_cost_month", "Actual cost month"),
-            PeriodCostSensor(entry, coordinator, "month", "base", "baseline_cost_month", "Baseline cost month", icon="mdi:cash-multiple"),
-            PeriodCostSensor(entry, coordinator, "month", "sav", "actual_savings_month", "Savings month", icon="mdi:piggy-bank", state_class="measurement"),
-            PeriodCostSensor(entry, coordinator, "year", "dyn", "actual_cost_year", "Actual cost year"),
-            PeriodCostSensor(entry, coordinator, "year", "base", "baseline_cost_year", "Baseline cost year", icon="mdi:cash-multiple"),
-            PeriodCostSensor(entry, coordinator, "year", "sav", "actual_savings_year", "Savings year", icon="mdi:piggy-bank", state_class="measurement"),
-            TariffSaverLinkStatusSensor(coordinator, entry),
-            TariffSaverLastApiSuccessSensor(coordinator, entry),
-        ],
-        update_before_add=True,
-    )
+    entities: list[SensorEntity] = [
+        TariffSaverPriceCurveSensor(coordinator, entry),
+        TariffSaverPriceNowSensor(coordinator, entry),
+        TariffSaverBaselinePriceNowSensor(coordinator, entry),
+        TariffSaverNextPriceSensor(coordinator, entry),
+        TariffSaverScoreNowSensor(coordinator, entry),
+        TariffSaverScoreStarsSensor(coordinator, entry, 5),
+        TariffSaverScoreStarsSensor(coordinator, entry, 10),
+        TariffSaverDayScoreSensor(coordinator, entry),
+        TariffSaverDayScoreStarsSensor(coordinator, entry, 5),
+        PeriodCostSensor(entry, coordinator, "today", "dyn", "actual_cost_today", "Actual cost today"),
+        PeriodCostSensor(entry, coordinator, "today", "base", "baseline_cost_today", "Baseline cost today", icon="mdi:cash-multiple"),
+        PeriodCostSensor(entry, coordinator, "today", "sav", "actual_savings_today", "Savings today", icon="mdi:piggy-bank", state_class="measurement"),
+        PeriodCostSensor(entry, coordinator, "week", "dyn", "actual_cost_week", "Actual cost week"),
+        PeriodCostSensor(entry, coordinator, "week", "base", "baseline_cost_week", "Baseline cost week", icon="mdi:cash-multiple"),
+        PeriodCostSensor(entry, coordinator, "week", "sav", "actual_savings_week", "Savings week", icon="mdi:piggy-bank", state_class="measurement"),
+        PeriodCostSensor(entry, coordinator, "month", "dyn", "actual_cost_month", "Actual cost month"),
+        PeriodCostSensor(entry, coordinator, "month", "base", "baseline_cost_month", "Baseline cost month", icon="mdi:cash-multiple"),
+        PeriodCostSensor(entry, coordinator, "month", "sav", "actual_savings_month", "Savings month", icon="mdi:piggy-bank", state_class="measurement"),
+        PeriodCostSensor(entry, coordinator, "year", "dyn", "actual_cost_year", "Actual cost year"),
+        PeriodCostSensor(entry, coordinator, "year", "base", "baseline_cost_year", "Baseline cost year", icon="mdi:cash-multiple"),
+        PeriodCostSensor(entry, coordinator, "year", "sav", "actual_savings_year", "Savings year", icon="mdi:piggy-bank", state_class="measurement"),
+        TariffSaverLinkStatusSensor(coordinator, entry),
+        TariffSaverLastApiSuccessSensor(coordinator, entry),
+    ]
+
+    for hours in WINDOW_HOURS:
+        entities.append(BestWindowStartSensor(coordinator, entry, hours))
+        entities.append(BestWindowScoreSensor(coordinator, entry, hours))
+
+    async_add_entities(entities, update_before_add=True)
 
 
 class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
@@ -179,7 +202,6 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
         active = _active_slots(self.coordinator)
         baseline = _baseline_slots(self.coordinator)
         baseline_map = {slot.start: slot for slot in baseline}
-
         return {
             "slot_count": len(active),
             "slots": [
@@ -187,43 +209,44 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
                     "start": slot.start.isoformat(),
                     "price_all_in_chf_per_kwh": _all_in_from_slot(slot),
                     "baseline_chf_per_kwh": _all_in_from_slot(baseline_map.get(slot.start)),
-                    "components": slot.components_chf_per_kwh,
-                    "baseline_components": (
-                        baseline_map.get(slot.start).components_chf_per_kwh
-                        if baseline_map.get(slot.start)
-                        else None
-                    ),
                 }
                 for slot in active
             ],
         }
 
 
-class TariffSaverPriceAllInNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+class TariffSaverPriceNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Price all-in now"
+    _attr_name = "Price now"
     _attr_native_unit_of_measurement = "CHF/kWh"
     _attr_icon = "mdi:cash"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
-        self._attr_unique_id = f"{entry.entry_id}_price_allin_now"
+        self._attr_unique_id = f"{entry.entry_id}_price_now"
         self._attr_device_info = _device_info(entry)
 
     @property
     def native_value(self) -> float | None:
         value = _all_in_from_slot(_current_slot(_active_slots(self.coordinator)))
-        return round(float(value), 6) if isinstance(value, (int, float)) and value > 0 else None
+        return round(float(value), 6) if isinstance(value, (int, float)) and value >= 0 else None
+
+
+class TariffSaverBaselinePriceNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Baseline price now"
+    _attr_native_unit_of_measurement = "CHF/kWh"
+    _attr_icon = "mdi:cash-sync"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_baseline_price_now"
+        self._attr_device_info = _device_info(entry)
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        slot = _current_slot(_active_slots(self.coordinator))
-        if not slot:
-            return {}
-        return {
-            "slot_start_utc": slot.start.isoformat(),
-            "components": slot.components_chf_per_kwh,
-        }
+    def native_value(self) -> float | None:
+        value = _all_in_from_slot(_current_slot(_baseline_slots(self.coordinator)))
+        return round(float(value), 6) if isinstance(value, (int, float)) and value >= 0 else None
 
 
 class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
@@ -240,7 +263,135 @@ class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], Sens
     @property
     def native_value(self) -> float | None:
         value = _all_in_from_slot(_next_slot(_active_slots(self.coordinator)))
-        return round(float(value), 6) if isinstance(value, (int, float)) and value > 0 else None
+        return round(float(value), 6) if isinstance(value, (int, float)) and value >= 0 else None
+
+
+class TariffSaverScoreNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Score now"
+    _attr_native_unit_of_measurement = "%"
+    _attr_icon = "mdi:gauge"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_score_now"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> int | None:
+        value = _stats(self.coordinator).get("current_score_0_100")
+        return int(value) if isinstance(value, int) else None
+
+
+class TariffSaverScoreStarsSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:star"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry, scale: int) -> None:
+        super().__init__(coordinator)
+        self.scale = scale
+        self._attr_name = f"Score now stars {scale}"
+        self._attr_unique_id = f"{entry.entry_id}_score_now_stars_{scale}"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> int | None:
+        score = _stats(self.coordinator).get("current_score_0_100")
+        return _stars(score if isinstance(score, int) else None, self.scale)
+
+
+
+
+class TariffSaverDayScoreSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Day score"
+    _attr_native_unit_of_measurement = "%"
+    _attr_icon = "mdi:calendar-star"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_day_score"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> int | None:
+        value = _stats(self.coordinator).get("day_score_0_100")
+        return int(value) if isinstance(value, int) else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stats = _stats(self.coordinator)
+        slot_day = stats.get("slot_day_local")
+        return {
+            "slot_day_local": slot_day.isoformat() if hasattr(slot_day, "isoformat") else slot_day,
+            "day_average_price_chf_per_kwh": stats.get("avg_active_chf_per_kwh"),
+            "year_min_day_avg_chf_per_kwh": stats.get("year_min_day_avg_chf_per_kwh"),
+            "year_max_day_avg_chf_per_kwh": stats.get("year_max_day_avg_chf_per_kwh"),
+            "year_day_samples": stats.get("year_day_samples"),
+        }
+
+
+class TariffSaverDayScoreStarsSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:star"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry, scale: int) -> None:
+        super().__init__(coordinator)
+        self.scale = scale
+        self._attr_name = f"Day score stars {scale}"
+        self._attr_unique_id = f"{entry.entry_id}_day_score_stars_{scale}"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> int | None:
+        score = _stats(self.coordinator).get("day_score_0_100")
+        return _stars(score if isinstance(score, int) else None, self.scale)
+
+
+class BestWindowStartSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-start"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry, hours: int) -> None:
+        super().__init__(coordinator)
+        self.hours = hours
+        self._attr_name = f"Best window {hours}h start"
+        self._attr_unique_id = f"{entry.entry_id}_best_window_{hours}h_start"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> datetime | None:
+        value = (_windows(self.coordinator).get(f"{self.hours}h") or {}).get("start")
+        return dt_util.as_utc(value) if isinstance(value, datetime) else None
+
+
+class BestWindowScoreSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = "%"
+    _attr_icon = "mdi:chart-bell-curve-cumulative"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry, hours: int) -> None:
+        super().__init__(coordinator)
+        self.hours = hours
+        self._attr_name = f"Best window {hours}h score"
+        self._attr_unique_id = f"{entry.entry_id}_best_window_{hours}h_score"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> int | None:
+        value = (_windows(self.coordinator).get(f"{self.hours}h") or {}).get("score_0_100")
+        return int(value) if isinstance(value, int) else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = _windows(self.coordinator).get(f"{self.hours}h") or {}
+        start = data.get("start")
+        avg_price = data.get("avg_price_chf_per_kwh")
+        return {
+            "start": start.isoformat() if isinstance(start, datetime) else None,
+            "avg_price_chf_per_kwh": avg_price,
+        }
 
 
 class PeriodCostSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity, RestoreEntity):
