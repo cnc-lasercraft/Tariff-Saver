@@ -101,4 +101,5 @@ class EkzSlotSource(SlotSource):
             grid=grid,
             regional_fees=regional_fees,
             integrated=float(integrated),
+            components={str(k): float(v) for k, v in comps.items() if isinstance(v, (int, float))},
         )
