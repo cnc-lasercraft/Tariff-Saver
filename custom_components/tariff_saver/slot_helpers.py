@@ -61,20 +61,50 @@ def price_slot_from_mapping(item: dict[str, Any], *, price_scale: float = 1.0) -
         return None
 
     components = item.get("components") if isinstance(item.get("components"), dict) else {}
-    baseline_components = item.get("baseline_components") if isinstance(item.get("baseline_components"), dict) else {}
+    provider_components = (
+        item.get("components_chf_per_kwh")
+        if isinstance(item.get("components_chf_per_kwh"), dict)
+        else {}
+    )
+    baseline_components = (
+        item.get("baseline_components") if isinstance(item.get("baseline_components"), dict) else {}
+    )
 
     electricity = _as_float(
-        item.get("electricity", item.get("price_chf_per_kwh", components.get("electricity", 0.0)))
+        item.get(
+            "electricity",
+            item.get(
+                "electricity_chf_per_kwh",
+                item.get("price_chf_per_kwh", components.get("electricity", provider_components.get("electricity", 0.0))),
+            ),
+        )
     )
-    grid = _as_float(item.get("grid", components.get("grid", 0.0)))
-    regional_fees = _as_float(item.get("regional_fees", components.get("regional_fees", 0.0)))
-    integrated = _as_float(item.get("integrated", components.get("integrated", 0.0)))
+    grid = _as_float(
+        item.get("grid", components.get("grid", provider_components.get("grid", 0.0)))
+    )
+    regional_fees = _as_float(
+        item.get(
+            "regional_fees",
+            components.get("regional_fees", provider_components.get("regional_fees", 0.0)),
+        )
+    )
+    integrated = _as_float(
+        item.get(
+            "integrated",
+            item.get(
+                "all_in_chf_per_kwh",
+                components.get("integrated", provider_components.get("integrated", 0.0)),
+            ),
+        )
+    )
 
+    if integrated <= 0:
+        integrated = electricity + grid + regional_fees
     if electricity <= 0 and integrated > 0:
         electricity = integrated
 
     merged_components: dict[str, float] = {}
-    for source in (components, baseline_components, item):
+    for source in (components, provider_components, baseline_components, item):
         if not isinstance(source, dict):
             continue
         for key, value in source.items():
