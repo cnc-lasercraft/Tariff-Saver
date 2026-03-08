@@ -2,43 +2,53 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_SOURCE_TYPE, DOMAIN, SOURCE_EKZ, SOURCE_ENTITIES
-from .models import PriceSlot
-from .slot_helpers import avg
-from .sources.base import SlotSource
-from .sources.ekz import EkzSlotSource
-from .sources.entities import EntitySlotSource
+from .const import CONF_EKZ_ENTRY_ID, CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME, DOMAIN
 from .storage import TariffSaverStore
 
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class PriceSlot:
+    """A single 15-minute price slot."""
+
+    start: datetime  # UTC, timezone-aware
+    electricity_chf_per_kwh: float
+    components_chf_per_kwh: dict[str, float]
+
+
+def _avg(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Fetch and persist price curves from a selected slot source."""
+    """Reads tariff curves from the separate EKZ provider integration."""
 
     def __init__(self, hass: HomeAssistant, config: dict[str, Any]) -> None:
         self.hass = hass
         self.config = config
-        self.source_type: str = str(config.get(CONF_SOURCE_TYPE, SOURCE_EKZ))
-        self.source: SlotSource = self._build_source()
+
+        self.tariff_name: str = "EKZ active"
+        self.baseline_tariff_name: str | None = "EKZ baseline"
+        self.publish_time: str = config.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
+        self.ekz_entry_id: str | None = config.get(CONF_EKZ_ENTRY_ID)
+
         self._last_fetch_date: date | None = None
         self.store: TariffSaverStore | None = None
-        self.source_status: str | None = None
-        self.source_details: dict[str, Any] = {}
+
+        self.link_status: str | None = None
+        self.linking_url: str | None = None
+        self.last_api_success_utc: datetime | None = None
 
         super().__init__(hass, _LOGGER, name="Tariff Saver", update_interval=None)
-
-    def _build_source(self) -> SlotSource:
-        if self.source_type == SOURCE_ENTITIES:
-            return EntitySlotSource(self.hass, self.config)
-        return EkzSlotSource(self.hass, self.config)
 
     async def _async_update_data(self) -> dict[str, Any]:
         if self.store is None:
@@ -49,36 +59,34 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     break
 
         today = dt_util.now().date()
-        if self._last_fetch_date == today:
-            return self.data or {"active": [], "baseline": [], "stats": {}, "source": {}}
+        if self._last_fetch_date == today and self.data:
+            return self.data
 
-        try:
-            active = await self.source.async_get_price_slots()
-            baseline = await self.source.async_get_baseline_slots()
-            self.source_details = await self.source.async_get_metadata()
-            self.source_status = "ok"
-        except Exception as err:
-            self.source_status = "error"
-            self.source_details = {"error": str(err), "source_type": self.source_type}
-            raise UpdateFailed(f"Slot source update failed: {err}") from err
+        provider_data = self._get_provider_data()
+        active_raw = provider_data.get("active_slots") or []
+        baseline_raw = provider_data.get("baseline_slots") or []
+
+        active = [self._convert_slot(slot) for slot in active_raw]
+        baseline = [self._convert_slot(slot) for slot in baseline_raw]
 
         if not active:
-            raise UpdateFailed("Slot source returned no active price slots")
+            raise UpdateFailed("EKZ Tariff provider returned no active_slots")
+
+        self.link_status = provider_data.get("link_status")
+        self.linking_url = provider_data.get("linking_url")
+        self.last_api_success_utc = provider_data.get("last_api_success_utc")
 
         if self.store is not None:
-            self.store.set_last_api_success(dt_util.utcnow())
-            base_map = {
-                slot.start: slot.components_chf_per_kwh
-                for slot in baseline
-                if slot.electricity_chf_per_kwh > 0 or slot.integrated > 0
-            }
-            for slot in active:
-                if slot.electricity_chf_per_kwh <= 0 and slot.integrated <= 0:
+            if isinstance(self.last_api_success_utc, datetime):
+                self.store.set_last_api_success(self.last_api_success_utc)
+            base_map = {s.start: s.components_chf_per_kwh for s in baseline if s.electricity_chf_per_kwh > 0}
+            for s in active:
+                if s.electricity_chf_per_kwh <= 0:
                     continue
                 self.store.set_price_slot(
-                    slot.start,
-                    dyn_components_chf_per_kwh=slot.components_chf_per_kwh,
-                    base_components_chf_per_kwh=base_map.get(slot.start),
+                    s.start,
+                    dyn_components_chf_per_kwh=s.components_chf_per_kwh,
+                    base_components_chf_per_kwh=base_map.get(s.start),
                 )
             self.store.trim_price_slots(keep_days=7)
             if self.store.dirty:
@@ -90,17 +98,61 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "active": active,
             "baseline": baseline,
             "stats": stats,
-            "source": {"status": self.source_status, **self.source_details},
+            "provider": {
+                "entry_id": provider_data.get("entry_id"),
+                "provider": provider_data.get("provider"),
+                "active_publication_timestamp": provider_data.get("active_publication_timestamp"),
+                "baseline_publication_timestamp": provider_data.get("baseline_publication_timestamp"),
+            },
         }
+
+    def _get_provider_data(self) -> dict[str, Any]:
+        try:
+            from custom_components.ekz_tariff import get_first_provider_data, get_provider_data
+        except ImportError as err:
+            raise UpdateFailed("Could not import custom_components.ekz_tariff provider helpers") from err
+
+        try:
+            if isinstance(self.ekz_entry_id, str) and self.ekz_entry_id.strip():
+                return get_provider_data(self.hass, self.ekz_entry_id.strip())
+            return get_first_provider_data(self.hass)
+        except KeyError as err:
+            raise UpdateFailed("No loaded EKZ Tariff entry found") from err
+
+    @staticmethod
+    def _convert_slot(slot: Any) -> PriceSlot:
+        start = getattr(slot, "start", None)
+        if not isinstance(start, datetime):
+            raise UpdateFailed("EKZ Tariff slot is missing start")
+
+        electricity = float(getattr(slot, "electricity_chf_per_kwh", 0.0) or 0.0)
+        raw_components = getattr(slot, "components_chf_per_kwh", {}) or {}
+        components = {
+            str(key): float(value)
+            for key, value in raw_components.items()
+            if isinstance(value, (int, float))
+        }
+        if electricity > 0 and "electricity" not in components:
+            components["electricity"] = electricity
+        if "integrated" not in components:
+            total = sum(float(v) for v in components.values() if isinstance(v, (int, float)))
+            if total > 0:
+                components["integrated"] = total
+
+        return PriceSlot(
+            start=dt_util.as_utc(start),
+            electricity_chf_per_kwh=electricity,
+            components_chf_per_kwh=components,
+        )
 
     @staticmethod
     def _compute_daily_stats(active: list[PriceSlot], baseline: list[PriceSlot]) -> dict[str, Any]:
         active_valid = [s for s in active if s.electricity_chf_per_kwh > 0]
         base_map = {s.start: s.electricity_chf_per_kwh for s in baseline if s.electricity_chf_per_kwh > 0}
 
-        avg_active = avg([s.electricity_chf_per_kwh for s in active_valid])
+        avg_active = _avg([s.electricity_chf_per_kwh for s in active_valid])
         avg_baseline = (
-            avg([base_map[s.start] for s in active_valid if s.start in base_map])
+            _avg([base_map[s.start] for s in active_valid if s.start in base_map])
             if base_map
             else None
         )
@@ -108,12 +160,12 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         dev_vs_avg: dict[str, float] = {}
         dev_vs_baseline: dict[str, float] = {}
 
-        for slot in active_valid:
+        for s in active_valid:
             if avg_active and avg_active > 0:
-                dev_vs_avg[slot.start.isoformat()] = (slot.electricity_chf_per_kwh / avg_active - 1.0) * 100.0
-            base = base_map.get(slot.start)
+                dev_vs_avg[s.start.isoformat()] = (s.electricity_chf_per_kwh / avg_active - 1.0) * 100.0
+            base = base_map.get(s.start)
             if base and base > 0:
-                dev_vs_baseline[slot.start.isoformat()] = (slot.electricity_chf_per_kwh / base - 1.0) * 100.0
+                dev_vs_baseline[s.start.isoformat()] = (s.electricity_chf_per_kwh / base - 1.0) * 100.0
 
         return {
             "calculated_at": dt_util.utcnow().isoformat(),

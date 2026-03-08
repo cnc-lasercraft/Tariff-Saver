@@ -2,17 +2,29 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME, DOMAIN
+from .const import (
+    CONF_CONSUMPTION_ENERGY_ENTITY,
+    CONF_PUBLISH_TIME,
+    DEFAULT_PUBLISH_TIME,
+    DOMAIN,
+)
 from .coordinator import TariffSaverCoordinator
 
 PLATFORMS: list[str] = ["sensor"]
 RETRY_INTERVAL = timedelta(minutes=30)
+
+
+async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
+    """Set up Tariff Saver from yaml (unused)."""
+    hass.data.setdefault(DOMAIN, {})
+    return True
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -40,13 +52,8 @@ def _next_local_midnight(now_local: datetime) -> datetime:
     )
 
 
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the Tariff Saver integration."""
-    hass.data.setdefault(DOMAIN, {})
-    return True
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Tariff Saver from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
     config = dict(entry.data)
@@ -75,10 +82,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if store is None:
                 continue
 
+            target_entry = hass.config_entries.async_get_entry(eid)
+            if target_entry is None:
+                continue
+
             energy_entity = (
-                coord.config.get("consumption_energy_entity")
-                if isinstance(getattr(coord, "config", None), dict)
-                else None
+                target_entry.options.get(CONF_CONSUMPTION_ENERGY_ENTITY)
+                or target_entry.data.get(CONF_CONSUMPTION_ENERGY_ENTITY)
             )
             if not isinstance(energy_entity, str) or not energy_entity:
                 continue
@@ -105,17 +115,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_register(DOMAIN, service_name, _reset_energy_baseline_service)
 
     async def _force_refresh() -> None:
-        try:
-            setattr(coordinator, "_last_fetch_date", None)
-        except Exception:
-            pass
+        coordinator._last_fetch_date = None
         await coordinator.async_request_refresh()
 
     async def _daily_refresh(now) -> None:  # noqa: ANN001
         await _force_refresh()
         if not _has_valid_prices(coordinator):
-            now_local = dt_util.now()
-            hass.data[DOMAIN][retry_state_key] = _next_local_midnight(now_local)
+            hass.data[DOMAIN][retry_state_key] = _next_local_midnight(dt_util.now())
         else:
             hass.data[DOMAIN][retry_state_key] = None
 
@@ -145,26 +151,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    unsub = hass.data.get(DOMAIN, {}).pop(entry.entry_id + "_unsub_daily", None)
-    if unsub:
-        unsub()
-    unsub = hass.data.get(DOMAIN, {}).pop(entry.entry_id + "_unsub_retry", None)
-    if unsub:
-        unsub()
+    for suffix in ("_unsub_daily", "_unsub_retry", "_unsub_energy_cost", "_unsub_energy_tick"):
+        unsub = hass.data.get(DOMAIN, {}).pop(entry.entry_id + suffix, None)
+        if unsub:
+            unsub()
 
     hass.data.get(DOMAIN, {}).pop(f"{entry.entry_id}_retry_until", None)
-    unsub = hass.data.get(DOMAIN, {}).pop(f"{entry.entry_id}_unsub_energy_cost", None)
-    if unsub:
-        unsub()
-    unsub = hass.data.get(DOMAIN, {}).pop(f"{entry.entry_id}_unsub_energy_cost_tick", None)
-    if unsub:
-        unsub()
     if unload_ok and DOMAIN in hass.data:
         hass.data[DOMAIN].pop(entry.entry_id, None)
         remaining_entries = [
-            k for k in hass.data[DOMAIN].keys() if isinstance(k, str) and hasattr(hass.data[DOMAIN].get(k), "store")
+            k
+            for k, v in hass.data[DOMAIN].items()
+            if isinstance(k, str) and isinstance(v, TariffSaverCoordinator)
         ]
         if not remaining_entries and hass.services.has_service(DOMAIN, "reset_energy_baseline"):
             hass.services.async_remove(DOMAIN, "reset_energy_baseline")
@@ -172,4 +173,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload a config entry."""
     await hass.config_entries.async_reload(entry.entry_id)

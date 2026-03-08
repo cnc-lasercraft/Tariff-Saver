@@ -1,13 +1,12 @@
 {
   "domain": "tariff_saver",
   "name": "Tariff Saver",
+  "dependencies": ["ekz_tariff"],
   "config_flow": true,
   "documentation": "https://github.com/cnc-lasercraft/tariff_saver",
   "issue_tracker": "https://github.com/cnc-lasercraft/tariff_saver/issues",
-  "iot_class": "local_polling",
-  "codeowners": [
-    "@cnc-lasercraft"
-  ],
+  "iot_class": "calculated",
+  "codeowners": ["@cnc-lasercraft"],
   "requirements": [],
-  "version": "0.3.6"
+  "version": "0.2.0"
 }

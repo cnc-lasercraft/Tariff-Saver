@@ -3,26 +3,20 @@ from __future__ import annotations
 
 DOMAIN = "tariff_saver"
 
-CONF_SOURCE_TYPE = "source_type"
-SOURCE_EKZ = "ekz"
-SOURCE_ENTITIES = "entities"
-
-CONF_PRICE_ENTITY = "price_entity"
-CONF_PRICE_ATTRIBUTE = "price_attribute"
-CONF_BASELINE_ENTITY = "baseline_entity"
-CONF_BASELINE_ATTRIBUTE = "baseline_attribute"
-
-CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
-CONF_PRICE_SCALE = "price_scale"
-CONF_IGNORE_ZERO_PRICES = "ignore_zero_prices"
 CONF_PUBLISH_TIME = "publish_time"
 DEFAULT_PUBLISH_TIME = "18:15"
 
-DEFAULT_PRICE_ATTRIBUTE = "price_slots"
-DEFAULT_BASELINE_ATTRIBUTE = "baseline_slots"
-DEFAULT_PRICE_SCALE = 1.0
-DEFAULT_IGNORE_ZERO_PRICES = True
+CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
+CONF_EKZ_ENTRY_ID = "ekz_entry_id"
 
-SIGNAL_STORE_UPDATED = "tariff_saver_store_updated"
+# legacy keys kept for backward compatibility with existing entries/options
+CONF_TARIFF_NAME = "tariff_name"
+CONF_BASELINE_TARIFF_NAME = "baseline_tariff_name"
+CONF_MODE = "mode"
+MODE_PUBLIC = "public"
+MODE_MYEKZ = "myekz"
+CONF_EMS_INSTANCE_ID = "ems_instance_id"
+CONF_REDIRECT_URI = "redirect_uri"
 
-EKZ_DOMAIN = "ekz_tariff"
+CONF_ENABLE_COST_TRACKING = "enable_cost_tracking"
+DEFAULT_ENABLE_COST_TRACKING = True

@@ -1,24 +1,26 @@
-"""Sensor platform for Tariff Saver (prices + costs)."""
+"""Sensor platform for Tariff Saver (prices + costs, incl. component breakdown)."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Any
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
-from homeassistant.helpers.entity import EntityCategory
+from homeassistant.core import HomeAssistant, callback, Event
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_CONSUMPTION_ENERGY_ENTITY, DOMAIN, SIGNAL_STORE_UPDATED
-from .coordinator import TariffSaverCoordinator
-from .models import PriceSlot
+from .const import DOMAIN
+from .coordinator import TariffSaverCoordinator, PriceSlot
 from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
+
+CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
+SIGNAL_STORE_UPDATED = "tariff_saver_store_updated"
 
 COMPONENT_KEYS = [
     "electricity",
@@ -54,9 +56,9 @@ def _current_slot(slots: list[PriceSlot]) -> PriceSlot | None:
     slots = sorted(slots, key=lambda s: s.start)
     now = dt_util.utcnow()
     current: PriceSlot | None = None
-    for slot in slots:
-        if slot.start <= now:
-            current = slot
+    for s in slots:
+        if s.start <= now:
+            current = s
         else:
             break
     return current or slots[0]
@@ -68,25 +70,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     energy_entity = entry.options.get(CONF_CONSUMPTION_ENERGY_ENTITY) or entry.data.get(CONF_CONSUMPTION_ENERGY_ENTITY)
     if isinstance(energy_entity, str) and energy_entity:
 
-        def _process_energy_state(state: Any, *, when_utc: datetime | None = None) -> None:
-            if state is None:
-                return
-            try:
-                kwh_total = float(state.state)
-            except Exception:
-                return
-
+        @callback
+        def _process_kwh(kwh_total: float) -> None:
             store = getattr(coordinator, "store", None)
             if store is None:
                 return
-
-            now_utc = when_utc or dt_util.utcnow()
-            added = store.add_sample(now_utc, kwh_total)
+            now_utc = dt_util.utcnow()
+            changed = store.add_sample(now_utc, kwh_total)
             newly = store.finalize_due_slots(now_utc)
-
             if store.dirty:
                 hass.async_create_task(store.async_save())
-            if added or newly > 0:
+            if changed or newly > 0:
                 async_dispatcher_send(hass, f"{SIGNAL_STORE_UPDATED}_{entry.entry_id}")
 
         @callback
@@ -94,24 +88,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             new_state = event.data.get("new_state")
             if new_state is None:
                 return
-            _process_energy_state(new_state)
-
-        @callback
-        def _periodic_energy_tick(now: datetime) -> None:
-            state = hass.states.get(energy_entity)
-            if state is None:
+            try:
+                _process_kwh(float(new_state.state))
+            except Exception:
                 return
-            _process_energy_state(state, when_utc=dt_util.as_utc(now))
-
-        unsub_state = async_track_state_change_event(hass, [energy_entity], _on_energy_change)
-        unsub_tick = async_track_time_interval(hass, _periodic_energy_tick, timedelta(minutes=5))
-        hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_cost"] = lambda: (unsub_state(), unsub_tick())
 
         current_state = hass.states.get(energy_entity)
         if current_state is not None:
-            _process_energy_state(current_state)
+            try:
+                _process_kwh(float(current_state.state))
+            except Exception:
+                pass
 
-    entities: list[SensorEntity] = [
+        unsub = async_track_state_change_event(hass, [energy_entity], _on_energy_change)
+        hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_cost"] = unsub
+
+        @callback
+        def _periodic_tick(now: datetime) -> None:
+            state = hass.states.get(energy_entity)
+            if state is None:
+                return
+            try:
+                _process_kwh(float(state.state))
+            except Exception:
+                return
+
+        unsub_tick = async_track_time_interval(hass, _periodic_tick, timedelta(minutes=5))
+        hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_tick"] = unsub_tick
+
+    entities: list[SensorEntity] = []
+    entities += [
         TariffSaverPriceCurveSensor(coordinator, entry),
         TariffSaverPriceNowSensor(coordinator, entry),
         TariffSaverNextPriceSensor(coordinator, entry),
@@ -150,7 +156,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             entities.append(PeriodCostSensor(entry, coordinator, period, "base", comp, f"base_{comp}_{period}", f"{comp} baseline {period}", icon="mdi:cash-multiple"))
             entities.append(PeriodCostSensor(entry, coordinator, period, "sav", comp, f"sav_{comp}_{period}", f"{comp} savings {period}", icon="mdi:piggy-bank", state_class="measurement"))
 
-    entities += [TariffSaverSourceStatusSensor(coordinator, entry)]
+    entities += [TariffSaverLinkStatusSensor(coordinator, entry)]
     entities += [TariffSaverLastApiSuccessSensor(coordinator, entry)]
     async_add_entities(entities, update_before_add=True)
 
@@ -162,7 +168,6 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
-        self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_price_curve"
         self._attr_device_info = _device_info(entry)
 
@@ -176,20 +181,20 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
         active = _active_slots(self.coordinator)
         baseline = _baseline_slots(self.coordinator)
         baseline_map = {s.start: s.components_chf_per_kwh for s in baseline} if baseline else {}
-        source_meta = (self.coordinator.data or {}).get("source", {}) if isinstance(self.coordinator.data, dict) else {}
 
         return {
-            "source": source_meta,
+            "tariff_name": getattr(self.coordinator, "tariff_name", None),
+            "baseline_tariff_name": getattr(self.coordinator, "baseline_tariff_name", None),
             "slot_count": len(active),
             "slots": [
                 {
-                    "start": slot.start.isoformat(),
-                    "price_chf_per_kwh": slot.electricity_chf_per_kwh,
-                    "baseline_chf_per_kwh": (baseline_map.get(slot.start, {}) or {}).get("electricity"),
-                    "components": slot.components_chf_per_kwh,
-                    "baseline_components": baseline_map.get(slot.start),
+                    "start": s.start.isoformat(),
+                    "price_chf_per_kwh": s.electricity_chf_per_kwh,
+                    "baseline_chf_per_kwh": (baseline_map.get(s.start, {}) or {}).get("electricity"),
+                    "components": s.components_chf_per_kwh,
+                    "baseline_components": baseline_map.get(s.start),
                 }
-                for slot in active
+                for s in active
             ],
         }
 
@@ -264,8 +269,8 @@ class TariffSaverPriceComponentNowSensor(CoordinatorEntity[TariffSaverCoordinato
         slot = _current_slot(_active_slots(self.coordinator))
         if not slot:
             return None
-        value = (slot.components_chf_per_kwh or {}).get(self._component)
-        return float(value) if isinstance(value, (int, float)) else None
+        v = (slot.components_chf_per_kwh or {}).get(self._component)
+        return float(v) if isinstance(v, (int, float)) else None
 
 
 class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
@@ -285,9 +290,9 @@ class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], Sens
         if not slots:
             return None
         now = dt_util.utcnow()
-        for slot in slots:
-            if slot.start > now:
-                return float(slot.electricity_chf_per_kwh)
+        for s in slots:
+            if s.start > now:
+                return float(s.electricity_chf_per_kwh)
         return None
 
 
@@ -342,10 +347,10 @@ class PeriodCostSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity, 
 
     @property
     def native_value(self) -> float | None:
-        breakdown = self._get_breakdown()
-        if not breakdown:
+        bd = self._get_breakdown()
+        if not bd:
             return None
-        bucket = breakdown.get(self.flavor) or {}
+        bucket = bd.get(self.flavor) or {}
         if not isinstance(bucket, dict):
             return None
 
@@ -353,42 +358,37 @@ class PeriodCostSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity, 
             total = TariffSaverStore.sum_components(bucket, IMPORT_ALLIN_COMPONENTS)
             return round(total, 2)
 
-        value = bucket.get(self.key)
-        if isinstance(value, (int, float)):
-            return round(float(value), 2)
+        v = bucket.get(self.key)
+        if isinstance(v, (int, float)):
+            return round(float(v), 2)
         return 0.0
 
 
-class TariffSaverSourceStatusSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+class TariffSaverLinkStatusSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Source status"
-    _attr_icon = "mdi:database-check-outline"
+    _attr_name = "Link status"
+    _attr_icon = "mdi:link-variant"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
-        self._attr_unique_id = f"{entry.entry_id}_source_status"
+        self._attr_unique_id = f"{entry.entry_id}_link_status"
         self._attr_device_info = _device_info(entry)
 
     @property
     def native_value(self) -> str | None:
-        data = self.coordinator.data or {}
-        source = data.get("source") if isinstance(data, dict) else None
-        if isinstance(source, dict):
-            value = source.get("status")
-            return str(value) if value is not None else None
-        return None
+        v = getattr(self.coordinator, "link_status", None)
+        return str(v) if v is not None else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        data = self.coordinator.data or {}
-        source = data.get("source") if isinstance(data, dict) else None
-        return source if isinstance(source, dict) else {}
+        url = getattr(self.coordinator, "linking_url", None)
+        return {"linking_url": url} if url else {}
 
 
 class TariffSaverLastApiSuccessSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Last source success"
+    _attr_name = "Last API success"
     _attr_icon = "mdi:cloud-check-outline"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_entity_category = EntityCategory.DIAGNOSTIC
