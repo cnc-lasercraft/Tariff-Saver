@@ -1,15 +1,4 @@
-"""Lightweight persistent storage for Tariff Saver.
-
-Persists:
-- price slots (UTC 15-min): component breakdown (CHF/kWh) for active and optional baseline
-- energy samples (UTC timestamps of cumulative kWh)
-- booked 15-min slots (UTC start) with kWh + computed CHF totals (actual/baseline/savings)
-- last API success timestamp
-
-Design goals:
-- Backwards compatible (no store version bump).
-- Minimal schema: keep dyn/base totals for existing sensors, but also store components for better cost accuracy.
-"""
+"""Lightweight persistent storage for Tariff Saver."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -20,15 +9,15 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 
-# Components we treat as "all-in" parts of the price (CHF/kWh).
-# The EKZ API may provide some or all of these fields per slot.
+# Work-price components in CHF/kWh.
+# integrated/all_in are fallbacks only and must not be added on top.
 IMPORT_ALLIN_COMPONENTS: tuple[str, ...] = (
-    "integrated",
     "electricity",
     "grid",
     "regional_fees",
-    "metering",
 )
+
+_FALLBACK_TOTAL_KEYS: tuple[str, ...] = ("integrated", "all_in")
 
 
 class TariffSaverStore:
@@ -81,12 +70,6 @@ class TariffSaverStore:
             for _k, v in ps.items():
                 if not isinstance(v, dict):
                     continue
-                v.setdefault("dyn", None)
-                v.setdefault("base", None)
-                v.setdefault("components", {})
-                v.setdefault("baseline_components", {})
-                v.setdefault("total", None)
-                v.setdefault("baseline_total", None)
                 v.setdefault("a_total", v.get("total"))
                 v.setdefault("b_total", v.get("baseline_total"))
                 v.setdefault("a_comp", v.get("components", {}))
@@ -141,24 +124,30 @@ class TariffSaverStore:
         self.dirty = True
 
     @staticmethod
-    def _total_from_components(comps: dict[str, float] | None) -> float | None:
+    def _work_total_from_components(comps: dict[str, float] | None) -> float | None:
         if not comps:
             return None
-        integrated = comps.get("integrated")
-        if isinstance(integrated, (int, float)) and float(integrated) > 0:
-            return float(integrated)
-        all_in = comps.get("all_in")
-        if isinstance(all_in, (int, float)) and float(all_in) > 0:
-            return float(all_in)
         total = 0.0
         found = False
-        for key, v in comps.items():
-            if key in {"integrated", "all_in"}:
-                continue
-            if isinstance(v, (int, float)):
-                total += float(v)
+        for key in IMPORT_ALLIN_COMPONENTS:
+            value = comps.get(key)
+            if isinstance(value, (int, float)):
+                total += float(value)
                 found = True
         return float(total) if found and total > 0 else None
+
+    @classmethod
+    def _total_from_components(cls, comps: dict[str, float] | None) -> float | None:
+        if not comps:
+            return None
+        work_total = cls._work_total_from_components(comps)
+        if isinstance(work_total, (int, float)) and work_total > 0:
+            return float(work_total)
+        for key in _FALLBACK_TOTAL_KEYS:
+            value = comps.get(key)
+            if isinstance(value, (int, float)) and float(value) > 0:
+                return float(value)
+        return None
 
     @staticmethod
     def sum_components(comps: dict[str, float] | None, keys: tuple[str, ...]) -> float:
@@ -171,6 +160,22 @@ class TariffSaverStore:
                 total += float(v)
         return total
 
+    @classmethod
+    def all_in_from_components(cls, comps: dict[str, float] | None) -> float:
+        if not comps:
+            return 0.0
+        work_total = cls._work_total_from_components(comps)
+        if isinstance(work_total, (int, float)) and work_total > 0:
+            return float(work_total)
+        fallback = cls._total_from_components(comps)
+        return float(fallback) if isinstance(fallback, (int, float)) and fallback > 0 else 0.0
+
+    @staticmethod
+    def _normalize_components(comps: dict[str, float] | None) -> dict[str, float]:
+        if not comps:
+            return {}
+        return {str(k): float(v) for k, v in comps.items() if isinstance(v, (int, float))}
+
     def set_price_slot(
         self,
         start_utc: datetime,
@@ -181,15 +186,11 @@ class TariffSaverStore:
         start_utc = dt_util.as_utc(start_utc)
         key = start_utc.isoformat()
 
-        a_comp = {str(k): float(v) for k, v in (dyn_components_chf_per_kwh or {}).items() if isinstance(v, (int, float))}
-        b_comp = (
-            {str(k): float(v) for k, v in (base_components_chf_per_kwh or {}).items() if isinstance(v, (int, float))}
-            if base_components_chf_per_kwh
-            else None
-        )
+        a_comp = self._normalize_components(dyn_components_chf_per_kwh)
+        b_comp = self._normalize_components(base_components_chf_per_kwh)
 
         a_total = self._total_from_components(a_comp)
-        b_total = self._total_from_components(b_comp) if b_comp else None
+        b_total = self._total_from_components(b_comp)
 
         self.price_slots[key] = {
             "a_total": float(a_total) if isinstance(a_total, (int, float)) else None,
@@ -223,7 +224,6 @@ class TariffSaverStore:
         self.price_slots = {k: v for k, v in self.price_slots.items() if k >= cutoff_iso}
         if len(self.price_slots) != before:
             self.dirty = True
-
 
     def reset_energy_baseline(self, ts_utc: datetime, kwh_total: float, *, clear_booked: bool = True) -> None:
         ts_utc = dt_util.as_utc(ts_utc)
@@ -262,6 +262,21 @@ class TariffSaverStore:
         ts_utc = dt_util.as_utc(ts_utc)
         minute = (ts_utc.minute // 15) * 15
         return ts_utc.replace(minute=minute, second=0, microsecond=0)
+
+    @staticmethod
+    def _cost_breakdown(kwh: float, comps: dict[str, float] | None) -> dict[str, float]:
+        out: dict[str, float] = {}
+        if not comps or kwh <= 0:
+            return out
+        for key, value in comps.items():
+            if isinstance(value, (int, float)):
+                out[str(key)] = float(kwh) * float(value)
+        return out
+
+    @staticmethod
+    def _diff_breakdown(base: dict[str, float], dyn: dict[str, float]) -> dict[str, float]:
+        keys = set(base) | set(dyn)
+        return {key: float(base.get(key, 0.0)) - float(dyn.get(key, 0.0)) for key in keys}
 
     def finalize_due_slots(self, now_utc: datetime) -> int:
         now_utc = dt_util.as_utc(now_utc)
@@ -323,17 +338,32 @@ class TariffSaverStore:
                 continue
 
             a_total, b_total = self.get_price_totals(cursor)
+            a_comp, b_comp = self.get_price_components(cursor)
             if a_total is None or a_total <= 0:
                 self._append_booked(cursor, delta, 0.0, 0.0, 0.0, "unpriced")
                 newly += 1
                 cursor += timedelta(minutes=15)
                 continue
 
-            dyn_chf = delta * float(a_total)
-            base_chf = delta * float(b_total) if isinstance(b_total, (int, float)) and b_total > 0 else 0.0
+            dyn_breakdown = self._cost_breakdown(delta, a_comp)
+            base_breakdown = self._cost_breakdown(delta, b_comp)
+            sav_breakdown = self._diff_breakdown(base_breakdown, dyn_breakdown)
+
+            dyn_chf = self.all_in_from_components(dyn_breakdown)
+            base_chf = self.all_in_from_components(base_breakdown)
             sav = base_chf - dyn_chf if base_chf > 0 else 0.0
 
-            self._append_booked(cursor, delta, dyn_chf, base_chf, sav, "ok")
+            self._append_booked(
+                cursor,
+                delta,
+                dyn_chf,
+                base_chf,
+                sav,
+                "ok",
+                dyn_components=dyn_breakdown,
+                base_components=base_breakdown,
+                savings_components=sav_breakdown,
+            )
             newly += 1
             cursor += timedelta(minutes=15)
 
@@ -342,7 +372,19 @@ class TariffSaverStore:
             self.dirty = True
         return newly
 
-    def _append_booked(self, start_utc: datetime, kwh: float, dyn_chf: float, base_chf: float, sav: float, status: str) -> None:
+    def _append_booked(
+        self,
+        start_utc: datetime,
+        kwh: float,
+        dyn_chf: float,
+        base_chf: float,
+        sav: float,
+        status: str,
+        *,
+        dyn_components: dict[str, float] | None = None,
+        base_components: dict[str, float] | None = None,
+        savings_components: dict[str, float] | None = None,
+    ) -> None:
         self.booked.append(
             {
                 "start": dt_util.as_utc(start_utc).isoformat(),
@@ -351,6 +393,9 @@ class TariffSaverStore:
                 "base_chf": float(base_chf),
                 "savings_chf": float(sav),
                 "status": str(status),
+                "dyn_components": self._normalize_components(dyn_components),
+                "base_components": self._normalize_components(base_components),
+                "savings_components": self._normalize_components(savings_components),
             }
         )
 
@@ -426,6 +471,17 @@ class TariffSaverStore:
             if not (start_utc <= s_utc < end_utc):
                 continue
 
+            dyn_comp = b.get("dyn_components") if isinstance(b.get("dyn_components"), dict) else {}
+            base_comp = b.get("base_components") if isinstance(b.get("base_components"), dict) else {}
+            sav_comp = b.get("savings_components") if isinstance(b.get("savings_components"), dict) else {}
+
+            if dyn_comp or base_comp or sav_comp:
+                for bucket_name, source in (("dyn", dyn_comp), ("base", base_comp), ("sav", sav_comp)):
+                    for key, value in source.items():
+                        if isinstance(value, (int, float)):
+                            out[bucket_name][str(key)] = out[bucket_name].get(str(key), 0.0) + float(value)
+                continue
+
             try:
                 dyn = float(b.get("dyn_chf", 0.0))
                 base = float(b.get("base_chf", 0.0))
@@ -433,9 +489,9 @@ class TariffSaverStore:
             except Exception:
                 continue
 
-            out["dyn"]["electricity"] = out["dyn"].get("electricity", 0.0) + dyn
-            out["base"]["electricity"] = out["base"].get("electricity", 0.0) + base
-            out["sav"]["electricity"] = out["sav"].get("electricity", 0.0) + sav
+            out["dyn"]["integrated"] = out["dyn"].get("integrated", 0.0) + dyn
+            out["base"]["integrated"] = out["base"].get("integrated", 0.0) + base
+            out["sav"]["integrated"] = out["sav"].get("integrated", 0.0) + sav
 
         return out
 

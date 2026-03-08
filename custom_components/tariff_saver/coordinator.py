@@ -29,6 +29,25 @@ def _avg(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _slot_all_in(comps: dict[str, float] | None) -> float | None:
+    if not comps:
+        return None
+    total = 0.0
+    found = False
+    for key in ("electricity", "grid", "regional_fees"):
+        value = comps.get(key)
+        if isinstance(value, (int, float)):
+            total += float(value)
+            found = True
+    if found and total > 0:
+        return total
+    for key in ("integrated", "all_in"):
+        value = comps.get(key)
+        if isinstance(value, (int, float)) and float(value) > 0:
+            return float(value)
+    return None
+
+
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Reads tariff curves from the separate EKZ provider integration."""
 
@@ -79,10 +98,8 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.store is not None:
             if isinstance(self.last_api_success_utc, datetime):
                 self.store.set_last_api_success(self.last_api_success_utc)
-            base_map = {s.start: s.components_chf_per_kwh for s in baseline if s.electricity_chf_per_kwh > 0}
+            base_map = {s.start: s.components_chf_per_kwh for s in baseline}
             for s in active:
-                if s.electricity_chf_per_kwh <= 0:
-                    continue
                 self.store.set_price_slot(
                     s.start,
                     dyn_components_chf_per_kwh=s.components_chf_per_kwh,
@@ -134,36 +151,9 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         electricity = float(getattr(slot, "electricity_chf_per_kwh", 0.0) or 0.0)
         if electricity <= 0:
-            electricity = float(
-                components.get("electricity")
-                or components.get("integrated")
-                or components.get("all_in")
-                or 0.0
-            )
-            if electricity <= 0 and components:
-                electricity = float(
-                    sum(
-                        float(v)
-                        for key, v in components.items()
-                        if isinstance(v, (int, float)) and key not in {"integrated", "all_in"}
-                    )
-                )
-
-        if electricity > 0 and "electricity" not in components:
+            electricity = float(components.get("electricity") or 0.0)
+        if electricity > 0:
             components["electricity"] = electricity
-
-        if "integrated" not in components:
-            integrated = float(components.get("all_in") or 0.0)
-            if integrated <= 0:
-                integrated = float(
-                    sum(
-                        float(v)
-                        for key, v in components.items()
-                        if isinstance(v, (int, float)) and key not in {"integrated", "all_in"}
-                    )
-                )
-            if integrated > 0:
-                components["integrated"] = integrated
 
         return PriceSlot(
             start=dt_util.as_utc(start),
@@ -173,25 +163,32 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @staticmethod
     def _compute_daily_stats(active: list[PriceSlot], baseline: list[PriceSlot]) -> dict[str, Any]:
-        active_valid = [s for s in active if s.electricity_chf_per_kwh > 0]
-        base_map = {s.start: s.electricity_chf_per_kwh for s in baseline if s.electricity_chf_per_kwh > 0}
+        active_map = {
+            s.start: _slot_all_in(s.components_chf_per_kwh)
+            for s in active
+        }
+        active_values = [v for v in active_map.values() if isinstance(v, (int, float)) and v > 0]
 
-        avg_active = _avg([s.electricity_chf_per_kwh for s in active_valid])
-        avg_baseline = (
-            _avg([base_map[s.start] for s in active_valid if s.start in base_map])
-            if base_map
-            else None
-        )
+        base_map = {
+            s.start: _slot_all_in(s.components_chf_per_kwh)
+            for s in baseline
+        }
+        base_values = [v for v in base_map.values() if isinstance(v, (int, float)) and v > 0]
+
+        avg_active = _avg([float(v) for v in active_values])
+        avg_baseline = _avg([float(v) for v in base_values])
 
         dev_vs_avg: dict[str, float] = {}
         dev_vs_baseline: dict[str, float] = {}
 
-        for s in active_valid:
-            if avg_active and avg_active > 0:
-                dev_vs_avg[s.start.isoformat()] = (s.electricity_chf_per_kwh / avg_active - 1.0) * 100.0
-            base = base_map.get(s.start)
-            if base and base > 0:
-                dev_vs_baseline[s.start.isoformat()] = (s.electricity_chf_per_kwh / base - 1.0) * 100.0
+        for s in active:
+            active_price = active_map.get(s.start)
+            if isinstance(active_price, (int, float)) and active_price > 0:
+                if avg_active and avg_active > 0:
+                    dev_vs_avg[s.start.isoformat()] = (float(active_price) / avg_active - 1.0) * 100.0
+                base_price = base_map.get(s.start)
+                if isinstance(base_price, (int, float)) and base_price > 0:
+                    dev_vs_baseline[s.start.isoformat()] = (float(active_price) / float(base_price) - 1.0) * 100.0
 
         return {
             "calculated_at": dt_util.utcnow().isoformat(),
