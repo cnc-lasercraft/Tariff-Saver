@@ -61,8 +61,6 @@ class TariffSaverOptionsFlow(OptionsFlow):
             ).strip()
 
             raw_fixed = str(cleaned.get(CONF_FEED_IN_FIXED_PRICE, "") or "").strip()
-
-            # Accept decimals with dot OR comma.
             if raw_fixed == "":
                 cleaned[CONF_FEED_IN_FIXED_PRICE] = 0.0
             else:
@@ -71,10 +69,9 @@ class TariffSaverOptionsFlow(OptionsFlow):
                 except ValueError:
                     errors[CONF_FEED_IN_FIXED_PRICE] = "invalid_number"
 
-            # Only require an entity when entity mode is selected.
             if (
-                cleaned.get(CONF_FEED_IN_PRICE_MODE) == "entity"
-                and not cleaned.get(CONF_FEED_IN_PRICE_ENTITY)
+                cleaned[CONF_FEED_IN_PRICE_MODE] == "entity"
+                and not cleaned[CONF_FEED_IN_PRICE_ENTITY]
             ):
                 errors[CONF_FEED_IN_PRICE_ENTITY] = "required"
 
@@ -90,7 +87,7 @@ class TariffSaverOptionsFlow(OptionsFlow):
                 vol.Optional(
                     CONF_EKZ_ENTRY_ID,
                     default=options.get(CONF_EKZ_ENTRY_ID, ""),
-                ): TextSelector(),
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
                 vol.Optional(
                     CONF_PV_FORECAST_ENTITY,
                     default=options.get(CONF_PV_FORECAST_ENTITY),
@@ -108,12 +105,10 @@ class TariffSaverOptionsFlow(OptionsFlow):
                         mode=SelectSelectorMode.DROPDOWN,
                     )
                 ),
-                # Text field on purpose: this avoids integer-only browser widgets.
                 vol.Optional(
                     CONF_FEED_IN_FIXED_PRICE,
                     default=str(options.get(CONF_FEED_IN_FIXED_PRICE, "0.0")),
                 ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
-                # Text field on purpose: empty value must be allowed.
                 vol.Optional(
                     CONF_FEED_IN_PRICE_ENTITY,
                     default=options.get(CONF_FEED_IN_PRICE_ENTITY, ""),
