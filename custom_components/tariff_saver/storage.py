@@ -147,9 +147,14 @@ class TariffSaverStore:
         integrated = comps.get("integrated")
         if isinstance(integrated, (int, float)) and float(integrated) > 0:
             return float(integrated)
+        all_in = comps.get("all_in")
+        if isinstance(all_in, (int, float)) and float(all_in) > 0:
+            return float(all_in)
         total = 0.0
         found = False
-        for v in comps.values():
+        for key, v in comps.items():
+            if key in {"integrated", "all_in"}:
+                continue
             if isinstance(v, (int, float)):
                 total += float(v)
                 found = True

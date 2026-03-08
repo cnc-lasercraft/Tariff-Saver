@@ -125,19 +125,45 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not isinstance(start, datetime):
             raise UpdateFailed("EKZ Tariff slot is missing start")
 
-        electricity = float(getattr(slot, "electricity_chf_per_kwh", 0.0) or 0.0)
         raw_components = getattr(slot, "components_chf_per_kwh", {}) or {}
         components = {
             str(key): float(value)
             for key, value in raw_components.items()
             if isinstance(value, (int, float))
         }
+
+        electricity = float(getattr(slot, "electricity_chf_per_kwh", 0.0) or 0.0)
+        if electricity <= 0:
+            electricity = float(
+                components.get("electricity")
+                or components.get("integrated")
+                or components.get("all_in")
+                or 0.0
+            )
+            if electricity <= 0 and components:
+                electricity = float(
+                    sum(
+                        float(v)
+                        for key, v in components.items()
+                        if isinstance(v, (int, float)) and key not in {"integrated", "all_in"}
+                    )
+                )
+
         if electricity > 0 and "electricity" not in components:
             components["electricity"] = electricity
+
         if "integrated" not in components:
-            total = sum(float(v) for v in components.values() if isinstance(v, (int, float)))
-            if total > 0:
-                components["integrated"] = total
+            integrated = float(components.get("all_in") or 0.0)
+            if integrated <= 0:
+                integrated = float(
+                    sum(
+                        float(v)
+                        for key, v in components.items()
+                        if isinstance(v, (int, float)) and key not in {"integrated", "all_in"}
+                    )
+                )
+            if integrated > 0:
+                components["integrated"] = integrated
 
         return PriceSlot(
             start=dt_util.as_utc(start),

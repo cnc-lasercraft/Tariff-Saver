@@ -213,7 +213,14 @@ class TariffSaverPriceNowSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
     @property
     def native_value(self) -> float | None:
         slot = _current_slot(_active_slots(self.coordinator))
-        return float(slot.electricity_chf_per_kwh) if slot else None
+        if not slot:
+            return None
+        value = float(slot.electricity_chf_per_kwh or 0.0)
+        if value > 0:
+            return value
+        comps = slot.components_chf_per_kwh or {}
+        fallback = comps.get("electricity") or comps.get("integrated") or comps.get("all_in")
+        return float(fallback) if isinstance(fallback, (int, float)) else None
 
 
 class TariffSaverPriceAllInNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
@@ -233,8 +240,15 @@ class TariffSaverPriceAllInNowSensor(CoordinatorEntity[TariffSaverCoordinator], 
         if not slot:
             return None
         comps = slot.components_chf_per_kwh or {}
-        total = sum(float(comps.get(c, 0.0) or 0.0) for c in IMPORT_ALLIN_COMPONENTS)
-        return round(total, 6) if total else None
+        api_integrated = comps.get("integrated") or comps.get("all_in")
+        if isinstance(api_integrated, (int, float)) and float(api_integrated) > 0:
+            return round(float(api_integrated), 6)
+        total = sum(
+            float(value)
+            for key, value in comps.items()
+            if isinstance(value, (int, float)) and key not in {"integrated", "all_in"}
+        )
+        return round(total, 6) if total > 0 else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -242,8 +256,12 @@ class TariffSaverPriceAllInNowSensor(CoordinatorEntity[TariffSaverCoordinator], 
         if not slot:
             return {}
         comps = slot.components_chf_per_kwh or {}
-        api_integrated = comps.get("integrated")
-        summed = sum(float(comps.get(c, 0.0) or 0.0) for c in IMPORT_ALLIN_COMPONENTS)
+        api_integrated = comps.get("integrated") or comps.get("all_in")
+        summed = sum(
+            float(value)
+            for key, value in comps.items()
+            if isinstance(value, (int, float)) and key not in {"integrated", "all_in"}
+        )
         return {
             "slot_start_utc": slot.start.isoformat(),
             "sum_components": round(summed, 6),
