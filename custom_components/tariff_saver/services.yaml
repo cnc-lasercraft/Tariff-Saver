@@ -1,0 +1,18 @@
+reset_energy_baseline:
+  name: Reset energy baseline
+  description: Set the current energy meter value as the new Tariff Saver baseline and optionally clear booked costs.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional. Reset only this Tariff Saver entry.
+      example: abc123
+      required: false
+      selector:
+        text:
+    clear_booked:
+      name: Clear booked costs
+      description: Clear already booked cost slots when resetting the baseline.
+      required: false
+      default: true
+      selector:
+        boolean:

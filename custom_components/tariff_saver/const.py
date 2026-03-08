@@ -3,38 +3,26 @@ from __future__ import annotations
 
 DOMAIN = "tariff_saver"
 
-# Publish time
+CONF_SOURCE_TYPE = "source_type"
+SOURCE_EKZ = "ekz"
+SOURCE_ENTITIES = "entities"
+
+CONF_PRICE_ENTITY = "price_entity"
+CONF_PRICE_ATTRIBUTE = "price_attribute"
+CONF_BASELINE_ENTITY = "baseline_entity"
+CONF_BASELINE_ATTRIBUTE = "baseline_attribute"
+
+CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
+CONF_PRICE_SCALE = "price_scale"
+CONF_IGNORE_ZERO_PRICES = "ignore_zero_prices"
 CONF_PUBLISH_TIME = "publish_time"
 DEFAULT_PUBLISH_TIME = "18:15"
 
-# Tariffs (KEEP these names for backward compatibility with config_flow/coordinator)
-CONF_TARIFF_NAME = "tariff_name"
-CONF_BASELINE_TARIFF_NAME = "baseline_tariff_name"
+DEFAULT_PRICE_ATTRIBUTE = "price_slots"
+DEFAULT_BASELINE_ATTRIBUTE = "baseline_slots"
+DEFAULT_PRICE_SCALE = 1.0
+DEFAULT_IGNORE_ZERO_PRICES = True
 
-# Consumption (energy total_increasing)
-CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
+SIGNAL_STORE_UPDATED = "tariff_saver_store_updated"
 
-# Grade thresholds (deviation vs daily avg, percent)
-CONF_GRADE_T1 = "grade_t1_percent"
-CONF_GRADE_T2 = "grade_t2_percent"
-CONF_GRADE_T3 = "grade_t3_percent"
-CONF_GRADE_T4 = "grade_t4_percent"
-
-DEFAULT_GRADE_T1 = -20.0
-DEFAULT_GRADE_T2 = -10.0
-DEFAULT_GRADE_T3 = 10.0
-DEFAULT_GRADE_T4 = 25.0
-
-# Toggles
-CONF_ENABLE_COST_TRACKING = "enable_cost_tracking"
-DEFAULT_ENABLE_COST_TRACKING = True
-
-# Modes
-CONF_MODE = "mode"
-MODE_PUBLIC = "public"
-MODE_MYEKZ = "myekz"
-
-# myEKZ linking / protected endpoints
-CONF_EMS_INSTANCE_ID = "ems_instance_id"
-CONF_REDIRECT_URI = "redirect_uri"
-
+EKZ_DOMAIN = "ekz_tariff"

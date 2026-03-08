@@ -1,155 +1,32 @@
-"""Config flow for Tariff Saver (Public + myEKZ OAuth2).
-
-This version keeps the working handler/registration setup and fixes ONLY:
-- ems_instance_id generation: no hardcoded value; generate a unique UUID per setup.
-
-Notes:
-- myEKZ form field 'redirect_uri' is for EKZ /v1/emsLinkStatus linking flow (return URI),
-  NOT the OAuth redirect_uri (that one is managed by HA/OAuth flow).
-- No entity renames.
-- Public flow unchanged.
-
-Requirements (already in your setup):
-- oauth2.py + application_credentials.py exist
-- manifest.json includes:
-    "config_flow": true,
-    "oauth2": true,
-    "application_credentials": true
-  and dependencies include "application_credentials" and "auth"
-"""
+"""Config flow for Tariff Saver."""
 from __future__ import annotations
 
-import logging
-import uuid
 from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.config_entries import ConfigFlow as HAConfigFlow
 from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
-from homeassistant.helpers import config_entry_oauth2_flow
 
-from .const import DOMAIN, DEFAULT_PUBLISH_TIME, CONF_PUBLISH_TIME
-
-_LOGGER = logging.getLogger(__name__)
-
-MODE_PUBLIC = "public"
-MODE_MYEKZ = "myekz"
+from .const import DOMAIN
 
 
-def _generate_ems_instance_id() -> str:
-    """Generate a unique, persistent EMS instance id (per HA installation)."""
-    return f"ha-{uuid.uuid4().hex}"
-
-
-class ConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN):
+class ConfigFlow(HAConfigFlow, domain=DOMAIN):
     """Handle a config flow for Tariff Saver."""
 
-    # Some HA versions require this attribute too
-    DOMAIN = DOMAIN
-    VERSION = 2
-
-    @property
-    def logger(self) -> logging.Logger:
-        return _LOGGER
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._name: str | None = None
-        self._mode: str | None = None
-        self._redirect_uri: str | None = None  # EKZ linking return URL (not OAuth)
-        self._ems_instance_id: str | None = None
-        self._publish_time: str = DEFAULT_PUBLISH_TIME
+    VERSION = 3
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
-            self._name = user_input[CONF_NAME]
-            return await self.async_step_mode()
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_NAME): str}),
-        )
-
-    async def async_step_mode(self, user_input: dict[str, Any] | None = None):
-        if user_input is not None:
-            self._mode = user_input["mode"]
-            if self._mode == MODE_PUBLIC:
-                return await self.async_step_public()
-            return await self.async_step_myekz()
-
-        return self.async_show_form(
-            step_id="mode",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("mode", default=MODE_PUBLIC): vol.In(
-                        {
-                            MODE_PUBLIC: "Public (no login)",
-                            MODE_MYEKZ: "myEKZ login",
-                        }
-                    )
-                }
-            ),
-        )
-
-    async def async_step_public(self, user_input: dict[str, Any] | None = None):
-        if user_input is not None:
             return self.async_create_entry(
-                title=self._name or "Tariff Saver",
-                data={
-                    CONF_NAME: self._name or "Tariff Saver",
-                    "mode": MODE_PUBLIC,
-                    "tariff_name": user_input["tariff_name"],
-                    "baseline_tariff_name": user_input.get("baseline_tariff_name"),
-                    CONF_PUBLISH_TIME: user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME),
-                },
+                title=user_input[CONF_NAME],
+                data={CONF_NAME: user_input[CONF_NAME]},
             )
 
         return self.async_show_form(
-            step_id="public",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("tariff_name"): str,
-                    vol.Optional("baseline_tariff_name", default="electricity_standard"): str,
-                    vol.Optional(CONF_PUBLISH_TIME, default=DEFAULT_PUBLISH_TIME): str,
-                }
-            ),
-        )
-
-    async def async_step_myekz(self, user_input: dict[str, Any] | None = None):
-        if user_input is not None:
-            self._redirect_uri = str(user_input["redirect_uri"]).strip()
-            self._publish_time = user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
-
-            # Generate ONCE for this config entry
-            self._ems_instance_id = _generate_ems_instance_id()
-
-            # Pick implementation first (sets self.flow_impl), then HA continues to auth.
-            return await self.async_step_pick_implementation()
-
-        default_redirect = (self.hass.config.external_url or "").rstrip("/") + "/"
-        return self.async_show_form(
-            step_id="myekz",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("redirect_uri", default=default_redirect or "https://"): str,
-                    vol.Optional(CONF_PUBLISH_TIME, default=DEFAULT_PUBLISH_TIME): str,
-                }
-            ),
-        )
-
-    async def async_step_auth_create_entry(self, data: dict[str, Any]):
-        return self.async_create_entry(
-            title=self._name or "Tariff Saver",
-            data={
-                CONF_NAME: self._name or "Tariff Saver",
-                "mode": MODE_MYEKZ,
-                "ems_instance_id": self._ems_instance_id,
-                "redirect_uri": self._redirect_uri,
-                "tariff_name": "myEKZ",
-                "baseline_tariff_name": None,
-                CONF_PUBLISH_TIME: self._publish_time,
-            },
+            step_id="user",
+            data_schema=vol.Schema({vol.Required(CONF_NAME, default="Tariff Saver"): str}),
         )
 
     @staticmethod
