@@ -132,10 +132,20 @@ def _parse_datetime_any(value: Any) -> datetime | None:
     return None
 
 
+def _slot_key_30m(value: datetime | None) -> str | None:
+    """Return a stable local 30-minute slot key for matching tariff and PV slots."""
+    if not isinstance(value, datetime):
+        return None
+    local_value = dt_util.as_local(value)
+    bucket_minute = 0 if local_value.minute < 30 else 30
+    bucket_local = local_value.replace(minute=bucket_minute, second=0, microsecond=0)
+    return bucket_local.isoformat()
+
+
 def _merge_slot_pv_data(slots: list[PriceSlot], pv_data: dict[str, Any]) -> list[dict[str, Any]]:
     """Attach PV forecast values to tariff 30-minute slots without duplicating forecast storage."""
     pv_slots = pv_data.get("slots") if isinstance(pv_data, dict) else []
-    pv_map: dict[datetime, dict[str, float]] = {}
+    pv_map: dict[str, dict[str, float]] = {}
     if isinstance(pv_slots, list):
         for item in pv_slots:
             if not isinstance(item, dict):
@@ -143,14 +153,17 @@ def _merge_slot_pv_data(slots: list[PriceSlot], pv_data: dict[str, Any]) -> list
             start = item.get("start")
             if not isinstance(start, datetime):
                 continue
-            pv_map[dt_util.as_utc(start)] = {
+            slot_key = _slot_key_30m(start)
+            if slot_key is None:
+                continue
+            pv_map[slot_key] = {
                 "pv_estimate_kw": round(float(item.get("pv_power_kw", 0.0) or 0.0), 6),
                 "pv_energy_kwh": round(float(item.get("pv_energy_kwh", 0.0) or 0.0), 6),
             }
 
     merged: list[dict[str, Any]] = []
     for slot in sorted(slots, key=lambda s: s.start):
-        pv_values = pv_map.get(dt_util.as_utc(slot.start), {})
+        pv_values = pv_map.get(_slot_key_30m(slot.start) or "", {})
         merged.append(
             {
                 "start": dt_util.as_utc(slot.start),
