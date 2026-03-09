@@ -48,10 +48,6 @@ def _avg(values: list[float]) -> float | None:
 def _slot_total_price(comps: dict[str, float] | None) -> float | None:
     if not comps:
         return None
-    for key in ("integrated", "all_in"):
-        value = comps.get(key)
-        if isinstance(value, (int, float)) and float(value) > 0:
-            return float(value)
     total = 0.0
     found = False
     for key in ("electricity", "grid", "regional_fees"):
@@ -59,7 +55,13 @@ def _slot_total_price(comps: dict[str, float] | None) -> float | None:
         if isinstance(value, (int, float)):
             total += float(value)
             found = True
-    return total if found and total > 0 else None
+    if found and total > 0:
+        return total
+    for key in ("integrated", "all_in"):
+        value = comps.get(key)
+        if isinstance(value, (int, float)) and float(value) > 0:
+            return float(value)
+    return None
 
 
 
@@ -128,6 +130,36 @@ def _parse_datetime_any(value: Any) -> datetime | None:
         if parsed is not None:
             return dt_util.as_utc(parsed)
     return None
+
+
+def _merge_slot_pv_data(slots: list[PriceSlot], pv_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Attach PV forecast values to tariff 30-minute slots without duplicating forecast storage."""
+    pv_slots = pv_data.get("slots") if isinstance(pv_data, dict) else []
+    pv_map: dict[datetime, dict[str, float]] = {}
+    if isinstance(pv_slots, list):
+        for item in pv_slots:
+            if not isinstance(item, dict):
+                continue
+            start = item.get("start")
+            if not isinstance(start, datetime):
+                continue
+            pv_map[dt_util.as_utc(start)] = {
+                "pv_estimate_kw": round(float(item.get("pv_power_kw", 0.0) or 0.0), 6),
+                "pv_energy_kwh": round(float(item.get("pv_energy_kwh", 0.0) or 0.0), 6),
+            }
+
+    merged: list[dict[str, Any]] = []
+    for slot in sorted(slots, key=lambda s: s.start):
+        pv_values = pv_map.get(dt_util.as_utc(slot.start), {})
+        merged.append(
+            {
+                "start": dt_util.as_utc(slot.start),
+                "price_all_in_chf_per_kwh": _slot_total_price(slot.components_chf_per_kwh),
+                "pv_estimate_kw": pv_values.get("pv_estimate_kw", 0.0),
+                "pv_energy_kwh": pv_values.get("pv_energy_kwh", 0.0),
+            }
+        )
+    return merged
 
 
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -210,12 +242,14 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.store.async_save()
 
         windows = self._compute_best_windows(active_30m)
+        slot_plan = _merge_slot_pv_data(active_30m, pv_data)
         self._last_fetch_date = today
         return {
             "active": active_30m,
             "baseline": baseline_30m,
             "active_raw": active,
             "baseline_raw": baseline,
+            "slot_plan": slot_plan,
             "stats": stats,
             "pv": pv_data,
             "feed_in": {

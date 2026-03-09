@@ -53,6 +53,11 @@ def _pv(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
     return data.get("pv", {}) if isinstance(data, dict) else {}
 
 
+def _slot_plan(coordinator: TariffSaverCoordinator) -> list[dict[str, Any]]:
+    data = coordinator.data or {}
+    return data.get("slot_plan", []) if isinstance(data, dict) else []
+
+
 def _feed_in(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
     data = coordinator.data or {}
     return data.get("feed_in", {}) if isinstance(data, dict) else {}
@@ -82,13 +87,15 @@ def _next_slot(slots: list[PriceSlot]) -> PriceSlot | None:
 def _all_in_from_slot(slot: PriceSlot | None) -> float | None:
     if not slot:
         return None
+    total = TariffSaverStore.sum_components(slot.components_chf_per_kwh, IMPORT_ALLIN_COMPONENTS)
+    if total > 0:
+        return total
     comps = slot.components_chf_per_kwh or {}
     for key in ("integrated", "all_in"):
         value = comps.get(key)
         if isinstance(value, (int, float)) and float(value) > 0:
             return float(value)
-    total = TariffSaverStore.sum_components(comps, IMPORT_ALLIN_COMPONENTS)
-    return total if total > 0 else None
+    return None
 
 
 def _stars(score: int | None, scale: int) -> int | None:
@@ -212,6 +219,11 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
         active = _active_slots(self.coordinator)
         baseline = _baseline_slots(self.coordinator)
         baseline_map = {slot.start: slot for slot in baseline}
+        slot_plan_map = {
+            slot.get("start"): slot
+            for slot in _slot_plan(self.coordinator)
+            if isinstance(slot, dict) and isinstance(slot.get("start"), datetime)
+        }
         return {
             "interval_minutes": 30,
             "slot_count": len(active),
@@ -220,6 +232,8 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
                     "start": slot.start.isoformat(),
                     "price_all_in_chf_per_kwh": _all_in_from_slot(slot),
                     "baseline_chf_per_kwh": _all_in_from_slot(baseline_map.get(slot.start)),
+                    "pv_estimate_kw": (slot_plan_map.get(slot.start) or {}).get("pv_estimate_kw", 0.0),
+                    "pv_energy_kwh": (slot_plan_map.get(slot.start) or {}).get("pv_energy_kwh", 0.0),
                 }
                 for slot in active
             ],
