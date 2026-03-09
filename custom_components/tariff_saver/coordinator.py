@@ -48,6 +48,10 @@ def _avg(values: list[float]) -> float | None:
 def _slot_total_price(comps: dict[str, float] | None) -> float | None:
     if not comps:
         return None
+    for key in ("integrated", "all_in"):
+        value = comps.get(key)
+        if isinstance(value, (int, float)) and float(value) > 0:
+            return float(value)
     total = 0.0
     found = False
     for key in ("electricity", "grid", "regional_fees"):
@@ -55,13 +59,7 @@ def _slot_total_price(comps: dict[str, float] | None) -> float | None:
         if isinstance(value, (int, float)):
             total += float(value)
             found = True
-    if found and total > 0:
-        return total
-    for key in ("integrated", "all_in"):
-        value = comps.get(key)
-        if isinstance(value, (int, float)) and float(value) > 0:
-            return float(value)
-    return None
+    return total if found and total > 0 else None
 
 
 

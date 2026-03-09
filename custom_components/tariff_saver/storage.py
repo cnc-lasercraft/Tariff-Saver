@@ -165,6 +165,10 @@ class TariffSaverStore:
     def _work_total_from_components(comps: dict[str, float] | None) -> float | None:
         if not comps:
             return None
+        for key in _FALLBACK_TOTAL_KEYS:
+            value = comps.get(key)
+            if isinstance(value, (int, float)) and float(value) > 0:
+                return float(value)
         total = 0.0
         found = False
         for key in IMPORT_ALLIN_COMPONENTS:

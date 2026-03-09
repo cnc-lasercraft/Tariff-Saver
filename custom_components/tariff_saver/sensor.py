@@ -82,15 +82,13 @@ def _next_slot(slots: list[PriceSlot]) -> PriceSlot | None:
 def _all_in_from_slot(slot: PriceSlot | None) -> float | None:
     if not slot:
         return None
-    total = TariffSaverStore.sum_components(slot.components_chf_per_kwh, IMPORT_ALLIN_COMPONENTS)
-    if total > 0:
-        return total
     comps = slot.components_chf_per_kwh or {}
     for key in ("integrated", "all_in"):
         value = comps.get(key)
         if isinstance(value, (int, float)) and float(value) > 0:
             return float(value)
-    return None
+    total = TariffSaverStore.sum_components(comps, IMPORT_ALLIN_COMPONENTS)
+    return total if total > 0 else None
 
 
 def _stars(score: int | None, scale: int) -> int | None:
