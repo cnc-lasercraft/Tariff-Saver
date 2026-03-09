@@ -51,38 +51,54 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 4
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
+        errors: dict[str, str] = {}
+
         if user_input is not None:
-            await self.async_set_unique_id(user_input[CONF_NAME])
-            self._abort_if_unique_id_configured()
-            return self.async_create_entry(
-                title=user_input[CONF_NAME],
-                data={
-                    CONF_NAME: user_input[CONF_NAME],
-                    CONF_PUBLISH_TIME: user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME),
-                    CONF_CONSUMPTION_ENERGY_ENTITY: user_input.get(CONF_CONSUMPTION_ENERGY_ENTITY, ""),
-                    CONF_EKZ_ENTRY_ID: user_input.get(CONF_EKZ_ENTRY_ID, ""),
-                    CONF_PV_FORECAST_ENTITY: user_input.get(CONF_PV_FORECAST_ENTITY, ""),
-                    CONF_PV_FORECAST_ATTRIBUTE: user_input.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE),
-                    CONF_FEED_IN_PRICE_MODE: user_input.get(CONF_FEED_IN_PRICE_MODE, DEFAULT_FEED_IN_PRICE_MODE),
-                    CONF_FEED_IN_FIXED_PRICE: user_input.get(CONF_FEED_IN_FIXED_PRICE, DEFAULT_FEED_IN_FIXED_PRICE),
-                    CONF_FEED_IN_PRICE_ENTITY: user_input.get(CONF_FEED_IN_PRICE_ENTITY, ""),
-                },
-            )
+            fixed_raw = str(user_input.get(CONF_FEED_IN_FIXED_PRICE, DEFAULT_FEED_IN_FIXED_PRICE) or "").strip()
+            entity_raw = str(user_input.get(CONF_FEED_IN_PRICE_ENTITY, "") or "").strip()
+            mode = str(user_input.get(CONF_FEED_IN_PRICE_MODE, DEFAULT_FEED_IN_PRICE_MODE) or DEFAULT_FEED_IN_PRICE_MODE)
+
+            try:
+                fixed_price = float(fixed_raw.replace(',', '.')) if fixed_raw != '' else float(DEFAULT_FEED_IN_FIXED_PRICE)
+            except ValueError:
+                errors[CONF_FEED_IN_FIXED_PRICE] = "invalid_number"
+                fixed_price = float(DEFAULT_FEED_IN_FIXED_PRICE)
+
+            if mode == "entity" and not entity_raw:
+                errors[CONF_FEED_IN_PRICE_ENTITY] = "required"
+
+            if not errors:
+                await self.async_set_unique_id(str(user_input[CONF_NAME]).strip())
+                self._abort_if_unique_id_configured()
+                return self.async_create_entry(
+                    title=str(user_input[CONF_NAME]).strip(),
+                    data={
+                        CONF_NAME: str(user_input[CONF_NAME]).strip(),
+                        CONF_PUBLISH_TIME: str(user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME) or DEFAULT_PUBLISH_TIME).strip(),
+                        CONF_CONSUMPTION_ENERGY_ENTITY: user_input.get(CONF_CONSUMPTION_ENERGY_ENTITY, ""),
+                        CONF_EKZ_ENTRY_ID: str(user_input.get(CONF_EKZ_ENTRY_ID, "") or "").strip(),
+                        CONF_PV_FORECAST_ENTITY: user_input.get(CONF_PV_FORECAST_ENTITY, ""),
+                        CONF_PV_FORECAST_ATTRIBUTE: str(user_input.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE) or DEFAULT_PV_FORECAST_ATTRIBUTE).strip(),
+                        CONF_FEED_IN_PRICE_MODE: mode,
+                        CONF_FEED_IN_FIXED_PRICE: fixed_price,
+                        CONF_FEED_IN_PRICE_ENTITY: entity_raw,
+                    },
+                )
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_NAME): str,
-                vol.Optional(CONF_CONSUMPTION_ENERGY_ENTITY, default=""): _sensor_entity_selector(),
-                vol.Optional(CONF_EKZ_ENTRY_ID, default=""): str,
-                vol.Optional(CONF_PV_FORECAST_ENTITY, default=""): _sensor_entity_selector(),
-                vol.Optional(CONF_PV_FORECAST_ATTRIBUTE, default=DEFAULT_PV_FORECAST_ATTRIBUTE): str,
-                vol.Optional(CONF_FEED_IN_PRICE_MODE, default=DEFAULT_FEED_IN_PRICE_MODE): _feed_in_price_mode_selector(),
-                vol.Optional(CONF_FEED_IN_FIXED_PRICE, default=DEFAULT_FEED_IN_FIXED_PRICE): vol.Coerce(float),
-                vol.Optional(CONF_FEED_IN_PRICE_ENTITY, default=""): _sensor_entity_selector(),
-                vol.Optional(CONF_PUBLISH_TIME, default=DEFAULT_PUBLISH_TIME): str,
+                vol.Required(CONF_NAME, default=(user_input or {}).get(CONF_NAME, "Tariff Saver")): str,
+                vol.Optional(CONF_CONSUMPTION_ENERGY_ENTITY, default=(user_input or {}).get(CONF_CONSUMPTION_ENERGY_ENTITY, "")): _sensor_entity_selector(),
+                vol.Optional(CONF_EKZ_ENTRY_ID, default=(user_input or {}).get(CONF_EKZ_ENTRY_ID, "")): str,
+                vol.Optional(CONF_PV_FORECAST_ENTITY, default=(user_input or {}).get(CONF_PV_FORECAST_ENTITY, "")): _sensor_entity_selector(),
+                vol.Optional(CONF_PV_FORECAST_ATTRIBUTE, default=(user_input or {}).get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE)): str,
+                vol.Optional(CONF_FEED_IN_PRICE_MODE, default=(user_input or {}).get(CONF_FEED_IN_PRICE_MODE, DEFAULT_FEED_IN_PRICE_MODE)): _feed_in_price_mode_selector(),
+                vol.Optional(CONF_FEED_IN_FIXED_PRICE, default=str((user_input or {}).get(CONF_FEED_IN_FIXED_PRICE, DEFAULT_FEED_IN_FIXED_PRICE))): str,
+                vol.Optional(CONF_FEED_IN_PRICE_ENTITY, default=(user_input or {}).get(CONF_FEED_IN_PRICE_ENTITY, "")): str,
+                vol.Optional(CONF_PUBLISH_TIME, default=(user_input or {}).get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)): str,
             }
         )
-        return self.async_show_form(step_id="user", data_schema=schema)
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
     @staticmethod
     @callback

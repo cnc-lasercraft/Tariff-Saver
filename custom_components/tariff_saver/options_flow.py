@@ -49,48 +49,69 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
         self._entry = config_entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
-        if user_input is not None:
-            merged = dict(self._entry.options)
-            merged.update(user_input)
-            return self.async_create_entry(title="", data=merged)
-
+        errors: dict[str, str] = {}
         opts = dict(self._entry.options)
         data = dict(self._entry.data)
+
+        if user_input is not None:
+            fixed_raw = str(user_input.get(CONF_FEED_IN_FIXED_PRICE, DEFAULT_FEED_IN_FIXED_PRICE) or "").strip()
+            entity_raw = str(user_input.get(CONF_FEED_IN_PRICE_ENTITY, "") or "").strip()
+            mode = str(user_input.get(CONF_FEED_IN_PRICE_MODE, DEFAULT_FEED_IN_PRICE_MODE) or DEFAULT_FEED_IN_PRICE_MODE)
+
+            try:
+                fixed_price = float(fixed_raw.replace(',', '.')) if fixed_raw != '' else float(DEFAULT_FEED_IN_FIXED_PRICE)
+            except ValueError:
+                errors[CONF_FEED_IN_FIXED_PRICE] = "invalid_number"
+                fixed_price = float(DEFAULT_FEED_IN_FIXED_PRICE)
+
+            if mode == "entity" and not entity_raw:
+                errors[CONF_FEED_IN_PRICE_ENTITY] = "required"
+
+            if not errors:
+                merged = dict(self._entry.options)
+                merged.update(user_input)
+                merged[CONF_EKZ_ENTRY_ID] = str(user_input.get(CONF_EKZ_ENTRY_ID, "") or "").strip()
+                merged[CONF_PV_FORECAST_ATTRIBUTE] = str(user_input.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE) or DEFAULT_PV_FORECAST_ATTRIBUTE).strip()
+                merged[CONF_FEED_IN_PRICE_MODE] = mode
+                merged[CONF_FEED_IN_FIXED_PRICE] = fixed_price
+                merged[CONF_FEED_IN_PRICE_ENTITY] = entity_raw
+                merged[CONF_PUBLISH_TIME] = str(user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME) or DEFAULT_PUBLISH_TIME).strip()
+                return self.async_create_entry(title="", data=merged)
 
         schema = vol.Schema(
             {
                 vol.Optional(
                     CONF_CONSUMPTION_ENERGY_ENTITY,
-                    default=opts.get(CONF_CONSUMPTION_ENERGY_ENTITY, data.get(CONF_CONSUMPTION_ENERGY_ENTITY, "")),
+                    default=(user_input or {}).get(CONF_CONSUMPTION_ENERGY_ENTITY, opts.get(CONF_CONSUMPTION_ENERGY_ENTITY, data.get(CONF_CONSUMPTION_ENERGY_ENTITY, ""))),
                 ): _sensor_entity_selector(),
                 vol.Optional(
                     CONF_EKZ_ENTRY_ID,
-                    default=opts.get(CONF_EKZ_ENTRY_ID, data.get(CONF_EKZ_ENTRY_ID, "")),
+                    default=(user_input or {}).get(CONF_EKZ_ENTRY_ID, opts.get(CONF_EKZ_ENTRY_ID, data.get(CONF_EKZ_ENTRY_ID, ""))),
                 ): str,
                 vol.Optional(
                     CONF_PV_FORECAST_ENTITY,
-                    default=opts.get(CONF_PV_FORECAST_ENTITY, data.get(CONF_PV_FORECAST_ENTITY, "")),
+                    default=(user_input or {}).get(CONF_PV_FORECAST_ENTITY, opts.get(CONF_PV_FORECAST_ENTITY, data.get(CONF_PV_FORECAST_ENTITY, ""))),
                 ): _sensor_entity_selector(),
                 vol.Optional(
                     CONF_PV_FORECAST_ATTRIBUTE,
-                    default=opts.get(CONF_PV_FORECAST_ATTRIBUTE, data.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE)),
+                    default=(user_input or {}).get(CONF_PV_FORECAST_ATTRIBUTE, opts.get(CONF_PV_FORECAST_ATTRIBUTE, data.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE))),
                 ): str,
                 vol.Optional(
                     CONF_FEED_IN_PRICE_MODE,
-                    default=opts.get(CONF_FEED_IN_PRICE_MODE, data.get(CONF_FEED_IN_PRICE_MODE, DEFAULT_FEED_IN_PRICE_MODE)),
+                    default=(user_input or {}).get(CONF_FEED_IN_PRICE_MODE, opts.get(CONF_FEED_IN_PRICE_MODE, data.get(CONF_FEED_IN_PRICE_MODE, DEFAULT_FEED_IN_PRICE_MODE))),
                 ): _feed_in_price_mode_selector(),
                 vol.Optional(
                     CONF_FEED_IN_FIXED_PRICE,
-                    default=opts.get(CONF_FEED_IN_FIXED_PRICE, data.get(CONF_FEED_IN_FIXED_PRICE, DEFAULT_FEED_IN_FIXED_PRICE)),
-                ): vol.Coerce(float),
+                    default=str((user_input or {}).get(CONF_FEED_IN_FIXED_PRICE, opts.get(CONF_FEED_IN_FIXED_PRICE, data.get(CONF_FEED_IN_FIXED_PRICE, DEFAULT_FEED_IN_FIXED_PRICE)))),
+                ): str,
                 vol.Optional(
                     CONF_FEED_IN_PRICE_ENTITY,
-                    default=opts.get(CONF_FEED_IN_PRICE_ENTITY, data.get(CONF_FEED_IN_PRICE_ENTITY, "")),
-                ): _sensor_entity_selector(),
+                    default=(user_input or {}).get(CONF_FEED_IN_PRICE_ENTITY, opts.get(CONF_FEED_IN_PRICE_ENTITY, data.get(CONF_FEED_IN_PRICE_ENTITY, ""))),
+                ): str,
                 vol.Optional(
                     CONF_PUBLISH_TIME,
-                    default=opts.get(CONF_PUBLISH_TIME, data.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)),
+                    default=(user_input or {}).get(CONF_PUBLISH_TIME, opts.get(CONF_PUBLISH_TIME, data.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME))),
                 ): str,
             }
         )
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)

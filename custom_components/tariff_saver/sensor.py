@@ -165,7 +165,6 @@ async def async_setup_entry(
         TariffSaverBaselinePriceNowSensor(coordinator, entry),
         TariffSaverNextPriceSensor(coordinator, entry),
         TariffSaverScoreNowSensor(coordinator, entry),
-        TariffSaverScoreStarsSensor(coordinator, entry, 5),
         TariffSaverScoreStarsSensor(coordinator, entry, 10),
         TariffSaverDayScoreSensor(coordinator, entry),
         TariffSaverDayScoreStarsSensor(coordinator, entry, 5),
@@ -197,7 +196,7 @@ async def async_setup_entry(
 
 class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Price curve"
+    _attr_name = "Price curve 30m"
     _attr_icon = "mdi:chart-line"
 
     def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
@@ -216,6 +215,7 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
         baseline = _baseline_slots(self.coordinator)
         baseline_map = {slot.start: slot for slot in baseline}
         return {
+            "interval_minutes": 30,
             "slot_count": len(active),
             "slots": [
                 {
@@ -230,7 +230,7 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
 
 class TariffSaverPriceNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Price now"
+    _attr_name = "Price now 30m"
     _attr_native_unit_of_measurement = "CHF/kWh"
     _attr_icon = "mdi:cash"
 
@@ -247,7 +247,7 @@ class TariffSaverPriceNowSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
 
 class TariffSaverBaselinePriceNowSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Baseline price now"
+    _attr_name = "Baseline price now 30m"
     _attr_native_unit_of_measurement = "CHF/kWh"
     _attr_icon = "mdi:cash-sync"
 
@@ -264,7 +264,7 @@ class TariffSaverBaselinePriceNowSensor(CoordinatorEntity[TariffSaverCoordinator
 
 class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
     _attr_has_entity_name = True
-    _attr_name = "Next price"
+    _attr_name = "Next price 30m"
     _attr_native_unit_of_measurement = "CHF/kWh"
     _attr_icon = "mdi:clock-outline"
 

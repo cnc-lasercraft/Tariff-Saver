@@ -31,7 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PriceSlot:
-    """A single 15-minute price slot."""
+    """A normalized price slot."""
 
     start: datetime  # UTC, timezone-aware
     electricity_chf_per_kwh: float
@@ -63,6 +63,52 @@ def _slot_total_price(comps: dict[str, float] | None) -> float | None:
             return float(value)
     return None
 
+
+
+
+def _aggregate_slots_30m(slots: list[PriceSlot]) -> list[PriceSlot]:
+    """Aggregate 15-minute price slots into 30-minute slots."""
+    buckets: dict[datetime, list[PriceSlot]] = {}
+    for slot in sorted(slots, key=lambda s: s.start):
+        local_start = dt_util.as_local(slot.start)
+        bucket_minute = 0 if local_start.minute < 30 else 30
+        bucket_local = local_start.replace(minute=bucket_minute, second=0, microsecond=0)
+        bucket_start = dt_util.as_utc(bucket_local)
+        buckets.setdefault(bucket_start, []).append(slot)
+
+    aggregated: list[PriceSlot] = []
+    for bucket_start in sorted(buckets):
+        bucket_slots = buckets[bucket_start]
+        components: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        electricity_values: list[float] = []
+
+        for slot in bucket_slots:
+            if isinstance(slot.electricity_chf_per_kwh, (int, float)):
+                electricity_values.append(float(slot.electricity_chf_per_kwh))
+            for key, value in (slot.components_chf_per_kwh or {}).items():
+                if isinstance(value, (int, float)):
+                    components[key] = components.get(key, 0.0) + float(value)
+                    counts[key] = counts.get(key, 0) + 1
+
+        averaged_components = {
+            key: round(total / counts[key], 6)
+            for key, total in components.items()
+            if counts.get(key)
+        }
+        electricity = round(sum(electricity_values) / len(electricity_values), 6) if electricity_values else 0.0
+        if electricity > 0:
+            averaged_components["electricity"] = electricity
+
+        aggregated.append(
+            PriceSlot(
+                start=bucket_start,
+                electricity_chf_per_kwh=electricity,
+                components_chf_per_kwh=averaged_components,
+            )
+        )
+
+    return aggregated
 
 def score_from_prices(current_price: float | None, min_price: float | None, max_price: float | None) -> int | None:
     """Return score where 0 is cheapest and 100 is most expensive."""
@@ -130,6 +176,8 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         active = [self._convert_slot(slot) for slot in active_raw]
         baseline = [self._convert_slot(slot) for slot in baseline_raw]
+        active_30m = _aggregate_slots_30m(active)
+        baseline_30m = _aggregate_slots_30m(baseline)
 
         if not active:
             raise UpdateFailed("EKZ Tariff provider returned no active_slots")
@@ -150,7 +198,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             self.store.trim_price_slots(keep_days=7)
 
-        stats = self._compute_daily_stats(active, baseline)
+        stats = self._compute_daily_stats(active_30m, baseline_30m)
         pv_data = self._parse_pv_forecast()
         feed_in_price = self._get_feed_in_price()
 
@@ -163,11 +211,13 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.store.dirty:
                 await self.store.async_save()
 
-        windows = self._compute_best_windows(active)
+        windows = self._compute_best_windows(active_30m)
         self._last_fetch_date = today
         return {
-            "active": active,
-            "baseline": baseline,
+            "active": active_30m,
+            "baseline": baseline_30m,
+            "active_raw": active,
+            "baseline_raw": baseline,
             "stats": stats,
             "pv": pv_data,
             "feed_in": {
@@ -376,7 +426,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now_utc = dt_util.utcnow()
 
         for hours in WINDOW_HOURS:
-            slot_count = hours * 4
+            slot_count = hours * 2
             candidates: list[tuple[datetime, float]] = []
             for idx in range(0, len(ordered) - slot_count + 1):
                 window_slots = ordered[idx : idx + slot_count]
