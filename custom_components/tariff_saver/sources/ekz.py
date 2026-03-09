@@ -88,12 +88,10 @@ class EkzSlotSource(SlotSource):
         if not isinstance(comps, dict):
             comps = {}
 
-        grid = float(comps.get("grid", 0.0) or 0.0)
+        grid = float(comps.get("grid_incl_fees", comps.get("grid", 0.0)) or 0.0)
         regional_fees = float(comps.get("regional_fees", 0.0) or 0.0)
 
-        integrated = comps.get("integrated")
-        if integrated is None:
-            integrated = electricity + grid + regional_fees
+        integrated = electricity + grid + regional_fees
 
         return PriceSlot(
             start=start,
