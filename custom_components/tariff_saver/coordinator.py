@@ -132,18 +132,17 @@ def _parse_datetime_any(value: Any) -> datetime | None:
     return None
 
 
-def _slot_key_30m(value: datetime | None) -> str | None:
-    """Return a stable local 30-minute slot key for matching tariff and PV slots."""
-    if not isinstance(value, datetime):
-        return None
-    local_value = dt_util.as_local(value)
+
+
+def _slot_key_local_30m(value: datetime) -> str:
+    local_value = dt_util.as_local(value).replace(second=0, microsecond=0)
     bucket_minute = 0 if local_value.minute < 30 else 30
-    bucket_local = local_value.replace(minute=bucket_minute, second=0, microsecond=0)
-    return bucket_local.isoformat()
+    bucket = local_value.replace(minute=bucket_minute)
+    return bucket.isoformat()
 
 
 def _merge_slot_pv_data(slots: list[PriceSlot], pv_data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Attach PV forecast values to tariff 30-minute slots without duplicating forecast storage."""
+    """Attach PV forecast values to tariff 30-minute slots using local 30-minute keys."""
     pv_slots = pv_data.get("slots") if isinstance(pv_data, dict) else []
     pv_map: dict[str, dict[str, float]] = {}
     if isinstance(pv_slots, list):
@@ -153,26 +152,44 @@ def _merge_slot_pv_data(slots: list[PriceSlot], pv_data: dict[str, Any]) -> list
             start = item.get("start")
             if not isinstance(start, datetime):
                 continue
-            slot_key = _slot_key_30m(start)
-            if slot_key is None:
-                continue
-            pv_map[slot_key] = {
+            pv_map[_slot_key_local_30m(start)] = {
                 "pv_estimate_kw": round(float(item.get("pv_power_kw", 0.0) or 0.0), 6),
                 "pv_energy_kwh": round(float(item.get("pv_energy_kwh", 0.0) or 0.0), 6),
             }
 
     merged: list[dict[str, Any]] = []
     for slot in sorted(slots, key=lambda s: s.start):
-        pv_values = pv_map.get(_slot_key_30m(slot.start) or "", {})
+        pv_values = pv_map.get(_slot_key_local_30m(slot.start), {})
         merged.append(
             {
                 "start": dt_util.as_utc(slot.start),
+                "slot_key_local": _slot_key_local_30m(slot.start),
                 "price_all_in_chf_per_kwh": _slot_total_price(slot.components_chf_per_kwh),
                 "pv_estimate_kw": pv_values.get("pv_estimate_kw", 0.0),
                 "pv_energy_kwh": pv_values.get("pv_energy_kwh", 0.0),
             }
         )
     return merged
+
+
+def _resolve_pv_forecast_entity(hass: HomeAssistant, configured_entity_id: str | None, attribute: str) -> tuple[str | None, Any]:
+    """Resolve the PV forecast entity from config, with a safe fallback autodetection."""
+    if isinstance(configured_entity_id, str) and configured_entity_id:
+        state = hass.states.get(configured_entity_id)
+        if state is not None:
+            return configured_entity_id, state
+
+    fallback_attrs = [attribute, "detailedForecast", "detailed_forecast", "forecast", "detailedForecasts"]
+    for state in hass.states.async_all("sensor"):
+        attrs = state.attributes or {}
+        for attr_name in fallback_attrs:
+            records = attrs.get(attr_name)
+            if not isinstance(records, list) or not records:
+                continue
+            first = records[0]
+            if isinstance(first, dict) and any(k in first for k in ("period_start", "start", "datetime")) and any(k in first for k in ("pv_estimate", "power", "power_kw", "forecast", "value", "pv_estimate50")):
+                return state.entity_id, state
+    return configured_entity_id if isinstance(configured_entity_id, str) and configured_entity_id else None, None
 
 
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -243,6 +260,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         stats = self._compute_daily_stats(active_30m, baseline_30m)
         pv_data = self._parse_pv_forecast()
+        slot_plan = _merge_slot_pv_data(active_30m, pv_data)
         feed_in_price = self._get_feed_in_price()
 
         if self.store is not None:
@@ -255,16 +273,15 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.store.async_save()
 
         windows = self._compute_best_windows(active_30m)
-        slot_plan = _merge_slot_pv_data(active_30m, pv_data)
         self._last_fetch_date = today
         return {
             "active": active_30m,
             "baseline": baseline_30m,
             "active_raw": active,
             "baseline_raw": baseline,
-            "slot_plan": slot_plan,
             "stats": stats,
             "pv": pv_data,
+            "slot_plan": slot_plan,
             "feed_in": {
                 "mode": self.feed_in_price_mode,
                 "price_chf_per_kwh": feed_in_price,

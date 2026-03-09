@@ -16,7 +16,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .coordinator import PriceSlot, TariffSaverCoordinator, _slot_key_30m
+from .coordinator import PriceSlot, TariffSaverCoordinator
 from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
 
 CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
@@ -173,6 +173,8 @@ async def async_setup_entry(
         TariffSaverScoreStarsSensor(coordinator, entry, 10),
         TariffSaverDayScoreSensor(coordinator, entry),
         TariffSaverDayScoreStarsSensor(coordinator, entry, 5),
+        TariffSaverPvForecastCurveSensor(coordinator, entry),
+        TariffSaverPvForecastRemainingSensor(coordinator, entry),
         TariffSaverFeedInPriceSensor(coordinator, entry),
         PeriodCostSensor(entry, coordinator, "today", "dyn", "actual_cost_today", "Actual cost today"),
         PeriodCostSensor(entry, coordinator, "today", "base", "baseline_cost_today", "Baseline cost today", icon="mdi:cash-multiple"),
@@ -218,20 +220,24 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
         baseline = _baseline_slots(self.coordinator)
         baseline_map = {slot.start: slot for slot in baseline}
         slot_plan_map = {
-            _slot_key_30m(slot.get("start")): slot
+            slot.get("start"): slot
             for slot in _slot_plan(self.coordinator)
             if isinstance(slot, dict) and isinstance(slot.get("start"), datetime)
         }
+        pv = _pv(self.coordinator)
         return {
             "interval_minutes": 30,
             "slot_count": len(active),
+            "pv_forecast_entity": pv.get("entity_id"),
+            "pv_forecast_attribute": pv.get("attribute"),
+            "pv_forecast_slot_count": pv.get("slot_count"),
             "slots": [
                 {
                     "start": slot.start.isoformat(),
                     "price_all_in_chf_per_kwh": _all_in_from_slot(slot),
                     "baseline_chf_per_kwh": _all_in_from_slot(baseline_map.get(slot.start)),
-                    "pv_estimate_kw": (slot_plan_map.get(_slot_key_30m(slot.start)) or {}).get("pv_estimate_kw", 0.0),
-                    "pv_energy_kwh": (slot_plan_map.get(_slot_key_30m(slot.start)) or {}).get("pv_energy_kwh", 0.0),
+                    "pv_estimate_kw": (slot_plan_map.get(slot.start) or {}).get("pv_estimate_kw", 0.0),
+                    "pv_energy_kwh": (slot_plan_map.get(slot.start) or {}).get("pv_energy_kwh", 0.0),
                 }
                 for slot in active
             ],
