@@ -91,7 +91,11 @@ class EkzSlotSource(SlotSource):
         grid = float(comps.get("grid_incl_fees", comps.get("grid", 0.0)) or 0.0)
         regional_fees = float(comps.get("regional_fees", 0.0) or 0.0)
 
-        integrated = electricity + grid + regional_fees
+        integrated = comps.get("integrated")
+        if integrated is None:
+            integrated = comps.get("all_in")
+        if integrated is None:
+            integrated = electricity + grid + regional_fees
 
         return PriceSlot(
             start=start,
