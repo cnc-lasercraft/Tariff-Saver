@@ -53,14 +53,32 @@ def _pv(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
     return data.get("pv", {}) if isinstance(data, dict) else {}
 
 
-def _slot_plan(coordinator: TariffSaverCoordinator) -> list[dict[str, Any]]:
-    data = coordinator.data or {}
-    return data.get("slot_plan", []) if isinstance(data, dict) else []
-
-
 def _feed_in(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
     data = coordinator.data or {}
     return data.get("feed_in", {}) if isinstance(data, dict) else {}
+
+
+def _slot_key_local(value: datetime | None) -> str | None:
+    if not isinstance(value, datetime):
+        return None
+    local_value = dt_util.as_local(value).replace(second=0, microsecond=0)
+    minute = 0 if local_value.minute < 30 else 30
+    local_value = local_value.replace(minute=minute)
+    return local_value.strftime("%Y-%m-%dT%H:%M")
+
+
+def _pv_slot_map(coordinator: TariffSaverCoordinator) -> dict[str, dict[str, Any]]:
+    pv = _pv(coordinator)
+    slots = pv.get("slots", []) if isinstance(pv, dict) else []
+    mapped: dict[str, dict[str, Any]] = {}
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        key = _slot_key_local(slot.get("start"))
+        if key is None:
+            continue
+        mapped[key] = slot
+    return mapped
 
 
 def _current_slot(slots: list[PriceSlot]) -> PriceSlot | None:
@@ -87,15 +105,13 @@ def _next_slot(slots: list[PriceSlot]) -> PriceSlot | None:
 def _all_in_from_slot(slot: PriceSlot | None) -> float | None:
     if not slot:
         return None
-    total = TariffSaverStore.sum_components(slot.components_chf_per_kwh, IMPORT_ALLIN_COMPONENTS)
-    if total > 0:
-        return total
     comps = slot.components_chf_per_kwh or {}
     for key in ("integrated", "all_in"):
         value = comps.get(key)
         if isinstance(value, (int, float)) and float(value) > 0:
             return float(value)
-    return None
+    total = TariffSaverStore.sum_components(comps, IMPORT_ALLIN_COMPONENTS)
+    return total if total > 0 else None
 
 
 def _stars(score: int | None, scale: int) -> int | None:
@@ -173,8 +189,6 @@ async def async_setup_entry(
         TariffSaverScoreStarsSensor(coordinator, entry, 10),
         TariffSaverDayScoreSensor(coordinator, entry),
         TariffSaverDayScoreStarsSensor(coordinator, entry, 5),
-        TariffSaverPvForecastCurveSensor(coordinator, entry),
-        TariffSaverPvForecastRemainingSensor(coordinator, entry),
         TariffSaverFeedInPriceSensor(coordinator, entry),
         PeriodCostSensor(entry, coordinator, "today", "dyn", "actual_cost_today", "Actual cost today"),
         PeriodCostSensor(entry, coordinator, "today", "base", "baseline_cost_today", "Baseline cost today", icon="mdi:cash-multiple"),
@@ -219,25 +233,21 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
         active = _active_slots(self.coordinator)
         baseline = _baseline_slots(self.coordinator)
         baseline_map = {slot.start: slot for slot in baseline}
-        slot_plan_map = {
-            slot.get("start"): slot
-            for slot in _slot_plan(self.coordinator)
-            if isinstance(slot, dict) and isinstance(slot.get("start"), datetime)
-        }
         pv = _pv(self.coordinator)
+        pv_map = _pv_slot_map(self.coordinator)
         return {
             "interval_minutes": 30,
             "slot_count": len(active),
-            "pv_forecast_entity": pv.get("entity_id"),
-            "pv_forecast_attribute": pv.get("attribute"),
-            "pv_forecast_slot_count": pv.get("slot_count"),
+            "pv_forecast_entity": pv.get("entity_id") if isinstance(pv, dict) else None,
+            "pv_forecast_attribute": pv.get("attribute") if isinstance(pv, dict) else None,
+            "pv_forecast_slot_count": pv.get("slot_count") if isinstance(pv, dict) else 0,
             "slots": [
                 {
                     "start": slot.start.isoformat(),
                     "price_all_in_chf_per_kwh": _all_in_from_slot(slot),
                     "baseline_chf_per_kwh": _all_in_from_slot(baseline_map.get(slot.start)),
-                    "pv_estimate_kw": (slot_plan_map.get(slot.start) or {}).get("pv_estimate_kw", 0.0),
-                    "pv_energy_kwh": (slot_plan_map.get(slot.start) or {}).get("pv_energy_kwh", 0.0),
+                    "pv_estimate_kw": round(float((pv_map.get(_slot_key_local(slot.start)) or {}).get("pv_power_kw", 0.0) or 0.0), 6),
+                    "pv_energy_kwh": round(float((pv_map.get(_slot_key_local(slot.start)) or {}).get("pv_energy_kwh", 0.0) or 0.0), 6),
                 }
                 for slot in active
             ],
