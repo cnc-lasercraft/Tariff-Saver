@@ -16,11 +16,8 @@ from .const import (
     CONF_FEED_IN_PRICE_ENTITY,
     CONF_FEED_IN_PRICE_MODE,
     CONF_PUBLISH_TIME,
-    CONF_PV_FORECAST_ATTRIBUTE,
-    CONF_PV_FORECAST_ENTITY,
     DEFAULT_FEED_IN_FIXED_PRICE,
     DEFAULT_PUBLISH_TIME,
-    DEFAULT_PV_FORECAST_ATTRIBUTE,
     FEED_IN_PRICE_MODE_ENTITY,
     DOMAIN,
 )
@@ -203,8 +200,6 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.baseline_tariff_name: str | None = "EKZ baseline"
         self.publish_time: str = config.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
         self.ekz_entry_id: str | None = config.get(CONF_EKZ_ENTRY_ID)
-        self.pv_forecast_entity: str | None = config.get(CONF_PV_FORECAST_ENTITY)
-        self.pv_forecast_attribute: str = str(config.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE) or DEFAULT_PV_FORECAST_ATTRIBUTE)
         self.feed_in_price_mode: str = str(config.get(CONF_FEED_IN_PRICE_MODE) or "fixed")
         self.feed_in_fixed_price: float = float(config.get(CONF_FEED_IN_FIXED_PRICE, DEFAULT_FEED_IN_FIXED_PRICE) or 0.0)
         self.feed_in_price_entity: str | None = config.get(CONF_FEED_IN_PRICE_ENTITY)
@@ -259,8 +254,13 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.store.trim_price_slots(keep_days=7)
 
         stats = self._compute_daily_stats(active_30m, baseline_30m)
-        pv_data = self._parse_pv_forecast()
-        slot_plan = _merge_slot_pv_data(active_30m, pv_data)
+        slot_plan = [
+            {
+                "start": slot.start,
+                "price_all_in_chf_per_kwh": slot.price_all_in_chf_per_kwh,
+            }
+            for slot in active_30m
+        ]
         feed_in_price = self._get_feed_in_price()
 
         if self.store is not None:
@@ -280,7 +280,6 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "active_raw": active,
             "baseline_raw": baseline,
             "stats": stats,
-            "pv": pv_data,
             "slot_plan": slot_plan,
             "feed_in": {
                 "mode": self.feed_in_price_mode,

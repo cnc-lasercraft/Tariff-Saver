@@ -15,12 +15,9 @@ from .const import (
     CONF_FEED_IN_PRICE_ENTITY,
     CONF_FEED_IN_PRICE_MODE,
     CONF_PUBLISH_TIME,
-    CONF_PV_FORECAST_ATTRIBUTE,
-    CONF_PV_FORECAST_ENTITY,
     DEFAULT_FEED_IN_FIXED_PRICE,
     DEFAULT_FEED_IN_PRICE_MODE,
     DEFAULT_PUBLISH_TIME,
-    DEFAULT_PV_FORECAST_ATTRIBUTE,
 )
 
 
@@ -71,7 +68,6 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 merged = dict(self._entry.options)
                 merged.update(user_input)
                 merged[CONF_EKZ_ENTRY_ID] = str(user_input.get(CONF_EKZ_ENTRY_ID, "") or "").strip()
-                merged[CONF_PV_FORECAST_ATTRIBUTE] = str(user_input.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE) or DEFAULT_PV_FORECAST_ATTRIBUTE).strip()
                 merged[CONF_FEED_IN_PRICE_MODE] = mode
                 merged[CONF_FEED_IN_FIXED_PRICE] = fixed_price
                 merged[CONF_FEED_IN_PRICE_ENTITY] = entity_raw
@@ -87,14 +83,6 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_EKZ_ENTRY_ID,
                     default=(user_input or {}).get(CONF_EKZ_ENTRY_ID, opts.get(CONF_EKZ_ENTRY_ID, data.get(CONF_EKZ_ENTRY_ID, ""))),
-                ): str,
-                vol.Optional(
-                    CONF_PV_FORECAST_ENTITY,
-                    default=(user_input or {}).get(CONF_PV_FORECAST_ENTITY, opts.get(CONF_PV_FORECAST_ENTITY, data.get(CONF_PV_FORECAST_ENTITY, ""))),
-                ): _sensor_entity_selector(),
-                vol.Optional(
-                    CONF_PV_FORECAST_ATTRIBUTE,
-                    default=(user_input or {}).get(CONF_PV_FORECAST_ATTRIBUTE, opts.get(CONF_PV_FORECAST_ATTRIBUTE, data.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE))),
                 ): str,
                 vol.Optional(
                     CONF_FEED_IN_PRICE_MODE,
