@@ -228,21 +228,14 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
         active = _active_slots(self.coordinator)
         baseline = _baseline_slots(self.coordinator)
         baseline_map = {slot.start: slot for slot in baseline}
-        pv = _pv(self.coordinator)
-        pv_map = _pv_slot_map(self.coordinator)
         return {
             "interval_minutes": 30,
             "slot_count": len(active),
-            "pv_forecast_entity": pv.get("entity_id") if isinstance(pv, dict) else None,
-            "pv_forecast_attribute": pv.get("attribute") if isinstance(pv, dict) else None,
-            "pv_forecast_slot_count": pv.get("slot_count") if isinstance(pv, dict) else 0,
             "slots": [
                 {
                     "start": slot.start.isoformat(),
                     "price_all_in_chf_per_kwh": _all_in_from_slot(slot),
                     "baseline_chf_per_kwh": _all_in_from_slot(baseline_map.get(slot.start)),
-                    "pv_estimate_kw": round(float((pv_map.get(_slot_key_local(slot.start)) or {}).get("pv_power_kw", 0.0) or 0.0), 6),
-                    "pv_energy_kwh": round(float((pv_map.get(_slot_key_local(slot.start)) or {}).get("pv_energy_kwh", 0.0) or 0.0), 6),
                 }
                 for slot in active
             ],

@@ -119,76 +119,6 @@ def score_from_prices(current_price: float | None, min_price: float | None, max_
     return max(0, min(100, int(round(score))))
 
 
-def _parse_datetime_any(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return dt_util.as_utc(value)
-    if isinstance(value, str):
-        parsed = dt_util.parse_datetime(value)
-        if parsed is not None:
-            return dt_util.as_utc(parsed)
-    return None
-
-
-
-
-def _slot_key_local_30m(value: datetime) -> str:
-    local_value = dt_util.as_local(value).replace(second=0, microsecond=0)
-    bucket_minute = 0 if local_value.minute < 30 else 30
-    bucket = local_value.replace(minute=bucket_minute)
-    return bucket.isoformat()
-
-
-def _merge_slot_pv_data(slots: list[PriceSlot], pv_data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Attach PV forecast values to tariff 30-minute slots using local 30-minute keys."""
-    pv_slots = pv_data.get("slots") if isinstance(pv_data, dict) else []
-    pv_map: dict[str, dict[str, float]] = {}
-    if isinstance(pv_slots, list):
-        for item in pv_slots:
-            if not isinstance(item, dict):
-                continue
-            start = item.get("start")
-            if not isinstance(start, datetime):
-                continue
-            pv_map[_slot_key_local_30m(start)] = {
-                "pv_estimate_kw": round(float(item.get("pv_power_kw", 0.0) or 0.0), 6),
-                "pv_energy_kwh": round(float(item.get("pv_energy_kwh", 0.0) or 0.0), 6),
-            }
-
-    merged: list[dict[str, Any]] = []
-    for slot in sorted(slots, key=lambda s: s.start):
-        pv_values = pv_map.get(_slot_key_local_30m(slot.start), {})
-        merged.append(
-            {
-                "start": dt_util.as_utc(slot.start),
-                "slot_key_local": _slot_key_local_30m(slot.start),
-                "price_all_in_chf_per_kwh": _slot_total_price(slot.components_chf_per_kwh),
-                "pv_estimate_kw": pv_values.get("pv_estimate_kw", 0.0),
-                "pv_energy_kwh": pv_values.get("pv_energy_kwh", 0.0),
-            }
-        )
-    return merged
-
-
-def _resolve_pv_forecast_entity(hass: HomeAssistant, configured_entity_id: str | None, attribute: str) -> tuple[str | None, Any]:
-    """Resolve the PV forecast entity from config, with a safe fallback autodetection."""
-    if isinstance(configured_entity_id, str) and configured_entity_id:
-        state = hass.states.get(configured_entity_id)
-        if state is not None:
-            return configured_entity_id, state
-
-    fallback_attrs = [attribute, "detailedForecast", "detailed_forecast", "forecast", "detailedForecasts"]
-    for state in hass.states.async_all("sensor"):
-        attrs = state.attributes or {}
-        for attr_name in fallback_attrs:
-            records = attrs.get(attr_name)
-            if not isinstance(records, list) or not records:
-                continue
-            first = records[0]
-            if isinstance(first, dict) and any(k in first for k in ("period_start", "start", "datetime")) and any(k in first for k in ("pv_estimate", "power", "power_kw", "forecast", "value", "pv_estimate50")):
-                return state.entity_id, state
-    return configured_entity_id if isinstance(configured_entity_id, str) and configured_entity_id else None, None
-
-
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Reads tariff curves from the separate EKZ provider integration."""
 
@@ -254,13 +184,6 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.store.trim_price_slots(keep_days=7)
 
         stats = self._compute_daily_stats(active_30m, baseline_30m)
-        slot_plan = [
-            {
-                "start": slot.start,
-                "price_all_in_chf_per_kwh": slot.price_all_in_chf_per_kwh,
-            }
-            for slot in active_30m
-        ]
         feed_in_price = self._get_feed_in_price()
 
         if self.store is not None:
@@ -280,7 +203,6 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "active_raw": active,
             "baseline_raw": baseline,
             "stats": stats,
-            "slot_plan": slot_plan,
             "feed_in": {
                 "mode": self.feed_in_price_mode,
                 "price_chf_per_kwh": feed_in_price,
@@ -319,86 +241,6 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return None
             return None
         return self.feed_in_fixed_price if self.feed_in_fixed_price >= 0 else None
-
-    def _parse_pv_forecast(self) -> dict[str, Any]:
-        entity_id = self.pv_forecast_entity
-        if not isinstance(entity_id, str) or not entity_id:
-            return {"configured": False, "slots": [], "remaining_energy_kwh": None, "slot_count": 0}
-
-        state = self.hass.states.get(entity_id)
-        if state is None:
-            return {"configured": True, "entity_id": entity_id, "attribute": self.pv_forecast_attribute, "slots": [], "remaining_energy_kwh": None, "slot_count": 0, "error": "entity_not_found"}
-
-        attrs = state.attributes or {}
-        records = attrs.get(self.pv_forecast_attribute)
-        if not isinstance(records, list):
-            for fallback in ("detailedForecast", "detailed_forecast", "forecast", "detailedForecasts"):
-                candidate = attrs.get(fallback)
-                if isinstance(candidate, list):
-                    records = candidate
-                    break
-
-        if not isinstance(records, list):
-            return {"configured": True, "entity_id": entity_id, "attribute": self.pv_forecast_attribute, "slots": [], "remaining_energy_kwh": None, "slot_count": 0, "error": "attribute_not_found"}
-
-        raw_slots: list[tuple[datetime, float]] = []
-        for item in records:
-            if not isinstance(item, dict):
-                continue
-            dt_value = (
-                item.get("period_start")
-                or item.get("start")
-                or item.get("start_time")
-                or item.get("datetime")
-                or item.get("time")
-            )
-            start = _parse_datetime_any(dt_value)
-            if start is None:
-                continue
-            power = None
-            for key in ("pv_estimate", "power", "power_kw", "forecast", "value", "pv_estimate50"):
-                value = item.get(key)
-                if isinstance(value, (int, float)):
-                    power = float(value)
-                    break
-            if power is None or power < 0:
-                continue
-            raw_slots.append((start, power))
-
-        raw_slots.sort(key=lambda x: x[0])
-        if not raw_slots:
-            return {"configured": True, "entity_id": entity_id, "attribute": self.pv_forecast_attribute, "slots": [], "remaining_energy_kwh": 0.0, "slot_count": 0}
-
-        interval_minutes = 30
-        if len(raw_slots) >= 2:
-            deltas = []
-            for idx in range(1, len(raw_slots)):
-                delta = int((raw_slots[idx][0] - raw_slots[idx - 1][0]).total_seconds() / 60)
-                if delta > 0:
-                    deltas.append(delta)
-            if deltas:
-                interval_minutes = min(deltas)
-        interval_hours = max(1, interval_minutes) / 60.0
-
-        slots = [
-            {
-                "start": start,
-                "pv_power_kw": round(power, 6),
-                "pv_energy_kwh": round(power * interval_hours, 6),
-            }
-            for start, power in raw_slots
-        ]
-        now_utc = dt_util.utcnow()
-        remaining = sum(slot["pv_energy_kwh"] for slot in slots if isinstance(slot["start"], datetime) and slot["start"] >= now_utc)
-        return {
-            "configured": True,
-            "entity_id": entity_id,
-            "attribute": self.pv_forecast_attribute,
-            "interval_minutes": interval_minutes,
-            "slot_count": len(slots),
-            "remaining_energy_kwh": round(remaining, 6),
-            "slots": slots,
-        }
 
     @staticmethod
     def _convert_slot(slot: Any) -> PriceSlot:
