@@ -22,14 +22,39 @@
       "init": {
         "title": "Tariff Saver options",
         "data": {
+          "next_step": "Area"
+        }
+      },
+      "general": {
+        "title": "General settings",
+        "data": {
           "consumption_energy_entity": "Consumption energy entity",
           "ekz_entry_id": "EKZ entry ID",
-          "pv_forecast_entity": "PV forecast entity",
-          "pv_forecast_attribute": "PV forecast attribute",
           "feed_in_price_mode": "Feed-in price mode",
           "feed_in_fixed_price": "Feed-in fixed price (CHF/kWh)",
           "feed_in_price_entity": "Feed-in price entity",
           "publish_time": "Publish time"
+        }
+      },
+      "consumer_select": {
+        "title": "Select consumer slot",
+        "data": {
+          "consumer_slot": "Consumer slot"
+        }
+      },
+      "consumer_edit": {
+        "title": "Edit consumer {slot}",
+        "data": {
+          "enabled": "Enabled",
+          "name": "Name",
+          "mode": "Mode",
+          "power_kw": "Power (kW)",
+          "duration_minutes": "Duration (minutes)",
+          "energy_kwh": "Energy (kWh)",
+          "measurement_entity": "Measurement entity",
+          "priority": "Priority (1-10)",
+          "pv_required": "PV required",
+          "learning_enabled": "Learning enabled"
         }
       }
     }
@@ -39,6 +64,19 @@
       "options": {
         "fixed": "Fixed value",
         "entity": "Entity"
+      }
+    },
+    "options_menu": {
+      "options": {
+        "general": "General settings",
+        "consumer": "Consumer"
+      }
+    },
+    "consumer_mode": {
+      "options": {
+        "auto": "Auto",
+        "fixed_duration": "Power + duration",
+        "fixed_energy": "Fixed energy"
       }
     }
   }

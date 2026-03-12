@@ -22,14 +22,39 @@
       "init": {
         "title": "Tariff Saver Optionen",
         "data": {
-          "consumption_energy_entity": "Verbrauchsenergie-Entität",
-          "ekz_entry_id": "EKZ Entry ID",
-          "pv_forecast_entity": "PV-Forecast Entität",
-          "pv_forecast_attribute": "PV-Forecast Attribut",
+          "next_step": "Bereich"
+        }
+      },
+      "general": {
+        "title": "Allgemeine Einstellungen",
+        "data": {
+          "consumption_energy_entity": "Verbrauchs-Energie Entität",
+          "ekz_entry_id": "EKZ entry ID",
           "feed_in_price_mode": "Einspeisepreis Modus",
           "feed_in_fixed_price": "Fester Einspeisepreis (CHF/kWh)",
           "feed_in_price_entity": "Einspeisepreis Entität",
           "publish_time": "Publikationszeit"
+        }
+      },
+      "consumer_select": {
+        "title": "Verbraucher-Slot wählen",
+        "data": {
+          "consumer_slot": "Verbraucher-Slot"
+        }
+      },
+      "consumer_edit": {
+        "title": "Verbraucher {slot} bearbeiten",
+        "data": {
+          "enabled": "Aktiv",
+          "name": "Name",
+          "mode": "Modus",
+          "power_kw": "Leistung (kW)",
+          "duration_minutes": "Dauer (Minuten)",
+          "energy_kwh": "Energie (kWh)",
+          "measurement_entity": "Mess-Entität",
+          "priority": "Priorität (1-10)",
+          "pv_required": "PV erforderlich",
+          "learning_enabled": "Lernen aktiv"
         }
       }
     }
@@ -39,6 +64,19 @@
       "options": {
         "fixed": "Fester Wert",
         "entity": "Entität"
+      }
+    },
+    "options_menu": {
+      "options": {
+        "general": "Allgemeine Einstellungen",
+        "consumer": "Verbraucher"
+      }
+    },
+    "consumer_mode": {
+      "options": {
+        "auto": "Auto",
+        "fixed_duration": "Leistung + Dauer",
+        "fixed_energy": "Feste Energie"
       }
     }
   }
