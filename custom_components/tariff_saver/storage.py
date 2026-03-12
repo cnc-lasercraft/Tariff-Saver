@@ -41,6 +41,9 @@ class TariffSaverStore:
         self.samples: list[dict[str, float]] = []
         self.booked: list[dict[str, Any]] = []
         self.day_average_prices: dict[str, float] = {}
+        self.consumer_learning: dict[str, dict[str, Any]] = {}
+        self.consumer_last_samples: dict[str, dict[str, Any]] = {}
+        self.consumer_active_runs: dict[str, dict[str, Any]] = {}
 
         self.last_api_success_utc: datetime | None = None
         self.energy_baseline_kwh: float | None = None
@@ -54,6 +57,9 @@ class TariffSaverStore:
         data.setdefault("samples", [])
         data.setdefault("booked", [])
         data.setdefault("day_average_prices", {})
+        data.setdefault("consumer_learning", {})
+        data.setdefault("consumer_last_samples", {})
+        data.setdefault("consumer_active_runs", {})
         data.setdefault("last_api_success_utc", None)
         data.setdefault("energy_baseline_kwh", None)
         data.setdefault("energy_baseline_timestamp_utc", None)
@@ -94,6 +100,21 @@ class TariffSaverStore:
             for k, v in (data.get("day_average_prices") or {}).items()
             if isinstance(v, (int, float))
         }
+        self.consumer_learning = {
+            str(k): dict(v)
+            for k, v in (data.get("consumer_learning") or {}).items()
+            if isinstance(v, dict)
+        }
+        self.consumer_last_samples = {
+            str(k): dict(v)
+            for k, v in (data.get("consumer_last_samples") or {}).items()
+            if isinstance(v, dict)
+        }
+        self.consumer_active_runs = {
+            str(k): dict(v)
+            for k, v in (data.get("consumer_active_runs") or {}).items()
+            if isinstance(v, dict)
+        }
 
         ts = data.get("last_api_success_utc")
         if isinstance(ts, str):
@@ -124,6 +145,9 @@ class TariffSaverStore:
             "samples": self.samples,
             "booked": self.booked,
             "day_average_prices": self.day_average_prices,
+            "consumer_learning": self.consumer_learning,
+            "consumer_last_samples": self.consumer_last_samples,
+            "consumer_active_runs": self.consumer_active_runs,
             "last_api_success_utc": self.last_api_success_utc.isoformat() if self.last_api_success_utc else None,
             "energy_baseline_kwh": self.energy_baseline_kwh,
             "energy_baseline_timestamp_utc": self.energy_baseline_timestamp_utc.isoformat() if self.energy_baseline_timestamp_utc else None,
@@ -559,3 +583,73 @@ class TariffSaverStore:
         start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
         end = start.replace(year=start.year + 1)
         return self._breakdown_between(start, end)
+
+
+def get_consumer_learning(self, consumer_id: str) -> dict[str, Any]:
+    data = self.consumer_learning.get(str(consumer_id))
+    return dict(data) if isinstance(data, dict) else {}
+
+def add_consumer_sample(self, consumer_id: str, ts_utc: datetime, kwh_total: float) -> bool:
+    consumer_id = str(consumer_id)
+    ts_utc = dt_util.as_utc(ts_utc)
+    if not isinstance(kwh_total, (int, float)):
+        return False
+
+    kwh_total = float(kwh_total)
+    epoch = ts_utc.timestamp()
+    last = self.consumer_last_samples.get(consumer_id)
+    if isinstance(last, dict):
+        prev_ts = float(last.get("ts", 0.0))
+        prev_kwh = float(last.get("kwh", 0.0))
+        if abs(prev_ts - epoch) < 1e-6:
+            return False
+
+        delta = kwh_total - prev_kwh
+        gap_seconds = max(0.0, epoch - prev_ts)
+
+        if delta > 0 and gap_seconds <= 900:
+            run = self.consumer_active_runs.get(consumer_id)
+            if not isinstance(run, dict):
+                run = {"start_ts": prev_ts, "end_ts": epoch, "energy_kwh": delta}
+            else:
+                run["end_ts"] = epoch
+                run["energy_kwh"] = float(run.get("energy_kwh", 0.0)) + delta
+            self.consumer_active_runs[consumer_id] = run
+            self.dirty = True
+        else:
+            self._finalize_consumer_run(consumer_id)
+
+    self.consumer_last_samples[consumer_id] = {"ts": epoch, "kwh": kwh_total}
+    self.dirty = True
+    return True
+
+def _finalize_consumer_run(self, consumer_id: str) -> None:
+    run = self.consumer_active_runs.pop(str(consumer_id), None)
+    if not isinstance(run, dict):
+        return
+
+    energy_kwh = float(run.get("energy_kwh", 0.0) or 0.0)
+    start_ts = float(run.get("start_ts", 0.0) or 0.0)
+    end_ts = float(run.get("end_ts", 0.0) or 0.0)
+    duration_minutes = max(0.0, (end_ts - start_ts) / 60.0)
+
+    if energy_kwh <= 0 or duration_minutes <= 0:
+        return
+
+    avg_power_kw = energy_kwh / (duration_minutes / 60.0) if duration_minutes > 0 else 0.0
+    info = self.consumer_learning.get(str(consumer_id), {})
+    sample_count = int(info.get("sample_count", 0) or 0)
+    new_count = sample_count + 1
+
+    def _avg(old_value: float, new_value: float) -> float:
+        return ((old_value * sample_count) + new_value) / new_count if new_count > 0 else new_value
+
+    updated = {
+        "sample_count": new_count,
+        "avg_energy_kwh": _avg(float(info.get("avg_energy_kwh", 0.0) or 0.0), energy_kwh),
+        "avg_duration_minutes": _avg(float(info.get("avg_duration_minutes", 0.0) or 0.0), duration_minutes),
+        "avg_power_kw": _avg(float(info.get("avg_power_kw", 0.0) or 0.0), avg_power_kw),
+        "last_run_end_utc": dt_util.as_utc(datetime.fromtimestamp(end_ts)).isoformat(),
+    }
+    self.consumer_learning[str(consumer_id)] = updated
+    self.dirty = True

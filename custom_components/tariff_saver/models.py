@@ -32,3 +32,44 @@ class PriceSlot:
             if isinstance(value, (int, float)):
                 base[str(key)] = float(value)
         return base
+
+
+
+@dataclass(frozen=True)
+class ConsumerConfig:
+    """Configuration for one flexible consumer."""
+
+    slot: int
+    enabled: bool = False
+    name: str = ""
+    mode: str = "auto"
+    power_kw: float = 0.0
+    duration_minutes: int = 0
+    energy_kwh: float = 0.0
+    measurement_entity: str = ""
+    priority: int = 5
+    pv_required: bool = False
+    learning_enabled: bool = True
+
+    @property
+    def configured_name(self) -> str:
+        return self.name.strip() or f"Consumer {self.slot}"
+
+    @property
+    def manual_energy_kwh(self) -> float | None:
+        if self.energy_kwh > 0:
+            return float(self.energy_kwh)
+        if self.power_kw > 0 and self.duration_minutes > 0:
+            return float(self.power_kw) * float(self.duration_minutes) / 60.0
+        return None
+
+
+@dataclass(frozen=True)
+class ConsumerLearning:
+    """Learned values for one flexible consumer."""
+
+    sample_count: int = 0
+    avg_energy_kwh: float = 0.0
+    avg_duration_minutes: float = 0.0
+    avg_power_kw: float = 0.0
+    last_run_end_utc: datetime | None = None

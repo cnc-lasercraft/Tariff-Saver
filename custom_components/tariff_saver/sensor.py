@@ -15,13 +15,48 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import CONSUMER_COUNT, CONF_CONSUMERS, DOMAIN
 from .coordinator import PriceSlot, TariffSaverCoordinator
+from .models import ConsumerConfig
 from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
 
 CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
 SIGNAL_STORE_UPDATED = "tariff_saver_store_updated"
 WINDOW_HOURS: tuple[int, ...] = (1, 2, 3, 6)
+
+
+def _consumer_config(entry: ConfigEntry, slot: int) -> ConsumerConfig:
+    consumers = entry.options.get(CONF_CONSUMERS, {})
+    raw = consumers.get(str(slot), {}) if isinstance(consumers, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return ConsumerConfig(
+        slot=slot,
+        enabled=bool(raw.get("enabled", False)),
+        name=str(raw.get("name", "") or ""),
+        mode=str(raw.get("mode", "auto") or "auto"),
+        power_kw=float(raw.get("power_kw", 0.0) or 0.0),
+        duration_minutes=int(raw.get("duration_minutes", 0) or 0),
+        energy_kwh=float(raw.get("energy_kwh", 0.0) or 0.0),
+        measurement_entity=str(raw.get("measurement_entity", "") or ""),
+        priority=max(1, min(10, int(raw.get("priority", 5) or 5))),
+        pv_required=bool(raw.get("pv_required", False)),
+        learning_enabled=bool(raw.get("learning_enabled", True)),
+    )
+
+
+def _consumer_effective_energy_kwh(config: ConsumerConfig, learning: dict[str, Any]) -> float | None:
+    manual = config.manual_energy_kwh
+    learned = float(learning.get("avg_energy_kwh", 0.0) or 0.0) if isinstance(learning, dict) else 0.0
+    if config.mode == "fixed_energy":
+        return float(config.energy_kwh) if config.energy_kwh > 0 else (learned if learned > 0 else None)
+    if config.mode == "fixed_duration":
+        if config.power_kw > 0 and config.duration_minutes > 0:
+            return float(config.power_kw) * float(config.duration_minutes) / 60.0
+        return learned if learned > 0 else None
+    if manual and manual > 0:
+        return manual
+    return learned if learned > 0 else None
 
 
 def _device_info(entry: ConfigEntry) -> dict[str, Any]:
@@ -51,29 +86,6 @@ def _windows(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
 def _feed_in(coordinator: TariffSaverCoordinator) -> dict[str, Any]:
     data = coordinator.data or {}
     return data.get("feed_in", {}) if isinstance(data, dict) else {}
-
-
-def _slot_key_local(value: datetime | None) -> str | None:
-    if not isinstance(value, datetime):
-        return None
-    local_value = dt_util.as_local(value).replace(second=0, microsecond=0)
-    minute = 0 if local_value.minute < 30 else 30
-    local_value = local_value.replace(minute=minute)
-    return local_value.strftime("%Y-%m-%dT%H:%M")
-
-
-def _pv_slot_map(coordinator: TariffSaverCoordinator) -> dict[str, dict[str, Any]]:
-    pv = _pv(coordinator)
-    slots = pv.get("slots", []) if isinstance(pv, dict) else []
-    mapped: dict[str, dict[str, Any]] = {}
-    for slot in slots:
-        if not isinstance(slot, dict):
-            continue
-        key = _slot_key_local(slot.get("start"))
-        if key is None:
-            continue
-        mapped[key] = slot
-    return mapped
 
 
 def _current_slot(slots: list[PriceSlot]) -> PriceSlot | None:
@@ -175,6 +187,41 @@ async def async_setup_entry(
             hass, _periodic_tick, timedelta(minutes=5)
         )
 
+    @callback
+    def _process_consumers() -> None:
+        store = getattr(coordinator, "store", None)
+        if store is None:
+            return
+        now_utc = dt_util.utcnow()
+        changed = False
+        for slot in range(1, CONSUMER_COUNT + 1):
+            config = _consumer_config(entry, slot)
+            if not config.enabled or not config.learning_enabled or not config.measurement_entity:
+                store._finalize_consumer_run(str(slot))
+                continue
+            state = hass.states.get(config.measurement_entity)
+            if state is None:
+                store._finalize_consumer_run(str(slot))
+                continue
+            try:
+                if store.add_consumer_sample(str(slot), now_utc, float(state.state)):
+                    changed = True
+            except Exception:
+                continue
+        if store.dirty:
+            hass.async_create_task(store.async_save())
+        if changed:
+            async_dispatcher_send(hass, f"{SIGNAL_STORE_UPDATED}_{entry.entry_id}")
+
+    @callback
+    def _periodic_consumer_tick(now: datetime) -> None:
+        _process_consumers()
+
+    _process_consumers()
+    hass.data[DOMAIN][f"{entry.entry_id}_unsub_consumer_tick"] = async_track_time_interval(
+        hass, _periodic_consumer_tick, timedelta(minutes=5)
+    )
+
     entities: list[SensorEntity] = [
         TariffSaverPriceCurveSensor(coordinator, entry),
         TariffSaverPriceNowSensor(coordinator, entry),
@@ -204,6 +251,9 @@ async def async_setup_entry(
     for hours in WINDOW_HOURS:
         entities.append(BestWindowStartSensor(coordinator, entry, hours))
         entities.append(BestWindowScoreSensor(coordinator, entry, hours))
+
+    for slot in range(1, CONSUMER_COUNT + 1):
+        entities.append(TariffSaverConsumerSensor(coordinator, entry, slot))
 
     async_add_entities(entities, update_before_add=True)
 
@@ -443,6 +493,55 @@ class BestWindowScoreSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnt
         return {
             "start": start.isoformat() if isinstance(start, datetime) else None,
             "avg_price_chf_per_kwh": avg_price,
+        }
+
+
+
+class TariffSaverConsumerSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_icon = "mdi:flash"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry, slot: int) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self.slot = slot
+        self._attr_name = f"Consumer {slot}"
+        self._attr_unique_id = f"{entry.entry_id}_consumer_{slot}"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> float | None:
+        config = _consumer_config(self.entry, self.slot)
+        store = getattr(self.coordinator, "store", None)
+        learning = store.get_consumer_learning(str(self.slot)) if store is not None else {}
+        value = _consumer_effective_energy_kwh(config, learning)
+        return round(float(value), 3) if isinstance(value, (int, float)) and value > 0 else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        config = _consumer_config(self.entry, self.slot)
+        store = getattr(self.coordinator, "store", None)
+        learning = store.get_consumer_learning(str(self.slot)) if store is not None else {}
+        return {
+            "slot": self.slot,
+            "enabled": config.enabled,
+            "name": config.configured_name,
+            "mode": config.mode,
+            "power_kw": config.power_kw,
+            "duration_minutes": config.duration_minutes,
+            "energy_kwh": config.energy_kwh,
+            "measurement_entity": config.measurement_entity,
+            "priority": config.priority,
+            "pv_required": config.pv_required,
+            "learning_enabled": config.learning_enabled,
+            "manual_energy_kwh": config.manual_energy_kwh,
+            "effective_energy_kwh": _consumer_effective_energy_kwh(config, learning),
+            "sample_count": int(learning.get("sample_count", 0) or 0),
+            "avg_energy_kwh": round(float(learning.get("avg_energy_kwh", 0.0) or 0.0), 3),
+            "avg_duration_minutes": round(float(learning.get("avg_duration_minutes", 0.0) or 0.0), 1),
+            "avg_power_kw": round(float(learning.get("avg_power_kw", 0.0) or 0.0), 3),
+            "last_run_end_utc": learning.get("last_run_end_utc"),
         }
 
 
