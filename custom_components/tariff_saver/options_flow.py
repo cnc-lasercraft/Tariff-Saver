@@ -15,6 +15,8 @@ from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
     CONF_CONSUMERS,
+    CONF_CONSUMER_MAX_DAYS,
+    CONF_CONSUMER_MIN_DAYS,
     CONF_CONSUMPTION_ENERGY_ENTITY,
     CONF_EKZ_ENTRY_ID,
     CONF_FEED_IN_FIXED_PRICE,
@@ -27,6 +29,8 @@ from .const import (
     CONSUMER_MODE_AUTO,
     CONSUMER_MODES,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
+    DEFAULT_CONSUMER10_MAX_DAYS,
+    DEFAULT_CONSUMER10_MIN_DAYS,
     DEFAULT_FEED_IN_FIXED_PRICE,
     DEFAULT_FEED_IN_PRICE_MODE,
     DEFAULT_PUBLISH_TIME,
@@ -75,6 +79,8 @@ def _consumer_defaults(slot: int, source: dict[str, Any] | None = None) -> dict[
         "priority": max(1, min(10, int(source.get("priority", 5) or 5))),
         "pv_required": bool(source.get("pv_required", False)),
         "learning_enabled": bool(source.get("learning_enabled", True)),
+        "min_days": int(source.get("min_days", DEFAULT_CONSUMER10_MIN_DAYS if slot == CONSUMER_COUNT else 0) or (DEFAULT_CONSUMER10_MIN_DAYS if slot == CONSUMER_COUNT else 0)),
+        "max_days": int(source.get("max_days", DEFAULT_CONSUMER10_MAX_DAYS if slot == CONSUMER_COUNT else 0) or (DEFAULT_CONSUMER10_MAX_DAYS if slot == CONSUMER_COUNT else 0)),
         "slot": slot,
     }
 
@@ -258,6 +264,12 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
             if updated["measurement_entity"] and "." not in updated["measurement_entity"]:
                 errors["measurement_entity"] = "invalid_entity"
 
+            if self._selected_consumer == CONSUMER_COUNT:
+                if updated["min_days"] < 0 or updated["max_days"] < 0:
+                    errors[CONF_CONSUMER_MIN_DAYS] = "invalid_number"
+                elif updated["max_days"] < updated["min_days"]:
+                    errors[CONF_CONSUMER_MAX_DAYS] = "invalid_number"
+
             if not errors:
                 consumers[key] = updated
                 merged = dict(self._entry.options)
@@ -276,6 +288,10 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional("priority", default=int((user_input or {}).get("priority", current["priority"]))): vol.Coerce(int),
                 vol.Optional("pv_required", default=(user_input or {}).get("pv_required", current["pv_required"])): bool,
                 vol.Optional("learning_enabled", default=(user_input or {}).get("learning_enabled", current["learning_enabled"])): bool,
+                **({
+                    vol.Optional(CONF_CONSUMER_MIN_DAYS, default=int((user_input or {}).get(CONF_CONSUMER_MIN_DAYS, current["min_days"]))): vol.Coerce(int),
+                    vol.Optional(CONF_CONSUMER_MAX_DAYS, default=int((user_input or {}).get(CONF_CONSUMER_MAX_DAYS, current["max_days"]))): vol.Coerce(int),
+                } if self._selected_consumer == CONSUMER_COUNT else {}),
             }
         )
         return self.async_show_form(

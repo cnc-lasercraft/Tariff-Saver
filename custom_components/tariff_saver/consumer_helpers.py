@@ -1,4 +1,3 @@
-
 """Helpers for consumer planning."""
 from __future__ import annotations
 
@@ -15,13 +14,18 @@ from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_SOC_ENTITY,
     CONF_CONSUMERS,
+    CONF_CONSUMER_MAX_DAYS,
+    CONF_CONSUMER_MIN_DAYS,
     CONF_PV_FORECAST_ATTRIBUTE,
     CONF_PV_FORECAST_ENTITY,
     DEFAULT_BATTERY_MIN_SOC_PERCENT,
+    DEFAULT_CONSUMER10_MAX_DAYS,
+    DEFAULT_CONSUMER10_MIN_DAYS,
     DEFAULT_PV_FORECAST_ATTRIBUTE,
 )
 from .models import ConsumerConfig, ConsumerLearning, PriceSlot
 from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
+
 
 def get_consumer_config(entry: ConfigEntry, slot: int) -> ConsumerConfig:
     consumers = entry.options.get(CONF_CONSUMERS, {})
@@ -40,10 +44,15 @@ def get_consumer_config(entry: ConfigEntry, slot: int) -> ConsumerConfig:
         priority=max(1, min(10, int(raw.get("priority", 5) or 5))),
         pv_required=bool(raw.get("pv_required", False)),
         learning_enabled=bool(raw.get("learning_enabled", True)),
+        min_days=int(raw.get(CONF_CONSUMER_MIN_DAYS, DEFAULT_CONSUMER10_MIN_DAYS if slot == 10 else 0) or (DEFAULT_CONSUMER10_MIN_DAYS if slot == 10 else 0)),
+        max_days=int(raw.get(CONF_CONSUMER_MAX_DAYS, DEFAULT_CONSUMER10_MAX_DAYS if slot == 10 else 0) or (DEFAULT_CONSUMER10_MAX_DAYS if slot == 10 else 0)),
     )
 
-def effective_energy_kwh(config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None) -> float | None:
-    manual = config.manual_energy_kwh
+
+def effective_energy_kwh(
+    config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None
+) -> float | None:
+    manual = getattr(config, "manual_energy_kwh", None)
     learned = 0.0
     if isinstance(learning, ConsumerLearning):
         learned = float(learning.avg_energy_kwh or 0.0)
@@ -56,16 +65,25 @@ def effective_energy_kwh(config: ConsumerConfig, learning: ConsumerLearning | di
         if config.power_kw > 0 and config.duration_minutes > 0:
             return float(config.power_kw) * float(config.duration_minutes) / 60.0
         return learned if learned > 0 else None
-    if manual and manual > 0:
-        return manual
+    if isinstance(manual, (int, float)) and manual > 0:
+        return float(manual)
+    if config.energy_kwh > 0:
+        return float(config.energy_kwh)
+    if config.power_kw > 0 and config.duration_minutes > 0:
+        return float(config.power_kw) * float(config.duration_minutes) / 60.0
     return learned if learned > 0 else None
 
-def effective_duration_minutes(config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None) -> int | None:
+
+def effective_duration_minutes(
+    config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None
+) -> int | None:
     if config.duration_minutes > 0:
         return int(config.duration_minutes)
     learned = None
     if isinstance(learning, ConsumerLearning):
-        learned = learning.avg_duration_minutes
+        learned = getattr(learning, "avg_duration_minutes", None)
+        if learned is None:
+            learned = getattr(learning, "avg_duration_min", None)
     elif isinstance(learning, dict):
         learned = learning.get("avg_duration_minutes") or learning.get("avg_duration_min")
     if isinstance(learned, (int, float)) and learned > 0:
@@ -74,7 +92,10 @@ def effective_duration_minutes(config: ConsumerConfig, learning: ConsumerLearnin
         return int(round((float(config.energy_kwh) / float(config.power_kw)) * 60.0))
     return None
 
-def effective_power_kw(config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None) -> float | None:
+
+def effective_power_kw(
+    config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None
+) -> float | None:
     if config.power_kw > 0:
         return float(config.power_kw)
     learned = None
@@ -85,6 +106,7 @@ def effective_power_kw(config: ConsumerConfig, learning: ConsumerLearning | dict
     if isinstance(learned, (int, float)) and learned > 0:
         return float(learned)
     return None
+
 
 def required_slot_count(config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None) -> int:
     dur = effective_duration_minutes(config, learning)
@@ -97,6 +119,7 @@ def required_slot_count(config: ConsumerConfig, learning: ConsumerLearning | dic
         return max(1, (minutes + 29) // 30)
     return 2
 
+
 def _all_in_from_slot(slot: PriceSlot | None) -> float | None:
     if slot is None:
         return None
@@ -108,9 +131,18 @@ def _all_in_from_slot(slot: PriceSlot | None) -> float | None:
     total = TariffSaverStore.sum_components(comps, IMPORT_ALLIN_COMPONENTS)
     return total if total > 0 else None
 
+
 def _parse_forecast_slots(hass: HomeAssistant, entry: ConfigEntry) -> list[dict[str, Any]]:
-    entity_id = str(entry.options.get(CONF_PV_FORECAST_ENTITY, entry.data.get(CONF_PV_FORECAST_ENTITY, "")) or "").strip()
-    attr_name = str(entry.options.get(CONF_PV_FORECAST_ATTRIBUTE, entry.data.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE)) or DEFAULT_PV_FORECAST_ATTRIBUTE).strip()
+    entity_id = str(
+        entry.options.get(CONF_PV_FORECAST_ENTITY, entry.data.get(CONF_PV_FORECAST_ENTITY, "")) or ""
+    ).strip()
+    attr_name = str(
+        entry.options.get(
+            CONF_PV_FORECAST_ATTRIBUTE,
+            entry.data.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE),
+        )
+        or DEFAULT_PV_FORECAST_ATTRIBUTE
+    ).strip()
     if not entity_id:
         return []
     state = hass.states.get(entity_id)
@@ -126,19 +158,25 @@ def _parse_forecast_slots(hass: HomeAssistant, entry: ConfigEntry) -> list[dict[
         dtp = dt_util.parse_datetime(str(item.get("period_start", "")))
         if dtp is None:
             continue
-        out.append({
-            "start": dt_util.as_local(dtp),
-            "pv_power_kw": float(item.get("pv_estimate", 0.0) or 0.0),
-            "pv_energy_kwh": float(item.get("pv_estimate", 0.0) or 0.0) * 0.5,
-        })
+        pv_power_kw = float(item.get("pv_estimate", 0.0) or 0.0)
+        out.append(
+            {
+                "start": dt_util.as_local(dtp),
+                "pv_power_kw": pv_power_kw,
+                "pv_energy_kwh": pv_power_kw * 0.5,
+            }
+        )
     out.sort(key=lambda x: x["start"])
     return out
+
 
 def battery_available_kwh(hass: HomeAssistant, entry: ConfigEntry) -> float:
     enabled = bool(entry.options.get(CONF_BATTERY_ENABLED, entry.data.get(CONF_BATTERY_ENABLED, False)))
     if not enabled:
         return 0.0
-    entity_id = str(entry.options.get(CONF_BATTERY_SOC_ENTITY, entry.data.get(CONF_BATTERY_SOC_ENTITY, "")) or "").strip()
+    entity_id = str(
+        entry.options.get(CONF_BATTERY_SOC_ENTITY, entry.data.get(CONF_BATTERY_SOC_ENTITY, "")) or ""
+    ).strip()
     if not entity_id:
         return 0.0
     state = hass.states.get(entity_id)
@@ -148,11 +186,21 @@ def battery_available_kwh(hass: HomeAssistant, entry: ConfigEntry) -> float:
         soc = float(state.state)
     except Exception:
         return 0.0
-    capacity = float(entry.options.get(CONF_BATTERY_CAPACITY_KWH, entry.data.get(CONF_BATTERY_CAPACITY_KWH, 0.0)) or 0.0)
-    reserve = float(entry.options.get(CONF_BATTERY_MIN_SOC_PERCENT, entry.data.get(CONF_BATTERY_MIN_SOC_PERCENT, DEFAULT_BATTERY_MIN_SOC_PERCENT)) or DEFAULT_BATTERY_MIN_SOC_PERCENT)
+    capacity = float(
+        entry.options.get(CONF_BATTERY_CAPACITY_KWH, entry.data.get(CONF_BATTERY_CAPACITY_KWH, 0.0))
+        or 0.0
+    )
+    reserve = float(
+        entry.options.get(
+            CONF_BATTERY_MIN_SOC_PERCENT,
+            entry.data.get(CONF_BATTERY_MIN_SOC_PERCENT, DEFAULT_BATTERY_MIN_SOC_PERCENT),
+        )
+        or DEFAULT_BATTERY_MIN_SOC_PERCENT
+    )
     if capacity <= 0:
         return 0.0
     return max(0.0, (soc - reserve) / 100.0 * capacity)
+
 
 def build_consumer_plan(
     hass: HomeAssistant,
@@ -166,6 +214,7 @@ def build_consumer_plan(
     slot_count = required_slot_count(config, learning)
     power_kw = effective_power_kw(config, learning)
     duration_min = effective_duration_minutes(config, learning)
+
     last_run = None
     if isinstance(learning, ConsumerLearning):
         last_run = learning.last_run_end_utc
@@ -175,28 +224,43 @@ def build_consumer_plan(
             last_run = dt_util.parse_datetime(last_run)
 
     if not config.enabled:
-        return {"status": "disabled", "should_run": False, "required_energy_kwh": req_energy, "slot_count": slot_count}
+        return {
+            "status": "disabled",
+            "should_run": False,
+            "required_energy_kwh": req_energy,
+            "slot_count": slot_count,
+        }
+
     if req_energy is None or req_energy <= 0:
-        return {"status": "not_configured", "should_run": False, "required_energy_kwh": None, "slot_count": slot_count}
-    if isinstance(last_run, datetime) and dt_util.as_local(last_run).date() == now_local.date():
-        return {"status": "done", "should_run": False, "required_energy_kwh": req_energy, "slot_count": slot_count, "last_run_end_utc": dt_util.as_utc(last_run).isoformat()}
+        return {
+            "status": "not_configured",
+            "should_run": False,
+            "required_energy_kwh": None,
+            "slot_count": slot_count,
+        }
+
+    days_since_last_run: int | None = None
+    if isinstance(last_run, datetime):
+        days_since_last_run = max(0, (now_local.date() - dt_util.as_local(last_run).date()).days)
+
+    # Consumer 10 = Boiler 60° hygiene special case
+    hygiene_mode = config.slot == 10 and config.max_days > 0
 
     future_price_slots = [
-    s
-    for s in sorted(active_slots, key=lambda x: x.start)
-    if dt_util.as_local(s.start) >= now_local.replace(second=0, microsecond=0)
+        s
+        for s in sorted(active_slots, key=lambda x: x.start)
+        if dt_util.as_local(s.start) >= now_local.replace(second=0, microsecond=0)
     ]
     if len(future_price_slots) < slot_count:
         future_price_slots = sorted(active_slots, key=lambda x: x.start)
 
-    # choose cheapest tariff window
     best_tariff = None
     for i in range(0, max(0, len(future_price_slots) - slot_count + 1)):
-        window = future_price_slots[i:i+slot_count]
+        window = future_price_slots[i : i + slot_count]
         prices = [_all_in_from_slot(s) for s in window]
         if any(p is None for p in prices):
             continue
-        avg = sum(prices)/len(prices)
+        avg = sum(prices) / len(prices)
         if best_tariff is None or avg < best_tariff["avg_price_chf_per_kwh"]:
             best_tariff = {
                 "start": dt_util.as_local(window[0].start),
@@ -208,43 +272,84 @@ def build_consumer_plan(
     forecast = _parse_forecast_slots(hass, entry)
     now_floor = now_local.replace(minute=0 if now_local.minute < 30 else 30, second=0, microsecond=0)
     forecast = [f for f in forecast if f["start"] >= now_floor]
+
     best_pv = None
+    best_pv_covering = None
     if forecast and len(forecast) >= slot_count:
         for i in range(0, len(forecast) - slot_count + 1):
-            window = forecast[i:i+slot_count]
-            # contiguous 30m only
+            window = forecast[i : i + slot_count]
             ok = True
             for j in range(1, len(window)):
-                if window[j]["start"] - window[j-1]["start"] != timedelta(minutes=30):
+                if window[j]["start"] - window[j - 1]["start"] != timedelta(minutes=30):
                     ok = False
                     break
             if not ok:
                 continue
             energy = sum(float(s["pv_energy_kwh"]) for s in window)
+            candidate = {
+                "start": window[0]["start"],
+                "end": window[-1]["start"] + timedelta(minutes=30),
+                "expected_pv_energy_kwh": energy,
+                "slot_count": slot_count,
+            }
             if best_pv is None or energy > best_pv["expected_pv_energy_kwh"]:
-                best_pv = {
-                    "start": window[0]["start"],
-                    "end": window[-1]["start"] + timedelta(minutes=30),
-                    "expected_pv_energy_kwh": energy,
-                    "slot_count": slot_count,
-                }
+                best_pv = candidate
+            if energy >= req_energy and (best_pv_covering is None or energy > best_pv_covering["expected_pv_energy_kwh"]):
+                best_pv_covering = candidate
 
     batt_avail = battery_available_kwh(hass, entry)
+
     chosen = None
-    source = "tariff"
-    if best_pv and (best_pv["expected_pv_energy_kwh"] + batt_avail) >= req_energy:
-        chosen = best_pv
-        source = "pv" if best_pv["expected_pv_energy_kwh"] >= req_energy else "pv_battery"
-    elif best_tariff:
-        chosen = best_tariff
-        source = "tariff"
+    source = None
+    due_status = None
+
+    if hygiene_mode:
+        min_days = max(0, int(config.min_days or DEFAULT_CONSUMER10_MIN_DAYS))
+        max_days = max(min_days, int(config.max_days or DEFAULT_CONSUMER10_MAX_DAYS))
+        if days_since_last_run is None:
+            days_since_last_run = max_days
+
+        if days_since_last_run < min_days:
+            due_status = "waiting_window"
+        elif days_since_last_run < max_days:
+            if best_pv_covering:
+                chosen = best_pv_covering
+                source = "pv"
+                due_status = "pv_window"
+            else:
+                due_status = "waiting_pv"
+        else:
+            due_status = "forced"
+            if best_pv_covering:
+                chosen = best_pv_covering
+                source = "pv"
+            elif best_tariff:
+                chosen = best_tariff
+                source = "tariff"
+    else:
+        if isinstance(last_run, datetime) and dt_util.as_local(last_run).date() == now_local.date():
+            return {
+                "status": "done",
+                "should_run": False,
+                "required_energy_kwh": req_energy,
+                "slot_count": slot_count,
+                "last_run_end_utc": dt_util.as_utc(last_run).isoformat(),
+            }
+
+        if best_pv and (best_pv["expected_pv_energy_kwh"] + batt_avail) >= req_energy:
+            chosen = best_pv
+            source = "pv" if best_pv["expected_pv_energy_kwh"] >= req_energy else "pv_battery"
+        elif best_tariff:
+            chosen = best_tariff
+            source = "tariff"
 
     should_run = False
     if chosen and isinstance(chosen.get("start"), datetime) and isinstance(chosen.get("end"), datetime):
         should_run = chosen["start"] <= now_local < chosen["end"]
 
+    status = "planned" if chosen else (due_status or "unavailable")
     return {
-        "status": "planned" if chosen else "unavailable",
+        "status": status,
         "should_run": should_run,
         "source": source if chosen else None,
         "required_energy_kwh": round(float(req_energy), 3),
@@ -259,4 +364,8 @@ def build_consumer_plan(
         "tariff_window_end": best_tariff["end"].isoformat() if best_tariff else None,
         "tariff_avg_price_chf_per_kwh": round(float(best_tariff["avg_price_chf_per_kwh"]), 6) if best_tariff else None,
         "last_run_end_utc": dt_util.as_utc(last_run).isoformat() if isinstance(last_run, datetime) else None,
+        "days_since_last_run": days_since_last_run,
+        "due_status": due_status,
+        "min_days": int(config.min_days or 0),
+        "max_days": int(config.max_days or 0),
     }

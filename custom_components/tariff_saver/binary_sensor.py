@@ -72,4 +72,8 @@ class TariffSaverConsumerShouldRunBinarySensor(CoordinatorEntity[TariffSaverCoor
             "tariff_window_end": plan.get("tariff_window_end"),
             "tariff_avg_price_chf_per_kwh": plan.get("tariff_avg_price_chf_per_kwh"),
             "last_run_end_utc": plan.get("last_run_end_utc"),
+            "min_days": plan.get("min_days"),
+            "max_days": plan.get("max_days"),
+            "days_since_last_run": plan.get("days_since_last_run"),
+            "due_status": plan.get("due_status"),
         }

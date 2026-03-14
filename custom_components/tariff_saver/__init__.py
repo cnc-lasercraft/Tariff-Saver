@@ -114,6 +114,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not hass.services.has_service(DOMAIN, service_name):
         hass.services.async_register(DOMAIN, service_name, _reset_energy_baseline_service)
 
+    service_name = "mark_consumer_run"
+    if not hass.services.has_service(DOMAIN, service_name):
+        hass.services.async_register(DOMAIN, service_name, _mark_consumer_run_service)
+
+
+    async def _mark_consumer_run_service(call: ServiceCall) -> None:
+        target_entry_id = call.data.get("entry_id")
+        slot = int(call.data.get("slot", 0) or 0)
+        if slot <= 0:
+            return
+
+        for eid, coord in list(hass.data.get(DOMAIN, {}).items()):
+            if not isinstance(eid, str) or not hasattr(coord, "store"):
+                continue
+            if target_entry_id and eid != target_entry_id:
+                continue
+
+            store = getattr(coord, "store", None)
+            if store is None:
+                continue
+
+            store.set_consumer_last_run(str(slot), dt_util.utcnow())
+            await store.async_save()
+            try:
+                await coord.async_request_refresh()
+            except Exception:
+                pass
+
     async def _force_refresh() -> None:
         coordinator._last_fetch_date = None
         await coordinator.async_request_refresh()
@@ -169,6 +197,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ]
         if not remaining_entries and hass.services.has_service(DOMAIN, "reset_energy_baseline"):
             hass.services.async_remove(DOMAIN, "reset_energy_baseline")
+        if not remaining_entries and hass.services.has_service(DOMAIN, "mark_consumer_run"):
+            hass.services.async_remove(DOMAIN, "mark_consumer_run")
     return unload_ok
 
 

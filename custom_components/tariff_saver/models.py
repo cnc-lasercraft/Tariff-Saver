@@ -50,6 +50,8 @@ class ConsumerConfig:
     priority: int = 5
     pv_required: bool = False
     learning_enabled: bool = True
+    min_days: int = 0
+    max_days: int = 0
 
     @property
     def configured_name(self) -> str:

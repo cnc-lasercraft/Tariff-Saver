@@ -16,3 +16,25 @@ reset_energy_baseline:
       default: true
       selector:
         boolean:
+
+
+mark_consumer_run:
+  name: Mark consumer run
+  description: Store the current timestamp as the last run time for one Tariff Saver consumer.
+  fields:
+    entry_id:
+      name: Config entry ID
+      description: Optional. Target only this Tariff Saver entry.
+      required: false
+      selector:
+        text:
+    slot:
+      name: Consumer slot
+      description: Consumer slot number, for example 10 for Boiler 60° hygiene.
+      required: true
+      example: 10
+      selector:
+        number:
+          min: 1
+          max: 10
+          mode: box

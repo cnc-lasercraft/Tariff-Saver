@@ -667,3 +667,15 @@ class TariffSaverStore:
             "last_run_end_utc": learned.get("last_run_end_utc"),
         }
 
+    def set_consumer_last_run(self, consumer_id: str, ts_utc: datetime) -> None:
+        ts_utc = dt_util.as_utc(ts_utc)
+        key = str(consumer_id)
+        learned = dict(self.consumer_learning.get(key, {}) or {})
+        learned.setdefault("sample_count", int(learned.get("sample_count", 0) or 0))
+        learned.setdefault("avg_energy_kwh", learned.get("avg_energy_kwh"))
+        learned.setdefault("avg_duration_minutes", learned.get("avg_duration_minutes"))
+        learned.setdefault("avg_power_kw", learned.get("avg_power_kw"))
+        learned["last_run_end_utc"] = ts_utc.isoformat()
+        self.consumer_learning[key] = learned
+        self.dirty = True
+
