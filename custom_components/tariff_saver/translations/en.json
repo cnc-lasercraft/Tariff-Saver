@@ -27,6 +27,12 @@
           "feed_in_price_mode": "Feed-in price mode",
           "feed_in_fixed_price": "Feed-in fixed price (CHF/kWh)",
           "feed_in_price_entity": "Feed-in price entity",
+          "pv_forecast_entity": "PV forecast entity",
+          "pv_forecast_attribute": "PV forecast attribute",
+          "battery_enabled": "Battery enabled",
+          "battery_soc_entity": "Battery SoC entity",
+          "battery_capacity_kwh": "Battery capacity (kWh)",
+          "battery_min_soc_percent": "Battery reserve SoC (%)",
           "publish_time": "Publish time"
         }
       }
@@ -69,6 +75,12 @@
           "feed_in_price_mode": "Feed-in price mode",
           "feed_in_fixed_price": "Feed-in fixed price (CHF/kWh)",
           "feed_in_price_entity": "Feed-in price entity",
+          "pv_forecast_entity": "PV forecast entity",
+          "pv_forecast_attribute": "PV forecast attribute",
+          "battery_enabled": "Battery enabled",
+          "battery_soc_entity": "Battery SoC entity",
+          "battery_capacity_kwh": "Battery capacity (kWh)",
+          "battery_min_soc_percent": "Battery reserve SoC (%)",
           "publish_time": "Publish time"
         }
       },

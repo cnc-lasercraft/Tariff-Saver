@@ -12,6 +12,12 @@
           "feed_in_price_mode": "Einspeisepreis Modus",
           "feed_in_fixed_price": "Fester Einspeisepreis (CHF/kWh)",
           "feed_in_price_entity": "Einspeisepreis Entität",
+          "pv_forecast_entity": "PV-Forecast Entität",
+          "pv_forecast_attribute": "PV-Forecast Attribut",
+          "battery_enabled": "Akku aktiv",
+          "battery_soc_entity": "Akku-SoC Entität",
+          "battery_capacity_kwh": "Akku-Kapazität (kWh)",
+          "battery_min_soc_percent": "Akku-Reserve SoC (%)",
           "publish_time": "Publikationszeit"
         }
       }
@@ -33,6 +39,12 @@
           "feed_in_price_mode": "Einspeisepreis Modus",
           "feed_in_fixed_price": "Fester Einspeisepreis (CHF/kWh)",
           "feed_in_price_entity": "Einspeisepreis Entität",
+          "pv_forecast_entity": "PV-Forecast Entität",
+          "pv_forecast_attribute": "PV-Forecast Attribut",
+          "battery_enabled": "Akku aktiv",
+          "battery_soc_entity": "Akku-SoC Entität",
+          "battery_capacity_kwh": "Akku-Kapazität (kWh)",
+          "battery_min_soc_percent": "Akku-Reserve SoC (%)",
           "publish_time": "Publikationszeit"
         }
       },
