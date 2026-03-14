@@ -110,15 +110,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception:
                 pass
 
-    service_name = "reset_energy_baseline"
-    if not hass.services.has_service(DOMAIN, service_name):
-        hass.services.async_register(DOMAIN, service_name, _reset_energy_baseline_service)
-
-    service_name = "mark_consumer_run"
-    if not hass.services.has_service(DOMAIN, service_name):
-        hass.services.async_register(DOMAIN, service_name, _mark_consumer_run_service)
-
-
     async def _mark_consumer_run_service(call: ServiceCall) -> None:
         target_entry_id = call.data.get("entry_id")
         slot = int(call.data.get("slot", 0) or 0)
@@ -135,12 +126,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if store is None:
                 continue
 
+            if not hasattr(store, "set_consumer_last_run"):
+                continue
+
             store.set_consumer_last_run(str(slot), dt_util.utcnow())
             await store.async_save()
             try:
                 await coord.async_request_refresh()
             except Exception:
                 pass
+
+    service_name = "reset_energy_baseline"
+    if not hass.services.has_service(DOMAIN, service_name):
+        hass.services.async_register(DOMAIN, service_name, _reset_energy_baseline_service)
+
+    service_name = "mark_consumer_run"
+    if not hass.services.has_service(DOMAIN, service_name):
+        hass.services.async_register(DOMAIN, service_name, _mark_consumer_run_service)
 
     async def _force_refresh() -> None:
         coordinator._last_fetch_date = None
