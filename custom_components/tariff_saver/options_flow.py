@@ -10,6 +10,10 @@ from homeassistant import config_entries
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_BATTERY_CAPACITY_KWH,
+    CONF_BATTERY_ENABLED,
+    CONF_BATTERY_MIN_SOC_PERCENT,
+    CONF_BATTERY_SOC_ENTITY,
     CONF_CONSUMERS,
     CONF_CONSUMPTION_ENERGY_ENTITY,
     CONF_EKZ_ENTRY_ID,
@@ -17,12 +21,16 @@ from .const import (
     CONF_FEED_IN_PRICE_ENTITY,
     CONF_FEED_IN_PRICE_MODE,
     CONF_PUBLISH_TIME,
+    CONF_PV_FORECAST_ATTRIBUTE,
+    CONF_PV_FORECAST_ENTITY,
     CONSUMER_COUNT,
     CONSUMER_MODE_AUTO,
     CONSUMER_MODES,
+    DEFAULT_BATTERY_MIN_SOC_PERCENT,
     DEFAULT_FEED_IN_FIXED_PRICE,
     DEFAULT_FEED_IN_PRICE_MODE,
     DEFAULT_PUBLISH_TIME,
+    DEFAULT_PV_FORECAST_ATTRIBUTE,
 )
 
 
@@ -169,6 +177,42 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                         CONF_FEED_IN_PRICE_ENTITY, opts.get(CONF_FEED_IN_PRICE_ENTITY, data.get(CONF_FEED_IN_PRICE_ENTITY, ""))
                     ),
                 ): str,
+                vol.Optional(
+                    CONF_PV_FORECAST_ENTITY,
+                    default=(user_input or {}).get(
+                        CONF_PV_FORECAST_ENTITY, opts.get(CONF_PV_FORECAST_ENTITY, data.get(CONF_PV_FORECAST_ENTITY, ""))
+                    ),
+                ): _sensor_entity_selector(),
+                vol.Optional(
+                    CONF_PV_FORECAST_ATTRIBUTE,
+                    default=(user_input or {}).get(
+                        CONF_PV_FORECAST_ATTRIBUTE, opts.get(CONF_PV_FORECAST_ATTRIBUTE, data.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE))
+                    ),
+                ): str,
+                vol.Optional(
+                    CONF_BATTERY_ENABLED,
+                    default=(user_input or {}).get(
+                        CONF_BATTERY_ENABLED, opts.get(CONF_BATTERY_ENABLED, data.get(CONF_BATTERY_ENABLED, False))
+                    ),
+                ): bool,
+                vol.Optional(
+                    CONF_BATTERY_SOC_ENTITY,
+                    default=(user_input or {}).get(
+                        CONF_BATTERY_SOC_ENTITY, opts.get(CONF_BATTERY_SOC_ENTITY, data.get(CONF_BATTERY_SOC_ENTITY, ""))
+                    ),
+                ): _sensor_entity_selector(),
+                vol.Optional(
+                    CONF_BATTERY_CAPACITY_KWH,
+                    default=float((user_input or {}).get(
+                        CONF_BATTERY_CAPACITY_KWH, opts.get(CONF_BATTERY_CAPACITY_KWH, data.get(CONF_BATTERY_CAPACITY_KWH, 0.0))
+                    )),
+                ): vol.Coerce(float),
+                vol.Optional(
+                    CONF_BATTERY_MIN_SOC_PERCENT,
+                    default=float((user_input or {}).get(
+                        CONF_BATTERY_MIN_SOC_PERCENT, opts.get(CONF_BATTERY_MIN_SOC_PERCENT, data.get(CONF_BATTERY_MIN_SOC_PERCENT, DEFAULT_BATTERY_MIN_SOC_PERCENT))
+                    )),
+                ): vol.Coerce(float),
                 vol.Optional(
                     CONF_PUBLISH_TIME,
                     default=(user_input or {}).get(

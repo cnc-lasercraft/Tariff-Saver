@@ -18,45 +18,13 @@ from homeassistant.util import dt as dt_util
 from .const import CONSUMER_COUNT, CONF_CONSUMERS, DOMAIN
 from .coordinator import PriceSlot, TariffSaverCoordinator
 from .models import ConsumerConfig
+from .consumer_helpers import build_consumer_plan, effective_energy_kwh, get_consumer_config
 from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
 
 CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
 SIGNAL_STORE_UPDATED = "tariff_saver_store_updated"
 WINDOW_HOURS: tuple[int, ...] = (1, 2, 3, 6)
 
-
-def _consumer_config(entry: ConfigEntry, slot: int) -> ConsumerConfig:
-    consumers = entry.options.get(CONF_CONSUMERS, {})
-    raw = consumers.get(str(slot), {}) if isinstance(consumers, dict) else {}
-    if not isinstance(raw, dict):
-        raw = {}
-    return ConsumerConfig(
-        slot=slot,
-        enabled=bool(raw.get("enabled", False)),
-        name=str(raw.get("name", "") or ""),
-        mode=str(raw.get("mode", "auto") or "auto"),
-        power_kw=float(raw.get("power_kw", 0.0) or 0.0),
-        duration_minutes=int(raw.get("duration_minutes", 0) or 0),
-        energy_kwh=float(raw.get("energy_kwh", 0.0) or 0.0),
-        measurement_entity=str(raw.get("measurement_entity", "") or ""),
-        priority=max(1, min(10, int(raw.get("priority", 5) or 5))),
-        pv_required=bool(raw.get("pv_required", False)),
-        learning_enabled=bool(raw.get("learning_enabled", True)),
-    )
-
-
-def _consumer_effective_energy_kwh(config: ConsumerConfig, learning: dict[str, Any]) -> float | None:
-    manual = config.manual_energy_kwh
-    learned = float(learning.get("avg_energy_kwh", 0.0) or 0.0) if isinstance(learning, dict) else 0.0
-    if config.mode == "fixed_energy":
-        return float(config.energy_kwh) if config.energy_kwh > 0 else (learned if learned > 0 else None)
-    if config.mode == "fixed_duration":
-        if config.power_kw > 0 and config.duration_minutes > 0:
-            return float(config.power_kw) * float(config.duration_minutes) / 60.0
-        return learned if learned > 0 else None
-    if manual and manual > 0:
-        return manual
-    return learned if learned > 0 else None
 
 
 def _device_info(entry: ConfigEntry) -> dict[str, Any]:
@@ -195,7 +163,7 @@ async def async_setup_entry(
         now_utc = dt_util.utcnow()
         changed = False
         for slot in range(1, CONSUMER_COUNT + 1):
-            config = _consumer_config(entry, slot)
+            config = get_consumer_config(entry, slot)
             if not config.enabled or not config.learning_enabled or not config.measurement_entity:
                 store._finalize_consumer_run(str(slot))
                 continue
@@ -512,17 +480,18 @@ class TariffSaverConsumerSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
 
     @property
     def native_value(self) -> float | None:
-        config = _consumer_config(self.entry, self.slot)
+        config = get_consumer_config(self.entry, self.slot)
         store = getattr(self.coordinator, "store", None)
         learning = store.get_consumer_learning(str(self.slot)) if store is not None else {}
-        value = _consumer_effective_energy_kwh(config, learning)
+        value = effective_energy_kwh(config, learning)
         return round(float(value), 3) if isinstance(value, (int, float)) and value > 0 else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        config = _consumer_config(self.entry, self.slot)
+        config = get_consumer_config(self.entry, self.slot)
         store = getattr(self.coordinator, "store", None)
         learning = store.get_consumer_learning(str(self.slot)) if store is not None else {}
+        plan = build_consumer_plan(self.hass, self.entry, config, learning, _active_slots(self.coordinator))
         return {
             "slot": self.slot,
             "enabled": config.enabled,
@@ -536,12 +505,22 @@ class TariffSaverConsumerSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
             "pv_required": config.pv_required,
             "learning_enabled": config.learning_enabled,
             "manual_energy_kwh": config.manual_energy_kwh,
-            "effective_energy_kwh": _consumer_effective_energy_kwh(config, learning),
+            "effective_energy_kwh": effective_energy_kwh(config, learning),
             "sample_count": int(learning.get("sample_count", 0) or 0),
             "avg_energy_kwh": round(float(learning.get("avg_energy_kwh", 0.0) or 0.0), 3),
             "avg_duration_minutes": round(float(learning.get("avg_duration_minutes", 0.0) or 0.0), 1),
             "avg_power_kw": round(float(learning.get("avg_power_kw", 0.0) or 0.0), 3),
             "last_run_end_utc": learning.get("last_run_end_utc"),
+            "plan_status": plan.get("status"),
+            "plan_source": plan.get("source"),
+            "should_run": plan.get("should_run"),
+            "chosen_start": plan.get("chosen_start"),
+            "chosen_end": plan.get("chosen_end"),
+            "expected_pv_energy_kwh": plan.get("expected_pv_energy_kwh"),
+            "battery_available_kwh": plan.get("battery_available_kwh"),
+            "tariff_window_start": plan.get("tariff_window_start"),
+            "tariff_window_end": plan.get("tariff_window_end"),
+            "tariff_avg_price_chf_per_kwh": plan.get("tariff_avg_price_chf_per_kwh"),
         }
 
 

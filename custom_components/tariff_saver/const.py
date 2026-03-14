@@ -28,3 +28,14 @@ CONSUMER_MODES = (
     CONSUMER_MODE_FIXED_DURATION,
     CONSUMER_MODE_FIXED_ENERGY,
 )
+
+
+CONF_PV_FORECAST_ENTITY = "pv_forecast_entity"
+CONF_PV_FORECAST_ATTRIBUTE = "pv_forecast_attribute"
+DEFAULT_PV_FORECAST_ATTRIBUTE = "detailedForecast"
+
+CONF_BATTERY_ENABLED = "battery_enabled"
+CONF_BATTERY_SOC_ENTITY = "battery_soc_entity"
+CONF_BATTERY_CAPACITY_KWH = "battery_capacity_kwh"
+CONF_BATTERY_MIN_SOC_PERCENT = "battery_min_soc_percent"
+DEFAULT_BATTERY_MIN_SOC_PERCENT = 20.0

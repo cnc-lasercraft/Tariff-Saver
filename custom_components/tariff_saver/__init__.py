@@ -17,7 +17,7 @@ from .const import (
 )
 from .coordinator import TariffSaverCoordinator
 
-PLATFORMS: list[str] = ["sensor"]
+PLATFORMS: list[str] = ["sensor", "binary_sensor"]
 RETRY_INTERVAL = timedelta(minutes=30)
 
 
