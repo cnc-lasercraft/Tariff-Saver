@@ -181,7 +181,11 @@ def build_consumer_plan(
     if isinstance(last_run, datetime) and dt_util.as_local(last_run).date() == now_local.date():
         return {"status": "done", "should_run": False, "required_energy_kwh": req_energy, "slot_count": slot_count, "last_run_end_utc": dt_util.as_utc(last_run).isoformat()}
 
-    future_price_slots = [s for s in sorted(active_slots, key=lambda x: x.start) if dt_util.as_local(x.start) >= now_local.replace(second=0, microsecond=0)]
+    future_price_slots = [
+    s
+    for s in sorted(active_slots, key=lambda x: x.start)
+    if dt_util.as_local(s.start) >= now_local.replace(second=0, microsecond=0)
+    ]
     if len(future_price_slots) < slot_count:
         future_price_slots = sorted(active_slots, key=lambda x: x.start)
 
