@@ -38,3 +38,50 @@ mark_consumer_run:
           min: 1
           max: 10
           mode: box
+    energy_kwh:
+      name: Energy consumed (kWh)
+      description: Optional. Energy consumed during this run in kWh (for efficiency tracking).
+      required: false
+      example: 3.5
+      selector:
+        number:
+          min: 0
+          max: 1000
+          step: 0.001
+          mode: box
+          unit_of_measurement: kWh
+    source:
+      name: Energy source
+      description: Optional. Energy source used for this run (pv, tariff, battery).
+      required: false
+      example: pv
+      selector:
+        select:
+          options:
+            - pv
+            - tariff
+            - battery
+    actual_price_chf_per_kwh:
+      name: Actual price (CHF/kWh)
+      description: Optional. Actual price paid per kWh (feed-in price for PV, tariff for grid).
+      required: false
+      example: 0.09
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 0.001
+          mode: box
+          unit_of_measurement: CHF/kWh
+    baseline_price_chf_per_kwh:
+      name: Baseline price (CHF/kWh)
+      description: Optional. Reference price to calculate savings against.
+      required: false
+      example: 0.133
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 0.001
+          mode: box
+          unit_of_measurement: CHF/kWh
