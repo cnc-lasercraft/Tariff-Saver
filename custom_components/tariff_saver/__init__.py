@@ -5,8 +5,7 @@ from datetime import datetime, time, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
@@ -101,15 +100,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     retry_state_key = f"{entry.entry_id}_retry_until"
     hass.data[DOMAIN][retry_state_key] = None
 
-    # Listen for EKZ Tariff validated data signal
-    async def _on_ekz_new_data(data: dict) -> None:
-        """EKZ Tariff has validated new data — force refresh."""
-        _LOGGER.info("Received ekz_tariff_new_data signal: %s", data)
+    # Listen for EKZ Tariff validated data via HA bus event
+    @callback
+    def _on_ekz_bus_event(event) -> None:
+        """EKZ Tariff has validated new data — schedule refresh."""
+        _LOGGER.info("Received ekz_tariff_new_data event: %s", event.data)
         coordinator._last_fetch_date = None
-        await coordinator.async_request_refresh()
+        hass.async_create_task(coordinator.async_refresh())
 
-    hass.data[DOMAIN][f"{entry.entry_id}_unsub_ekz_signal"] = async_dispatcher_connect(
-        hass, "ekz_tariff_new_data", _on_ekz_new_data
+    hass.data[DOMAIN][f"{entry.entry_id}_unsub_ekz_signal"] = hass.bus.async_listen(
+        "ekz_tariff_new_data", _on_ekz_bus_event
     )
 
     async def _reset_energy_baseline_service(call: ServiceCall) -> None:
