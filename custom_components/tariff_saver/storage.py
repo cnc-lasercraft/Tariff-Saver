@@ -40,6 +40,12 @@ class TariffSaverStore:
         self.price_slots: dict[str, dict[str, Any]] = {}
         self.samples: list[dict[str, float]] = []
         self.booked: list[dict[str, Any]] = []
+        self.base_load_daily: list[dict[str, Any]] = []
+        self.consumption_slot_buffer: dict[str, float] = {}
+        self.historical_price_min: float = 999.0
+        self.historical_price_max: float = 0.0
+        self.consumer_slot_buffers: dict[str, dict[str, float]] = {}
+        self.load_profiles: list[dict[str, Any]] = []
         self.day_average_prices: dict[str, float] = {}
         self.consumer_learning: dict[str, dict[str, Any]] = {}
         self.consumer_runs: dict[str, dict[str, Any]] = {}
@@ -47,6 +53,9 @@ class TariffSaverStore:
         self.last_api_success_utc: datetime | None = None
         self.energy_baseline_kwh: float | None = None
         self.energy_baseline_timestamp_utc: datetime | None = None
+        self.activity_log: list[dict] = []
+        self.consumer_plans: dict = {}
+        self.plans_tariff_date: str | None = None
         self.dirty: bool = False
 
     async def _async_migrate(self, old_version: int, old_minor_version: int, old_data: dict) -> dict:
@@ -93,11 +102,22 @@ class TariffSaverStore:
         self.price_slots = dict(data.get("price_slots") or {})
         self.samples = list(data.get("samples") or [])
         self.booked = list(data.get("booked") or [])
+        self.base_load_daily = list(data.get("base_load_daily") or [])
+        self.consumption_slot_buffer = dict(data.get("consumption_slot_buffer") or {})
+        _raw_min = data.get("historical_price_min")
+        _raw_max = data.get("historical_price_max")
+        self.historical_price_min = float(_raw_min) if _raw_min is not None and float(_raw_min) >= 0.15 else 999.0
+        self.historical_price_max = float(_raw_max) if _raw_max is not None and float(_raw_max) > 0 else 0.0
+        self.consumer_slot_buffers = dict(data.get("consumer_slot_buffers") or {})
+        self.load_profiles = list(data.get("load_profiles") or [])
         self.day_average_prices = {
             str(k): float(v)
             for k, v in (data.get("day_average_prices") or {}).items()
             if isinstance(v, (int, float))
         }
+        self.activity_log = list(data.get("activity_log") or [])
+        self.consumer_plans = dict(data.get("consumer_plans") or {})
+        self.plans_tariff_date = data.get("plans_tariff_date")
         self.consumer_learning = {
             str(k): dict(v)
             for k, v in (data.get("consumer_learning") or {}).items()
@@ -137,7 +157,16 @@ class TariffSaverStore:
             "price_slots": self.price_slots,
             "samples": self.samples,
             "booked": self.booked,
+            "base_load_daily": self.base_load_daily,
+            "consumption_slot_buffer": self.consumption_slot_buffer,
+            "historical_price_min": self.historical_price_min,
+            "historical_price_max": self.historical_price_max,
+            "consumer_slot_buffers": self.consumer_slot_buffers,
+            "load_profiles": self.load_profiles,
             "day_average_prices": self.day_average_prices,
+            "activity_log": self.activity_log,
+            "consumer_plans": self.consumer_plans,
+            "plans_tariff_date": self.plans_tariff_date,
             "consumer_learning": self.consumer_learning,
             "consumer_runs": self.consumer_runs,
             "last_api_success_utc": self.last_api_success_utc.isoformat() if self.last_api_success_utc else None,
@@ -166,14 +195,15 @@ class TariffSaverStore:
             self.dirty = True
 
     def get_year_day_average_prices(self, reference_local_day: date | None = None) -> list[float]:
-        target_year = (reference_local_day or dt_util.now().date()).year
+        ref = reference_local_day or dt_util.now().date()
+        cutoff = ref - timedelta(days=365)
         values: list[float] = []
         for key, value in self.day_average_prices.items():
             try:
                 day = date.fromisoformat(str(key))
             except ValueError:
                 continue
-            if day.year == target_year and isinstance(value, (int, float)):
+            if cutoff <= day <= ref and isinstance(value, (int, float)):
                 values.append(float(value))
         return values
 
@@ -577,6 +607,183 @@ class TariffSaverStore:
         return self._breakdown_between(start, end)
 
 
+    def update_historical_prices(self, prices: list) -> None:
+        changed = False
+        for p in prices:
+            if isinstance(p, (int, float)) and p > 0.15:
+                if float(p) < self.historical_price_min:
+                    self.historical_price_min = round(float(p), 6)
+                    changed = True
+                if float(p) > self.historical_price_max:
+                    self.historical_price_max = round(float(p), 6)
+                    changed = True
+        if changed:
+            self.dirty = True
+
+    def log_activity(self, icon: str, message: str) -> None:
+        from homeassistant.util import dt as dt_util
+        entry = {
+            "time": dt_util.now().isoformat(),
+            "icon": icon,
+            "msg": message,
+        }
+        self.activity_log.insert(0, entry)
+        self.activity_log = self.activity_log[:30]  # keep last 30
+        self.dirty = True
+
+    def record_consumer_slot(self, entity_id: str, slot_start_iso: str, cumulative_kwh: float) -> None:
+        if entity_id not in self.consumer_slot_buffers:
+            self.consumer_slot_buffers[entity_id] = {}
+        self.consumer_slot_buffers[entity_id][slot_start_iso] = round(cumulative_kwh, 4)
+        self.dirty = True
+
+    def record_consumption_slot(self, slot_start_iso: str, cumulative_kwh: float) -> None:
+        """Record cumulative consumption reading for a 30-min slot."""
+        self.consumption_slot_buffer[slot_start_iso] = round(cumulative_kwh, 4)
+        self.dirty = True
+
+    def compile_load_profile(self, date_str: str, season: str) -> dict[str, Any] | None:
+        """Compile 48-slot profile from buffer. Consumer consumption from measurement entity diffs."""
+        sorted_keys = sorted(self.consumption_slot_buffer.keys())
+        if len(sorted_keys) < 2:
+            return None
+
+        slots = []
+        for i in range(len(sorted_keys) - 1):
+            current_key = sorted_keys[i]
+            next_key = sorted_keys[i + 1]
+            current_val = self.consumption_slot_buffer[current_key]
+            next_val = self.consumption_slot_buffer[next_key]
+            delta = max(0.0, next_val - current_val)
+
+            # Sum consumer measurement diffs for this slot
+            consumer_kwh = 0.0
+            for entity_id, buf in self.consumer_slot_buffers.items():
+                c_cur = buf.get(current_key)
+                c_nxt = buf.get(next_key)
+                if c_cur is not None and c_nxt is not None:
+                    consumer_kwh += max(0.0, c_nxt - c_cur)
+
+            consumer_kwh = min(consumer_kwh, delta)
+            base_kwh = max(0.0, delta - consumer_kwh)
+            # Compute slot index (0-47) from time
+            try:
+                slot_dt = dt_util.parse_datetime(current_key)
+                if slot_dt:
+                    local_dt = dt_util.as_local(slot_dt)
+                    slot_index = local_dt.hour * 2 + (1 if local_dt.minute >= 30 else 0)
+                else:
+                    slot_index = i
+            except Exception:
+                slot_index = i
+            slots.append({
+                "start": current_key,
+                "slot_index": slot_index,
+                "total_kwh": round(delta, 4),
+                "consumer_kwh": round(consumer_kwh, 4),
+                "base_kwh": round(base_kwh, 4),
+            })
+
+        profile = {
+            "date": date_str,
+            "season": season,
+            "slots": slots,
+            "total_kwh": round(sum(s["total_kwh"] for s in slots), 3),
+            "consumer_kwh": round(sum(s["consumer_kwh"] for s in slots), 3),
+            "base_kwh": round(sum(s["base_kwh"] for s in slots), 3),
+        }
+
+        self.load_profiles = [p for p in self.load_profiles if p.get("date") != date_str]
+        self.load_profiles.append(profile)
+        self.dirty = True
+        return profile
+
+    def clear_consumption_slot_buffer(self) -> None:
+        self.consumption_slot_buffer = {}
+        self.consumer_slot_buffers = {}
+        self.dirty = True
+
+    def get_seasonal_load_profile(self, season: str | None = None) -> dict[int, float]:
+        """Get average base load per 30-min slot index (0-47) for a season.
+
+        Returns dict {slot_index: avg_base_kwh}.
+        If season is None, averages across all seasons.
+        """
+        from collections import defaultdict
+        slot_totals: dict[int, list[float]] = defaultdict(list)
+
+        for profile in self.load_profiles:
+            if season and profile.get("season") != season:
+                continue
+            for slot in profile.get("slots", []):
+                idx = slot.get("slot_index")
+                if idx is None:
+                    try:
+                        slot_dt = dt_util.parse_datetime(slot.get("start", ""))
+                        if slot_dt:
+                            local_dt = dt_util.as_local(slot_dt)
+                            idx = local_dt.hour * 2 + (1 if local_dt.minute >= 30 else 0)
+                    except Exception:
+                        continue
+                if idx is None:
+                    continue
+                base = slot.get("base_kwh")
+                if isinstance(base, (int, float)):
+                    slot_totals[int(idx)].append(float(base))
+
+        return {
+            idx: round(sum(vals) / len(vals), 4)
+            for idx, vals in slot_totals.items()
+            if vals
+        }
+
+    def add_base_load_daily(
+        self, date_str: str, emma_kwh: float, consumer_kwh: float,
+        base_load_kwh: float, season: str,
+    ) -> None:
+        self.base_load_daily = [r for r in self.base_load_daily if r.get("date") != date_str]
+        self.base_load_daily.append({
+            "date": date_str,
+            "emma_kwh": round(emma_kwh, 3),
+            "consumer_kwh": round(consumer_kwh, 3),
+            "base_load_kwh": round(base_load_kwh, 3),
+            "season": season,
+        })
+        self.dirty = True
+
+    def compute_consumer_kwh_today(self) -> float:
+        now = dt_util.now()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        start_utc = dt_util.as_utc(start)
+        end_utc = dt_util.as_utc(end)
+        total = 0.0
+        for b in self.booked:
+            dtp = dt_util.parse_datetime(str(b.get("start", "")))
+            if dtp is None:
+                continue
+            s_utc = dt_util.as_utc(dtp)
+            if start_utc <= s_utc < end_utc:
+                try:
+                    total += float(b.get("kwh", 0.0))
+                except Exception:
+                    continue
+        return total
+
+    def get_base_load_season_averages(self) -> dict[str, float]:
+        buckets: dict[str, list[float]] = {}
+        for rec in self.base_load_daily:
+            season = str(rec.get("season", ""))
+            kwh = rec.get("base_load_kwh")
+            if not season or not isinstance(kwh, (int, float)):
+                continue
+            buckets.setdefault(season, []).append(float(kwh))
+        return {
+            season: round(sum(vals) / len(vals), 3)
+            for season, vals in buckets.items()
+            if vals
+        }
+
     def _finalize_consumer_run(self, consumer_id: str) -> None:
         run = self.consumer_runs.get(str(consumer_id))
         if not isinstance(run, dict) or not run.get("active"):
@@ -656,6 +863,33 @@ class TariffSaverStore:
             self._finalize_consumer_run(key)
             return True
         return False
+
+
+    def record_consumer_efficiency(
+        self,
+        consumer_id: str,
+        *,
+        energy_kwh: float,
+        source: str,
+        actual_price_chf_per_kwh: float,
+        baseline_price_chf_per_kwh: float,
+    ) -> None:
+        """Record efficiency stats for a consumer run."""
+        key = str(consumer_id)
+        learned = dict(self.consumer_learning.get(key, {}) or {})
+        energy_kwh = max(0.0, float(energy_kwh or 0))
+        actual_price = max(0.0, float(actual_price_chf_per_kwh or 0))
+        baseline_price = max(0.0, float(baseline_price_chf_per_kwh or 0))
+        savings = max(0.0, energy_kwh * (baseline_price - actual_price))
+        if str(source).lower() == "pv":
+            learned["pv_runs"] = int(learned.get("pv_runs", 0) or 0) + 1
+            learned["pv_kwh"] = float(learned.get("pv_kwh", 0.0) or 0.0) + energy_kwh
+        else:
+            learned["grid_runs"] = int(learned.get("grid_runs", 0) or 0) + 1
+            learned["grid_kwh"] = float(learned.get("grid_kwh", 0.0) or 0.0) + energy_kwh
+        learned["total_savings_chf"] = float(learned.get("total_savings_chf", 0.0) or 0.0) + savings
+        self.consumer_learning[key] = learned
+        self.dirty = True
 
     def get_consumer_learning(self, consumer_id: str) -> dict[str, Any]:
         learned = dict(self.consumer_learning.get(str(consumer_id), {}) or {})

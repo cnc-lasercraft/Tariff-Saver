@@ -6,11 +6,13 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CONSUMPTION_ENERGY_ENTITY,
+    CONF_SEASON_ENTITY,
     CONF_PUBLISH_TIME,
     DEFAULT_PUBLISH_TIME,
     DOMAIN,
@@ -52,6 +54,36 @@ def _next_local_midnight(now_local: datetime) -> datetime:
     )
 
 
+
+def _get_season(hass, entry) -> str:
+    """Get current season from configured entity or derive from date."""
+    from .const import CONF_SEASON_ENTITY
+    season_entity = str(
+        entry.options.get(CONF_SEASON_ENTITY, entry.data.get(CONF_SEASON_ENTITY, "")) or ""
+    ).strip()
+    if season_entity:
+        state = hass.states.get(season_entity)
+        if state and state.state not in ("unavailable", "unknown", ""):
+            return state.state
+    # Fallback: derive from month
+    month = dt_util.now().month
+    if month in (12, 1, 2):
+        return "Winter"
+    elif month in (3, 4, 5):
+        return "Frühling"
+    elif month in (6, 7, 8):
+        return "Sommer"
+    else:
+        return "Herbst"
+
+
+def _get_consumption_entity(entry) -> str:
+    """Get configured consumption energy entity."""
+    return str(
+        entry.options.get(CONF_CONSUMPTION_ENERGY_ENTITY, entry.data.get(CONF_CONSUMPTION_ENERGY_ENTITY, "")) or ""
+    ).strip()
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tariff Saver from a config entry."""
     hass.data.setdefault(DOMAIN, {})
@@ -60,6 +92,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     config.update(dict(entry.options))
 
     coordinator = TariffSaverCoordinator(hass, config=config)
+    coordinator.entry = entry
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     publish_time = config.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME)
@@ -67,6 +100,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     retry_state_key = f"{entry.entry_id}_retry_until"
     hass.data[DOMAIN][retry_state_key] = None
+
+    # Listen for EKZ Tariff validated data signal
+    async def _on_ekz_new_data(data: dict) -> None:
+        """EKZ Tariff has validated new data — force refresh."""
+        _LOGGER.info("Received ekz_tariff_new_data signal: %s", data)
+        coordinator._last_fetch_date = None
+        await coordinator.async_request_refresh()
+
+    hass.data[DOMAIN][f"{entry.entry_id}_unsub_ekz_signal"] = async_dispatcher_connect(
+        hass, "ekz_tariff_new_data", _on_ekz_new_data
+    )
 
     async def _reset_energy_baseline_service(call: ServiceCall) -> None:
         clear_booked = bool(call.data.get("clear_booked", True))
@@ -130,6 +174,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 continue
 
             store.set_consumer_last_run(str(slot), dt_util.utcnow())
+
+            energy_kwh = call.data.get("energy_kwh")
+            source = call.data.get("source")
+            actual_price = call.data.get("actual_price_chf_per_kwh")
+            baseline_price = call.data.get("baseline_price_chf_per_kwh")
+            if (
+                energy_kwh is not None
+                and source is not None
+                and actual_price is not None
+                and baseline_price is not None
+                and hasattr(store, "record_consumer_efficiency")
+            ):
+                try:
+                    store.record_consumer_efficiency(
+                        str(slot),
+                        energy_kwh=float(energy_kwh),
+                        source=str(source),
+                        actual_price_chf_per_kwh=float(actual_price),
+                        baseline_price_chf_per_kwh=float(baseline_price),
+                    )
+                except Exception:
+                    pass
+
             await store.async_save()
             try:
                 await coord.async_request_refresh()
@@ -143,6 +210,59 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     service_name = "mark_consumer_run"
     if not hass.services.has_service(DOMAIN, service_name):
         hass.services.async_register(DOMAIN, service_name, _mark_consumer_run_service)
+
+    async def _update_consumer_service(call: ServiceCall) -> None:
+        slot = int(call.data.get("slot", 0))
+        key = str(call.data.get("key", ""))
+        value = call.data.get("value")
+        if slot < 1 or slot > 10 or not key:
+            return
+
+        # Type conversion
+        if key in ("enabled", "pv_required", "tariff_only", "pv_opportunist", "learning_enabled", "min_runtime_minutes"):
+            value = bool(value)
+        elif key in ("power_kw", "energy_kwh"):
+            value = float(value or 0)
+        elif key in ("duration_minutes", "priority", "max_grid_score", "min_days", "max_days"):
+            value = int(value or 0)
+        else:
+            value = str(value or "")
+
+        new_options = dict(entry.options)
+        consumers = dict(new_options.get("consumers", {}))
+        consumer = dict(consumers.get(str(slot), {}))
+        consumer[key] = value
+        consumers[str(slot)] = consumer
+        new_options["consumers"] = consumers
+
+        hass.config_entries.async_update_entry(entry, options=new_options)
+        # Fire state update for config sensor immediately, defer full recalculation
+        coordinator.async_set_updated_data(coordinator.data)
+
+    async def _update_setting_service(call: ServiceCall) -> None:
+        key = str(call.data.get("key", ""))
+        value = call.data.get("value")
+        if not key or key == "consumers":
+            return
+        # Type conversion
+        if key in ("battery_enabled", "heating_enabled"):
+            value = bool(value)
+        elif key in ("feed_in_fixed_price", "battery_capacity_kwh", "battery_min_soc_percent", "ampel_pv_threshold_kw", "heating_wp_power_kw", "heating_comfort_min", "heating_pv_max", "heating_max_score", "heating_pv_wait_minutes", "heating_wp_min_runtime"):
+            value = float(value or 0)
+        else:
+            value = str(value or "")
+        new_options = dict(entry.options)
+        new_options[key] = value
+        hass.config_entries.async_update_entry(entry, options=new_options)
+        coordinator.async_set_updated_data(coordinator.data)
+
+    service_name = "update_setting"
+    if not hass.services.has_service(DOMAIN, service_name):
+        hass.services.async_register(DOMAIN, service_name, _update_setting_service)
+
+    service_name = "update_consumer"
+    if not hass.services.has_service(DOMAIN, service_name):
+        hass.services.async_register(DOMAIN, service_name, _update_consumer_service)
 
     async def _force_refresh() -> None:
         coordinator._last_fetch_date = None
@@ -175,6 +295,185 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, _retry_tick, RETRY_INTERVAL
     )
 
+    async def _daily_base_load_snapshot(now) -> None:
+        store = getattr(coordinator, "store", None)
+        if store is None:
+            return
+        consumption_entity = _get_consumption_entity(entry)
+        if not consumption_entity:
+            return
+        consumption_state = hass.states.get(consumption_entity)
+        if consumption_state is None:
+            return
+        try:
+            total_kwh = float(consumption_state.state)
+        except (ValueError, TypeError):
+            return
+        season = _get_season(hass, entry)
+        today_str = dt_util.now().date().isoformat()
+
+        # Record final reading and compile 30-min profile
+        now_local = dt_util.now()
+        slot_minute = 0 if now_local.minute < 30 else 30
+        slot_start = now_local.replace(minute=slot_minute, second=0, microsecond=0)
+        slot_iso = slot_start.isoformat()
+        store.record_consumption_slot(slot_iso, total_kwh)
+
+        # Final consumer measurement readings
+        from .consumer_helpers import get_consumer_config
+        from .const import CONSUMER_COUNT
+        for slot in range(1, CONSUMER_COUNT + 1):
+            cfg = get_consumer_config(entry, slot)
+            if not cfg.enabled or not cfg.measurement_entity:
+                continue
+            meas_state = hass.states.get(cfg.measurement_entity)
+            if meas_state is None:
+                continue
+            try:
+                meas_kwh = float(meas_state.state)
+            except (ValueError, TypeError):
+                continue
+            store.record_consumer_slot(cfg.measurement_entity, slot_iso, meas_kwh)
+
+        profile = store.compile_load_profile(today_str, season)
+        store.clear_consumption_slot_buffer()
+
+        # Calculate daily totals from the compiled profile (not from the raw sensor)
+        if profile:
+            daily_total_kwh = float(profile.get("total_kwh", 0.0))
+            consumer_kwh = float(profile.get("consumer_kwh", 0.0))
+            base_load_kwh = float(profile.get("base_kwh", 0.0))
+        else:
+            consumer_kwh = store.compute_consumer_kwh_today()
+            daily_total_kwh = 0.0
+            base_load_kwh = 0.0
+
+        store.add_base_load_daily(today_str, daily_total_kwh, consumer_kwh, base_load_kwh, season)
+        await store.async_save()
+
+    async def _consumption_slot_tick(now) -> None:
+        """Sample consumption + consumer measurement sensors every 30 minutes."""
+        store = getattr(coordinator, "store", None)
+        if store is None:
+            return
+        consumption_entity = _get_consumption_entity(entry)
+        if not consumption_entity:
+            return
+        consumption_state = hass.states.get(consumption_entity)
+        if consumption_state is None:
+            return
+        try:
+            total_kwh = float(consumption_state.state)
+        except (ValueError, TypeError):
+            return
+        now_local = dt_util.now()
+        slot_minute = 0 if now_local.minute < 30 else 30
+        slot_start = now_local.replace(minute=slot_minute, second=0, microsecond=0)
+        slot_iso = slot_start.isoformat()
+        store.record_consumption_slot(slot_iso, total_kwh)
+
+        # Sample all consumer measurement entities
+        from .consumer_helpers import get_consumer_config
+        from .const import CONSUMER_COUNT
+        for slot in range(1, CONSUMER_COUNT + 1):
+            cfg = get_consumer_config(entry, slot)
+            if not cfg.enabled or not cfg.measurement_entity:
+                continue
+            meas_state = hass.states.get(cfg.measurement_entity)
+            if meas_state is None:
+                continue
+            try:
+                meas_kwh = float(meas_state.state)
+            except (ValueError, TypeError):
+                continue
+            store.record_consumer_slot(cfg.measurement_entity, slot_iso, meas_kwh)
+
+        await store.async_save()
+
+    # Create WP Sperre input_boolean if not exists
+    if not hass.states.get("input_boolean.tariff_saver_wp_sperre"):
+        try:
+            await hass.services.async_call(
+                "input_boolean", "create", {}, blocking=False
+            )
+        except Exception:
+            pass
+        # Use the helper API to create it
+        from homeassistant.helpers import entity_registry as er
+        from homeassistant.components.input_boolean import DOMAIN as IB_DOMAIN
+        try:
+            current = await hass.helpers.storage.Store(1, "input_boolean").async_load() or {}
+            items = current.get("items") or []
+            if not any(item.get("id") == "tariff_saver_wp_sperre" for item in items):
+                items.append({
+                    "id": "tariff_saver_wp_sperre",
+                    "name": "Tariff Saver WP Sperre",
+                    "icon": "mdi:hand-back-right",
+                })
+                current["items"] = items
+                store = hass.helpers.storage.Store(1, "input_boolean")
+                await store.async_save(current)
+                _LOGGER.info("Created input_boolean.tariff_saver_wp_sperre")
+        except Exception as ex:
+            _LOGGER.debug("Could not create WP Sperre helper: %s", ex)
+
+    hass.data[DOMAIN][entry.entry_id + "_unsub_base_load"] = async_track_time_change(
+        hass, _daily_base_load_snapshot, hour=23, minute=55, second=0
+    )
+    hass.data[DOMAIN][entry.entry_id + "_unsub_consumption_tick"] = async_track_time_interval(
+        hass, _consumption_slot_tick, timedelta(minutes=30)
+    )
+
+    async def _heating_tick(now) -> None:
+        """Check heating state every 5 minutes."""
+        from .heating import async_heating_tick
+        try:
+            await async_heating_tick(hass, entry, coordinator)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Heating tick failed")
+
+    hass.data[DOMAIN][entry.entry_id + "_unsub_heating_tick"] = async_track_time_interval(
+        hass, _heating_tick, timedelta(minutes=5)
+    )
+
+
+    # Midnight refresh removed — plans are persisted and only recomputed
+    # when new tariff data is published (18:15).
+
+    async def handle_clear_activity_log(call) -> None:
+        store = getattr(coordinator, "store", None)
+        if store:
+            store.activity_log = []
+            store.dirty = True
+            await store.async_save()
+            # Force sensor update by firing event
+            hass.bus.async_fire(f"{DOMAIN}_activity_log_updated")
+
+    async def handle_delete_activity_log_entry(call) -> None:
+        store = getattr(coordinator, "store", None)
+        if store:
+            index = int(call.data.get("index", -1))
+            if 0 <= index < len(store.activity_log):
+                store.activity_log.pop(index)
+                store.dirty = True
+                await store.async_save()
+                # Force sensor update by firing event
+                hass.bus.async_fire(f"{DOMAIN}_activity_log_updated")
+
+    async def handle_add_activity_log_entry(call) -> None:
+        store = getattr(coordinator, "store", None)
+        if store:
+            icon = str(call.data.get("icon", "ℹ️"))
+            msg = str(call.data.get("msg", "Test"))
+            store.log_activity(icon, msg)
+            await store.async_save()
+            hass.bus.async_fire(f"{DOMAIN}_activity_log_updated")
+
+    hass.services.async_register(DOMAIN, "add_activity_log_entry", handle_add_activity_log_entry)
+    hass.services.async_register(DOMAIN, "clear_activity_log", handle_clear_activity_log)
+    hass.services.async_register(DOMAIN, "delete_activity_log_entry", handle_delete_activity_log_entry)
+
     await coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -184,7 +483,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    for suffix in ("_unsub_daily", "_unsub_retry", "_unsub_energy_cost", "_unsub_energy_tick", "_unsub_consumer_tick"):
+    for suffix in ("_unsub_daily", "_unsub_retry", "_unsub_energy_cost", "_unsub_energy_tick", "_unsub_consumer_tick", "_unsub_base_load", "_unsub_consumption_tick", "_unsub_ekz_signal"):
         unsub = hass.data.get(DOMAIN, {}).pop(entry.entry_id + suffix, None)
         if unsub:
             unsub()

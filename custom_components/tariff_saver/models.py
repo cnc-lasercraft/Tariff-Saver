@@ -52,6 +52,10 @@ class ConsumerConfig:
     learning_enabled: bool = True
     min_days: int = 0
     max_days: int = 0
+    max_grid_score: int = 100
+    tariff_only: bool = False
+    pv_opportunist: bool = False
+    min_runtime_minutes: int = 0
 
     @property
     def configured_name(self) -> str:

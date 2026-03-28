@@ -17,7 +17,9 @@ from .const import (
     CONF_CONSUMERS,
     CONF_CONSUMER_MAX_DAYS,
     CONF_CONSUMER_MIN_DAYS,
+    CONF_BATTERY_SOC_MARGIN,
     CONF_CONSUMPTION_ENERGY_ENTITY,
+    CONF_SEASON_ENTITY,
     CONF_EKZ_ENTRY_ID,
     CONF_FEED_IN_FIXED_PRICE,
     CONF_FEED_IN_PRICE_ENTITY,
@@ -81,6 +83,8 @@ def _consumer_defaults(slot: int, source: dict[str, Any] | None = None) -> dict[
         "learning_enabled": bool(source.get("learning_enabled", True)),
         "min_days": int(source.get("min_days", DEFAULT_CONSUMER10_MIN_DAYS if slot == CONSUMER_COUNT else 0) or (DEFAULT_CONSUMER10_MIN_DAYS if slot == CONSUMER_COUNT else 0)),
         "max_days": int(source.get("max_days", DEFAULT_CONSUMER10_MAX_DAYS if slot == CONSUMER_COUNT else 0) or (DEFAULT_CONSUMER10_MAX_DAYS if slot == CONSUMER_COUNT else 0)),
+        "max_grid_score": max(0, min(100, int(source.get("max_grid_score", 100) or 100))),
+        "tariff_only": bool(source.get("tariff_only", False)),
         "slot": slot,
     }
 
@@ -143,16 +147,28 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 merged[CONF_PUBLISH_TIME] = str(
                     user_input.get(CONF_PUBLISH_TIME, DEFAULT_PUBLISH_TIME) or DEFAULT_PUBLISH_TIME
                 ).strip()
+                merged[CONF_SEASON_ENTITY] = str(user_input.get(CONF_SEASON_ENTITY, "") or "").strip()
                 merged[CONF_CONSUMERS] = dict(opts.get(CONF_CONSUMERS, {}))
                 return self.async_create_entry(title="", data=merged)
 
         schema = vol.Schema(
             {
                 vol.Optional(
-                    CONF_CONSUMPTION_ENERGY_ENTITY,
+                    CONF_BATTERY_SOC_MARGIN,
+    CONF_CONSUMPTION_ENERGY_ENTITY,
+    CONF_SEASON_ENTITY,
                     default=(user_input or {}).get(
-                        CONF_CONSUMPTION_ENERGY_ENTITY,
+                        CONF_BATTERY_SOC_MARGIN,
+    CONF_CONSUMPTION_ENERGY_ENTITY,
+    CONF_SEASON_ENTITY,
                         opts.get(CONF_CONSUMPTION_ENERGY_ENTITY, data.get(CONF_CONSUMPTION_ENERGY_ENTITY, "")),
+                    ),
+                ): _sensor_entity_selector(),
+                vol.Optional(
+                    CONF_SEASON_ENTITY,
+                    default=(user_input or {}).get(
+                        CONF_SEASON_ENTITY,
+                        opts.get(CONF_SEASON_ENTITY, data.get(CONF_SEASON_ENTITY, "")),
                     ),
                 ): _sensor_entity_selector(),
                 vol.Optional(
@@ -288,6 +304,8 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional("priority", default=int((user_input or {}).get("priority", current["priority"]))): vol.Coerce(int),
                 vol.Optional("pv_required", default=(user_input or {}).get("pv_required", current["pv_required"])): bool,
                 vol.Optional("learning_enabled", default=(user_input or {}).get("learning_enabled", current["learning_enabled"])): bool,
+                vol.Optional("tariff_only", default=(user_input or {}).get("tariff_only", current.get("tariff_only", False))): bool,
+                vol.Optional("max_grid_score", default=int((user_input or {}).get("max_grid_score", current.get("max_grid_score", 100)))): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
                 **({
                     vol.Optional(CONF_CONSUMER_MIN_DAYS, default=int((user_input or {}).get(CONF_CONSUMER_MIN_DAYS, current["min_days"]))): vol.Coerce(int),
                     vol.Optional(CONF_CONSUMER_MAX_DAYS, default=int((user_input or {}).get(CONF_CONSUMER_MAX_DAYS, current["max_days"]))): vol.Coerce(int),

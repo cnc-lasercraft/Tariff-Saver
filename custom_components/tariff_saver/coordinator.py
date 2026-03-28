@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -21,6 +21,7 @@ from .const import (
     FEED_IN_PRICE_MODE_ENTITY,
     DOMAIN,
 )
+from .consumer_helpers import build_all_consumer_plans
 from .storage import TariffSaverStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.linking_url: str | None = None
         self.last_api_success_utc: datetime | None = None
 
-        super().__init__(hass, _LOGGER, name="Tariff Saver", update_interval=None)
+        super().__init__(hass, _LOGGER, name="Tariff Saver", update_interval=timedelta(minutes=15))
 
     async def _async_update_data(self) -> dict[str, Any]:
         if self.store is None:
@@ -151,7 +152,11 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await self.store.async_load()
                     break
 
-        today = dt_util.now().date()
+        now_local = dt_util.now()
+        today = now_local.date()
+        tomorrow = today + timedelta(days=1)
+
+        # Once per day fetch; EKZ signal resets _last_fetch_date to force re-fetch
         if self._last_fetch_date == today and self.data:
             return self.data
 
@@ -184,6 +189,13 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.store.trim_price_slots(keep_days=7)
 
         stats = self._compute_daily_stats(active_30m, baseline_30m)
+
+        # Update historical min/max prices
+        if self.store is not None:
+            all_prices = [_slot_total_price(s.components_chf_per_kwh) for s in active_30m]
+            self.store.update_historical_prices(all_prices)
+            if self.store.dirty:
+                self.hass.async_create_task(self.store.async_save())
         feed_in_price = self._get_feed_in_price()
 
         if self.store is not None:
@@ -197,6 +209,88 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         windows = self._compute_best_windows(active_30m)
         self._last_fetch_date = today
+
+        # ── Consumer Plans: einmal berechnen, stabil speichern ──
+        # Plans werden für ein bestimmtes Tarif-Datum berechnet und wiederverwendet.
+        # Neue Berechnung NUR wenn Tarife für einen neuen Tag eintreffen.
+        consumer_plans: dict = {}
+
+        # Tarif-Datum bestimmen: welchen Tag decken die Slots ab?
+        slot_dates = [dt_util.as_local(s.start).date() for s in active_30m]
+        from collections import Counter
+        tariff_date = str(Counter(slot_dates).most_common(1)[0][0]) if slot_dates else str(today)
+
+        if self.store is not None and self.store.consumer_plans and self.store.plans_tariff_date == tariff_date:
+            # Plans für dieses Tarif-Datum vorhanden — laden, nicht neu berechnen
+            consumer_plans = {
+                int(k) if str(k).isdigit() else k: v
+                for k, v in self.store.consumer_plans.items()
+            }
+            _LOGGER.info("Plans geladen für %s", tariff_date)
+        elif hasattr(self, "entry"):
+            # Keine Plans für dieses Datum — neu berechnen
+            tariff_date_fmt = dt_util.parse_date(tariff_date).strftime("%d.%m.%Y") if dt_util.parse_date(tariff_date) else tariff_date
+            try:
+                consumer_plans = build_all_consumer_plans(
+                    hass=self.hass,
+                    entry=self.entry,
+                    active_slots=active_30m,
+                    store=self.store,
+                )
+                # Persist plans
+                if self.store is not None:
+                    serializable = {}
+                    for slot, plan in consumer_plans.items():
+                        sp = dict(plan)
+                        for k in ("start", "end", "chosen_start", "chosen_end", "tariff_window_start", "tariff_window_end"):
+                            v = sp.get(k)
+                            if hasattr(v, "isoformat"):
+                                sp[k] = v.isoformat()
+                        serializable[slot] = sp
+                    self.store.consumer_plans = serializable
+                    self.store.plans_tariff_date = tariff_date
+                    self.store.dirty = True
+
+                _LOGGER.info("Slots für %s berechnet", tariff_date_fmt)
+                self.store.log_activity("📅", f"Slots für {tariff_date_fmt} berechnet")
+
+                # Log geplante Consumer
+                from .consumer_helpers import get_consumer_config
+                for _slot, _plan in consumer_plans.items():
+                    _status = _plan.get("status", "")
+                    _source = _plan.get("source", "")
+                    _start = _plan.get("start") or _plan.get("chosen_start")
+                    _end = _plan.get("end") or _plan.get("chosen_end")
+                    try:
+                        _cfg = get_consumer_config(self.entry, int(_slot))
+                        _name = _cfg.configured_name
+                    except Exception:
+                        _name = f"Consumer {_slot}"
+                    if _status == "planned" and _start:
+                        _time_str = ""
+                        try:
+                            _s = dt_util.parse_datetime(str(_start))
+                            _e = dt_util.parse_datetime(str(_end)) if _end else None
+                            if _s:
+                                _time_str = dt_util.as_local(_s).strftime("%H:%M")
+                                if _e:
+                                    _time_str += "-" + dt_util.as_local(_e).strftime("%H:%M")
+                        except Exception:
+                            pass
+                        _price = _plan.get("avg_price_chf_per_kwh") or _plan.get("tariff_avg_price_chf_per_kwh")
+                        _detail = f"{_source}"
+                        if _price and isinstance(_price, (int, float)):
+                            _detail += f" {round(_price * 100, 1)} Rp"
+                        self.store.log_activity("\U0001f4cb", f"{_name} geplant ({_detail} {_time_str})")
+            except Exception as _err:
+                _LOGGER.error("Consumer-Plan-Berechnung fehlgeschlagen: %s", _err)
+        else:
+            if self.store is not None and self.store.plans_tariff_date:
+                _LOGGER.error(
+                    "Keine Plans für heute (%s)! Gespeicherte Plans sind für %s.",
+                    tariff_date, self.store.plans_tariff_date,
+                )
+
         return {
             "active": active_30m,
             "baseline": baseline_30m,
@@ -215,6 +309,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "active_publication_timestamp": provider_data.get("active_publication_timestamp"),
                 "baseline_publication_timestamp": provider_data.get("baseline_publication_timestamp"),
             },
+            "consumer_plans": consumer_plans,
         }
 
     def _get_provider_data(self) -> dict[str, Any]:
@@ -268,13 +363,18 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     def _compute_daily_stats(self, active: list[PriceSlot], baseline: list[PriceSlot]) -> dict[str, Any]:
-        active_map = {s.start: _slot_total_price(s.components_chf_per_kwh) for s in active}
+        # Filter to today only for daily averages/scores
+        today_local = dt_util.now().date()
+        today_active = [s for s in active if dt_util.as_local(s.start).date() == today_local]
+        today_baseline = [s for s in baseline if dt_util.as_local(s.start).date() == today_local]
+
+        active_map = {s.start: _slot_total_price(s.components_chf_per_kwh) for s in today_active}
         active_values = [float(v) for v in active_map.values() if isinstance(v, (int, float)) and v >= 0]
 
-        baseline_by_start = {s.start: s for s in baseline}
+        baseline_by_start = {s.start: s for s in today_baseline}
         base_values = [
             float(v)
-            for v in (_slot_total_price(s.components_chf_per_kwh) for s in baseline)
+            for v in (_slot_total_price(s.components_chf_per_kwh) for s in today_baseline)
             if isinstance(v, (int, float)) and v >= 0
         ]
 
@@ -287,10 +387,11 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if current_slot is None and active:
             current_slot = active[0]
         current_price = _slot_total_price(current_slot.components_chf_per_kwh) if current_slot else None
-        current_base_slot = baseline_by_start.get(current_slot.start) if current_slot else None
+        all_baseline_map = {s.start: s for s in baseline}
+        current_base_slot = all_baseline_map.get(current_slot.start) if current_slot else None
         current_baseline = _slot_total_price(current_base_slot.components_chf_per_kwh) if current_base_slot else None
 
-        slot_day_local = dt_util.as_local(active[0].start).date() if active else None
+        slot_day_local = today_local if today_active else None
         year_prices = self.store.get_year_day_average_prices(slot_day_local) if self.store and isinstance(slot_day_local, date) else []
         year_min = min(year_prices) if year_prices else None
         year_max = max(year_prices) if year_prices else None
@@ -299,6 +400,18 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         dev_vs_baseline_percent = None
         if isinstance(current_price, (int, float)) and isinstance(current_baseline, (int, float)) and current_baseline > 0:
             dev_vs_baseline_percent = ((float(current_price) / float(current_baseline)) - 1.0) * 100.0
+
+        # Tomorrow stats (available after ~18:15 when EKZ publishes)
+        from datetime import timedelta as _td
+        tomorrow_local = today_local + _td(days=1)
+        tomorrow_active = [s for s in active if dt_util.as_local(s.start).date() == tomorrow_local]
+        tomorrow_values = [
+            float(v) for v in
+            (_slot_total_price(s.components_chf_per_kwh) for s in tomorrow_active)
+            if isinstance(v, (int, float)) and v >= 0
+        ]
+        avg_tomorrow = _avg(tomorrow_values)
+        tomorrow_score = score_from_prices(avg_tomorrow, year_min, year_max) if avg_tomorrow else None
 
         return {
             "calculated_at": dt_util.utcnow().isoformat(),
@@ -315,6 +428,9 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "year_min_day_avg_chf_per_kwh": year_min,
             "year_max_day_avg_chf_per_kwh": year_max,
             "year_day_samples": len(year_prices),
+            "tomorrow_avg_chf_per_kwh": avg_tomorrow,
+            "tomorrow_score_0_100": tomorrow_score,
+            "tomorrow_slot_count": len(tomorrow_values),
         }
 
     @staticmethod
