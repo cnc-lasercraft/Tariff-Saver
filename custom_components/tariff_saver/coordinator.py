@@ -210,86 +210,14 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         windows = self._compute_best_windows(active_30m)
         self._last_fetch_date = today
 
-        # ── Consumer Plans: einmal berechnen, stabil speichern ──
-        # Plans werden für ein bestimmtes Tarif-Datum berechnet und wiederverwendet.
-        # Neue Berechnung NUR wenn Tarife für einen neuen Tag eintreffen.
+        # ── Consumer Plans: nur aus Storage laden ──
+        # Neuberechnung erfolgt NUR über EKZ-Signal (in __init__.py _on_ekz_bus_event)
         consumer_plans: dict = {}
-
-        # Tarif-Datum bestimmen: welchen Tag decken die Slots ab?
-        slot_dates = [dt_util.as_local(s.start).date() for s in active_30m]
-        from collections import Counter
-        tariff_date = str(Counter(slot_dates).most_common(1)[0][0]) if slot_dates else str(today)
-
-        if self.store is not None and self.store.consumer_plans and self.store.plans_tariff_date == tariff_date:
-            # Plans für dieses Tarif-Datum vorhanden — laden, nicht neu berechnen
+        if self.store is not None and self.store.consumer_plans:
             consumer_plans = {
                 int(k) if str(k).isdigit() else k: v
                 for k, v in self.store.consumer_plans.items()
             }
-            _LOGGER.info("Plans geladen für %s", tariff_date)
-        elif hasattr(self, "entry"):
-            # Keine Plans für dieses Datum — neu berechnen
-            tariff_date_fmt = dt_util.parse_date(tariff_date).strftime("%d.%m.%Y") if dt_util.parse_date(tariff_date) else tariff_date
-            try:
-                consumer_plans = build_all_consumer_plans(
-                    hass=self.hass,
-                    entry=self.entry,
-                    active_slots=active_30m,
-                    store=self.store,
-                )
-                # Persist plans
-                if self.store is not None:
-                    serializable = {}
-                    for slot, plan in consumer_plans.items():
-                        sp = dict(plan)
-                        for k in ("start", "end", "chosen_start", "chosen_end", "tariff_window_start", "tariff_window_end"):
-                            v = sp.get(k)
-                            if hasattr(v, "isoformat"):
-                                sp[k] = v.isoformat()
-                        serializable[slot] = sp
-                    self.store.consumer_plans = serializable
-                    self.store.plans_tariff_date = tariff_date
-                    self.store.dirty = True
-
-                _LOGGER.info("Slots für %s berechnet", tariff_date_fmt)
-                self.store.log_activity("📅", f"Slots für {tariff_date_fmt} berechnet")
-
-                # Log geplante Consumer
-                from .consumer_helpers import get_consumer_config
-                for _slot, _plan in consumer_plans.items():
-                    _status = _plan.get("status", "")
-                    _source = _plan.get("source", "")
-                    _start = _plan.get("start") or _plan.get("chosen_start")
-                    _end = _plan.get("end") or _plan.get("chosen_end")
-                    try:
-                        _cfg = get_consumer_config(self.entry, int(_slot))
-                        _name = _cfg.configured_name
-                    except Exception:
-                        _name = f"Consumer {_slot}"
-                    if _status == "planned" and _start:
-                        _time_str = ""
-                        try:
-                            _s = dt_util.parse_datetime(str(_start))
-                            _e = dt_util.parse_datetime(str(_end)) if _end else None
-                            if _s:
-                                _time_str = dt_util.as_local(_s).strftime("%H:%M")
-                                if _e:
-                                    _time_str += "-" + dt_util.as_local(_e).strftime("%H:%M")
-                        except Exception:
-                            pass
-                        _price = _plan.get("avg_price_chf_per_kwh") or _plan.get("tariff_avg_price_chf_per_kwh")
-                        _detail = f"{_source}"
-                        if _price and isinstance(_price, (int, float)):
-                            _detail += f" {round(_price * 100, 1)} Rp"
-                        self.store.log_activity("\U0001f4cb", f"{_name} geplant ({_detail} {_time_str})")
-            except Exception as _err:
-                _LOGGER.error("Consumer-Plan-Berechnung fehlgeschlagen: %s", _err)
-        else:
-            if self.store is not None and self.store.plans_tariff_date:
-                _LOGGER.error(
-                    "Keine Plans für heute (%s)! Gespeicherte Plans sind für %s.",
-                    tariff_date, self.store.plans_tariff_date,
-                )
 
         return {
             "active": active_30m,

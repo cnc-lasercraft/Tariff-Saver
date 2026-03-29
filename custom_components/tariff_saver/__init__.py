@@ -1,8 +1,11 @@
 """Tariff Saver integration."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, time, timedelta
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, callback
@@ -101,12 +104,105 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][retry_state_key] = None
 
     # Listen for EKZ Tariff validated data via HA bus event
-    @callback
-    def _on_ekz_bus_event(event) -> None:
-        """EKZ Tariff has validated new data — schedule refresh."""
+    async def _on_ekz_bus_event(event) -> None:
+        """EKZ Tariff has validated new data — refresh and calculate plans for tomorrow."""
         _LOGGER.info("Received ekz_tariff_new_data event: %s", event.data)
+        target_date = event.data.get("date", "")
+
+        # 1. Refresh tariff data from EKZ provider
         coordinator._last_fetch_date = None
-        hass.async_create_task(coordinator.async_refresh())
+        try:
+            await coordinator.async_refresh()
+        except Exception:
+            pass
+
+        # 2. Calculate consumer plans for tomorrow
+        if not hasattr(coordinator, "entry") or coordinator.store is None:
+            _LOGGER.warning("Cannot calculate plans — entry or store not ready")
+            return
+
+        data = coordinator.data or {}
+        all_active = data.get("active", [])
+
+        # Filter slots to ONLY tomorrow's date
+        tomorrow_date = dt_util.parse_date(target_date)
+        if tomorrow_date is None:
+            tomorrow_date = (dt_util.now() + timedelta(days=1)).date()
+        active_30m = [s for s in all_active if dt_util.as_local(s.start).date() == tomorrow_date]
+        _dbg(f"step2: all_active={len(all_active)}, tomorrow_only={len(active_30m)} for {tomorrow_date}")
+        if not active_30m:
+            _dbg("step2: ABORT - no slots for tomorrow")
+            return
+
+        from .consumer_helpers import build_all_consumer_plans, get_consumer_config
+        tariff_date_fmt = target_date
+        try:
+            parsed_date = dt_util.parse_date(target_date)
+            if parsed_date:
+                tariff_date_fmt = parsed_date.strftime("%d.%m.%Y")
+        except Exception:
+            pass
+
+        try:
+            plans = build_all_consumer_plans(
+                hass=hass,
+                entry=coordinator.entry,
+                active_slots=active_30m,
+                store=coordinator.store,
+            )
+            # Persist plans
+            serializable = {}
+            for slot, plan in plans.items():
+                sp = dict(plan)
+                for k in ("start", "end", "chosen_start", "chosen_end", "tariff_window_start", "tariff_window_end"):
+                    v = sp.get(k)
+                    if hasattr(v, "isoformat"):
+                        sp[k] = v.isoformat()
+                serializable[slot] = sp
+            coordinator.store.consumer_plans = serializable
+            coordinator.store.plans_tariff_date = target_date
+            coordinator.store.dirty = True
+            await coordinator.store.async_save()
+
+            coordinator.store.log_activity("📅", f"Slots für {tariff_date_fmt} berechnet")
+
+            for _slot, _plan in plans.items():
+                _status = _plan.get("status", "")
+                _source = _plan.get("source", "")
+                _start = _plan.get("start") or _plan.get("chosen_start")
+                _end = _plan.get("end") or _plan.get("chosen_end")
+                try:
+                    _cfg = get_consumer_config(coordinator.entry, int(_slot))
+                    _name = _cfg.configured_name
+                except Exception:
+                    _name = f"Consumer {_slot}"
+                if _status == "planned" and _start:
+                    _time_str = ""
+                    try:
+                        _s = dt_util.parse_datetime(str(_start))
+                        _e = dt_util.parse_datetime(str(_end)) if _end else None
+                        if _s:
+                            _time_str = dt_util.as_local(_s).strftime("%H:%M")
+                            if _e:
+                                _time_str += "-" + dt_util.as_local(_e).strftime("%H:%M")
+                    except Exception:
+                        pass
+                    _price = _plan.get("avg_price_chf_per_kwh") or _plan.get("tariff_avg_price_chf_per_kwh")
+                    _detail = f"{_source}"
+                    if _price and isinstance(_price, (int, float)):
+                        _detail += f" {round(_price * 100, 1)} Rp"
+                    coordinator.store.log_activity("\U0001f4cb", f"{_name} geplant ({_detail} {_time_str})")
+
+            # Update coordinator data with new plans
+            updated_data = dict(coordinator.data) if coordinator.data else {}
+            updated_data["consumer_plans"] = plans
+            coordinator.async_set_updated_data(updated_data)
+            _LOGGER.info("Consumer plans calculated for %s", target_date)
+
+        except Exception as err:
+            _LOGGER.error("Consumer plan calculation failed: %s", err)
+            if coordinator.store is not None:
+                coordinator.store.log_activity("💥", f"Plan-Berechnung fehlgeschlagen: {err}")
 
     hass.data[DOMAIN][f"{entry.entry_id}_unsub_ekz_signal"] = hass.bus.async_listen(
         "ekz_tariff_new_data", _on_ekz_bus_event

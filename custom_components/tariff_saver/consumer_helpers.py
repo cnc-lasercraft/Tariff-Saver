@@ -408,13 +408,11 @@ def build_consumer_plan(
         if any(p < 0.10 for p in prices):
             continue
         avg = sum(prices) / len(prices)
-        # Skip windows where any slot exceeds max_grid_score (unless PV covers it)
-        if config.max_grid_score < 100 and price_min is not None and price_max is not None and price_max > price_min:
-            window_scores = [
-                max(0, min(100, int(round(((p - price_min) / (price_max - price_min)) * 100))))
-                for p in prices
-            ]
-            if any(s > config.max_grid_score for s in window_scores):
+        # Skip windows where any slot exceeds max_grid_score
+        if config.max_grid_score < 100:
+            from .coordinator import score_from_prices
+            window_scores = [score_from_prices(p, price_min, price_max) for p in prices]
+            if any(s is not None and s > config.max_grid_score for s in window_scores):
                 continue
         if best_tariff is None or avg < best_tariff["avg_price_chf_per_kwh"]:
             best_tariff = {
@@ -570,12 +568,9 @@ def build_consumer_plan(
                     # Skip windows where PV covers the base load
                     if _base_profile and forecast and _pv_covers_window(forecast, _base_profile, w_start, w_end):
                         continue
-                    if config.max_grid_score < 100 and price_min is not None and price_max is not None and price_max > price_min:
-                        window_scores = [
-                            max(0, min(100, int(round(((p - price_min) / (price_max - price_min)) * 100))))
-                            for p in prices
-                        ]
-                        if any(s > config.max_grid_score for s in window_scores):
+                    if config.max_grid_score < 100:
+                        window_scores = [score_from_prices(p, price_min, price_max) for p in prices]
+                        if any(s is not None and s > config.max_grid_score for s in window_scores):
                             continue
                     avg = sum(prices) / len(prices)
                     candidate = {
