@@ -658,27 +658,4 @@ def build_all_consumer_plans(
             if start_dt and end_dt:
                 claimed_windows.append((start_dt, end_dt))
 
-    # Enforce run_order: consumers with run_order > 0 must be scheduled in time order
-    # e.g. run_order=1 runs before run_order=2 (swap windows if needed)
-    ordered = [(slot, cfg, plans[slot]) for slot, cfg in consumers
-               if cfg.run_order > 0 and plans[slot].get("chosen_start")]
-    ordered.sort(key=lambda x: x[1].run_order)
-    # Collect their start times sorted chronologically
-    time_slots = sorted(
-        [(plans[slot].get("chosen_start"), plans[slot].get("chosen_end")) for slot, _, _ in ordered],
-        key=lambda t: str(t[0]),
-    )
-    # Assign earliest window to lowest run_order
-    for i, (slot, cfg, plan) in enumerate(ordered):
-        if i < len(time_slots):
-            old_start = plan.get("chosen_start")
-            new_start, new_end = time_slots[i]
-            if str(old_start) != str(new_start):
-                plans[slot]["chosen_start"] = new_start
-                plans[slot]["chosen_end"] = new_end
-                if "tariff_window_start" in plans[slot]:
-                    plans[slot]["tariff_window_start"] = new_start
-                if "tariff_window_end" in plans[slot]:
-                    plans[slot]["tariff_window_end"] = new_end
-
     return plans

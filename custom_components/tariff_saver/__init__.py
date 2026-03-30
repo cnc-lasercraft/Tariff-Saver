@@ -134,7 +134,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("No slots for tomorrow %s — skipping plan calculation", tomorrow_date)
             return
 
-        from .consumer_helpers import build_all_consumer_plans, get_consumer_config
+        from .consumer_helpers import get_consumer_config
+        from .scheduler import optimize_consumer_plans
         tariff_date_fmt = target_date
         try:
             parsed_date = dt_util.parse_date(target_date)
@@ -143,12 +144,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:
             pass
 
+        max_grid_kw = float(config.get("max_grid_power_kw", 25.0) or 25.0)
         try:
-            plans = build_all_consumer_plans(
+            plans = optimize_consumer_plans(
                 hass=hass,
                 entry=coordinator.entry,
                 active_slots=active_30m,
                 store=coordinator.store,
+                max_grid_power_kw=max_grid_kw,
             )
             # Persist plans
             serializable = {}
