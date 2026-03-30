@@ -56,6 +56,7 @@ class ConsumerConfig:
     tariff_only: bool = False
     pv_opportunist: bool = False
     min_runtime_minutes: int = 0
+    run_order: int = 0  # 0=keine Einschränkung, 1=zuerst, 2=danach, etc.
 
     @property
     def configured_name(self) -> str:

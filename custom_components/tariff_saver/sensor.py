@@ -850,6 +850,7 @@ class ConsumerConfigSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnti
                 "tariff_only": cfg.get("tariff_only", False),
                 "pv_opportunist": cfg.get("pv_opportunist", False),
                 "min_runtime_minutes": cfg.get("min_runtime_minutes", 0),
+                "run_order": cfg.get("run_order", 0),
                 "learning_enabled": cfg.get("learning_enabled", True),
                 "min_days": cfg.get("min_days", 0),
                 "max_days": cfg.get("max_days", 0),

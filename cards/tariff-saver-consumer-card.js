@@ -76,6 +76,7 @@ class TariffSaverConsumerCard extends HTMLElement {
       const measurement = c.measurement_entity || '';
       const minDays = c.min_days || 0;
       const minRuntime = c.min_runtime_minutes || 0;
+      const runOrder = c.run_order || 0;
       const maxDays = c.max_days || 0;
 
       const entity = this._hass.states[`binary_sensor.tariff_saver_consumer_${i}_should_run`];
@@ -118,6 +119,7 @@ class TariffSaverConsumerCard extends HTMLElement {
           <td class="toggle"><label class="sw"><input type="checkbox" ${pvOpp ? 'checked' : ''} data-slot="${i}" data-key="pv_opportunist"><span class="sl"></span></label></td>
           <td class="num"><input type="text" value="${minDays}-${maxDays}" data-slot="${i}" data-key="days_range" style="width:45px;text-align:center" placeholder="0-0"></td>
           <td class="num"><input type="number" value="${minRuntime}" data-slot="${i}" data-key="min_runtime_minutes" min="0" max="60" step="1" style="width:40px"></td>
+          <td class="num"><input type="number" value="${runOrder}" data-slot="${i}" data-key="run_order" min="0" max="10" step="1" style="width:50px"></td>
           <td class="meas"><input type="text" value="${this._esc(measurement)}" data-slot="${i}" data-key="measurement_entity" placeholder="—"></td>
           <td class="live">${source || '–'}</td>
           <td class="live win">${window || '–'}</td>
@@ -162,7 +164,7 @@ class TariffSaverConsumerCard extends HTMLElement {
       <ha-card>
         <h2>Consumer Konfiguration</h2>
         <table><thead><tr>
-          <th></th><th>#</th><th>An</th><th>Name</th><th>Modus</th><th>kW</th><th>Min</th><th>Prio</th><th>Score</th><th>Grid</th><th>PV-Opp</th><th>Tage</th><th>LZ</th><th>Mess-Entity</th><th>Quelle</th><th>Geplant</th>
+          <th></th><th>#</th><th>An</th><th>Name</th><th>Modus</th><th>kW</th><th>Min</th><th>Prio</th><th>Score</th><th>Grid</th><th>PV-Opp</th><th>Tage</th><th>LZ</th><th>RF</th><th>Mess-Entity</th><th>Quelle</th><th>Geplant</th>
         </tr></thead><tbody>${rows}</tbody></table>
         <div class="foot">🟢 läuft · 📋 geplant · ⏸ wartend · ⬜ aus — Änderungen werden sofort gespeichert<br>
         <b>Score</b> = Max Grid Score (nur ohne PV) · <b>Grid</b> = nur Tarif-Fenster, kein PV · <b>PV-Opp</b> = läuft immer bei PV-Überschuss · <b>Tage</b> = min-max Tage zwischen Läufen (0-0 = keine Vorgabe) · <b>LZ</b> = Min. Laufzeit in Minuten</div>
@@ -183,7 +185,7 @@ class TariffSaverConsumerCard extends HTMLElement {
       el.addEventListener('change', e => {
         e.stopPropagation();
         let v = parseFloat(e.target.value);
-        if (['duration_minutes','priority','max_grid_score','min_runtime_minutes'].includes(e.target.dataset.key)) v = Math.round(v);
+        if (['duration_minutes','priority','max_grid_score','min_runtime_minutes','run_order'].includes(e.target.dataset.key)) v = Math.round(v);
         self._save(parseInt(e.target.dataset.slot), e.target.dataset.key, v);
       });
       el.addEventListener('focus', () => { self._editing = true; });

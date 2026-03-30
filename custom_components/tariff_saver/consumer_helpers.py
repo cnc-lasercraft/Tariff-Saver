@@ -50,6 +50,7 @@ def get_consumer_config(entry: ConfigEntry, slot: int) -> ConsumerConfig:
         tariff_only=bool(raw.get("tariff_only", False)),
         pv_opportunist=bool(raw.get("pv_opportunist", False)),
         min_runtime_minutes=int(raw.get("min_runtime_minutes", 0) or 0),
+        run_order=int(raw.get("run_order", 0) or 0),
     )
 
 
@@ -630,12 +631,12 @@ def build_all_consumer_plans(
     """
     from .const import CONSUMER_COUNT
 
-    # Collect all consumers sorted by priority ascending (1 = highest priority)
+    # Collect all consumers sorted by priority descending (10 = highest priority)
     consumers: list[tuple[int, ConsumerConfig]] = []
     for slot in range(1, CONSUMER_COUNT + 1):
         config = get_consumer_config(entry, slot)
         consumers.append((slot, config))
-    consumers.sort(key=lambda x: (not x[1].enabled, x[1].priority))
+    consumers.sort(key=lambda x: (not x[1].enabled, -x[1].priority))
 
     claimed_windows: list[tuple] = []
     plans: dict[int, dict[str, Any]] = {}
@@ -656,5 +657,28 @@ def build_all_consumer_plans(
             end_dt = dt_util.parse_datetime(str(chosen_end))
             if start_dt and end_dt:
                 claimed_windows.append((start_dt, end_dt))
+
+    # Enforce run_order: consumers with run_order > 0 must be scheduled in time order
+    # e.g. run_order=1 runs before run_order=2 (swap windows if needed)
+    ordered = [(slot, cfg, plans[slot]) for slot, cfg in consumers
+               if cfg.run_order > 0 and plans[slot].get("chosen_start")]
+    ordered.sort(key=lambda x: x[1].run_order)
+    # Collect their start times sorted chronologically
+    time_slots = sorted(
+        [(plans[slot].get("chosen_start"), plans[slot].get("chosen_end")) for slot, _, _ in ordered],
+        key=lambda t: str(t[0]),
+    )
+    # Assign earliest window to lowest run_order
+    for i, (slot, cfg, plan) in enumerate(ordered):
+        if i < len(time_slots):
+            old_start = plan.get("chosen_start")
+            new_start, new_end = time_slots[i]
+            if str(old_start) != str(new_start):
+                plans[slot]["chosen_start"] = new_start
+                plans[slot]["chosen_end"] = new_end
+                if "tariff_window_start" in plans[slot]:
+                    plans[slot]["tariff_window_start"] = new_start
+                if "tariff_window_end" in plans[slot]:
+                    plans[slot]["tariff_window_end"] = new_end
 
     return plans
