@@ -129,9 +129,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if tomorrow_date is None:
             tomorrow_date = (dt_util.now() + timedelta(days=1)).date()
         active_30m = [s for s in all_active if dt_util.as_local(s.start).date() == tomorrow_date]
-        _dbg(f"step2: all_active={len(all_active)}, tomorrow_only={len(active_30m)} for {tomorrow_date}")
+        _LOGGER.info("Plan calculation: %d total slots, %d for %s", len(all_active), len(active_30m), tomorrow_date)
         if not active_30m:
-            _dbg("step2: ABORT - no slots for tomorrow")
+            _LOGGER.warning("No slots for tomorrow %s — skipping plan calculation", tomorrow_date)
             return
 
         from .consumer_helpers import build_all_consumer_plans, get_consumer_config
