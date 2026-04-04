@@ -56,6 +56,7 @@ class TariffSaverStore:
         self.activity_log: list[dict] = []
         self.consumer_plans: dict = {}
         self.plans_tariff_date: str | None = None
+        self.battery_stats: dict[str, dict[str, Any]] = {}  # keyed by date "YYYY-MM-DD"
         self.dirty: bool = False
 
     async def _async_migrate(self, old_version: int, old_minor_version: int, old_data: dict) -> dict:
@@ -123,6 +124,11 @@ class TariffSaverStore:
             for k, v in (data.get("consumer_learning") or {}).items()
             if isinstance(v, dict)
         }
+        self.battery_stats = {
+            str(k): dict(v)
+            for k, v in (data.get("battery_stats") or {}).items()
+            if isinstance(v, dict)
+        }
         self.consumer_runs = {
             str(k): dict(v)
             for k, v in (data.get("consumer_runs") or {}).items()
@@ -172,6 +178,7 @@ class TariffSaverStore:
             "last_api_success_utc": self.last_api_success_utc.isoformat() if self.last_api_success_utc else None,
             "energy_baseline_kwh": self.energy_baseline_kwh,
             "energy_baseline_timestamp_utc": self.energy_baseline_timestamp_utc.isoformat() if self.energy_baseline_timestamp_utc else None,
+            "battery_stats": self.battery_stats,
         }
 
     def set_last_api_success(self, when_utc: datetime) -> None:
@@ -607,10 +614,10 @@ class TariffSaverStore:
         return self._breakdown_between(start, end)
 
 
-    def update_historical_prices(self, prices: list) -> None:
+    def update_historical_prices(self, prices: list, min_valid: float = 0.05, max_valid: float = 1.00) -> None:
         changed = False
         for p in prices:
-            if isinstance(p, (int, float)) and p > 0.15:
+            if isinstance(p, (int, float)) and min_valid <= float(p) <= max_valid:
                 if float(p) < self.historical_price_min:
                     self.historical_price_min = round(float(p), 6)
                     changed = True
@@ -630,6 +637,62 @@ class TariffSaverStore:
         self.activity_log.insert(0, entry)
         self.activity_log = self.activity_log[:30]  # keep last 30
         self.dirty = True
+
+    def record_battery_event(self, event_type: str, kwh: float = 0.0, cost_chf: float = 0.0, avg_price: float = 0.0, case: str = "") -> None:
+        """Record a battery management event for daily statistics.
+
+        event_type: 'grid_charge', 'hold', 'case'
+        """
+        from homeassistant.util import dt as dt_util
+        today = dt_util.now().strftime("%Y-%m-%d")
+        if today not in self.battery_stats:
+            self.battery_stats[today] = {
+                "grid_charge_kwh": 0.0,
+                "grid_charge_cost_chf": 0.0,
+                "grid_charge_avg_price": 0.0,
+                "hold_minutes": 0,
+                "hold_saved_kwh": 0.0,
+                "case": "",
+                "events": [],
+            }
+        stats = self.battery_stats[today]
+
+        if event_type == "grid_charge":
+            stats["grid_charge_kwh"] = round(stats["grid_charge_kwh"] + kwh, 2)
+            stats["grid_charge_cost_chf"] = round(stats["grid_charge_cost_chf"] + cost_chf, 4)
+            if kwh > 0:
+                total_kwh = stats["grid_charge_kwh"]
+                total_cost = stats["grid_charge_cost_chf"]
+                stats["grid_charge_avg_price"] = round(total_cost / total_kwh, 4) if total_kwh > 0 else 0.0
+        elif event_type == "hold":
+            stats["hold_minutes"] += 5  # each tick = 5 min
+            stats["hold_saved_kwh"] = round(stats["hold_saved_kwh"] + kwh, 2)
+        elif event_type == "case":
+            stats["case"] = case
+
+        ts = dt_util.now().strftime("%H:%M")
+        stats["events"].append(f"{ts} {event_type}")
+        stats["events"] = stats["events"][-50:]  # keep last 50
+
+        # Cleanup: keep only last 30 days
+        cutoff = (dt_util.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        self.battery_stats = {k: v for k, v in self.battery_stats.items() if k >= cutoff}
+        self.dirty = True
+
+    def get_battery_stats_summary(self) -> dict:
+        """Return summary of battery stats for the last 30 days."""
+        if not self.battery_stats:
+            return {"days": 0, "total_grid_kwh": 0.0, "total_grid_cost": 0.0, "avg_price": 0.0, "total_hold_min": 0}
+        total_kwh = sum(d.get("grid_charge_kwh", 0) for d in self.battery_stats.values())
+        total_cost = sum(d.get("grid_charge_cost_chf", 0) for d in self.battery_stats.values())
+        total_hold = sum(d.get("hold_minutes", 0) for d in self.battery_stats.values())
+        return {
+            "days": len(self.battery_stats),
+            "total_grid_kwh": round(total_kwh, 1),
+            "total_grid_cost": round(total_cost, 2),
+            "avg_price": round(total_cost / total_kwh, 4) if total_kwh > 0 else 0.0,
+            "total_hold_min": total_hold,
+        }
 
     def record_consumer_slot(self, entity_id: str, slot_start_iso: str, cumulative_kwh: float) -> None:
         if entity_id not in self.consumer_slot_buffers:

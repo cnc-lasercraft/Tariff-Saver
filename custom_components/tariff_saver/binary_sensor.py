@@ -34,10 +34,11 @@ async def async_setup_entry(
     coordinator: TariffSaverCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities = [TariffSaverConsumerShouldRunBinarySensor(coordinator, entry, slot) for slot in range(1, CONSUMER_COUNT + 1)]
     entities.append(TariffSaverTomorrowAvailableBinarySensor(coordinator, entry))
+    entities.append(TariffSaverStromSparenBinarySensor(coordinator, entry))
     async_add_entities(entities, update_before_add=True)
 
 class TariffSaverTomorrowAvailableBinarySensor(CoordinatorEntity[TariffSaverCoordinator], BinarySensorEntity):
-    """On when tomorrow's tariff data is available (>= 24 slots)."""
+    """On when tomorrow's tariff data is available (>= 24 slots) AND validated."""
 
     _attr_has_entity_name = True
     _attr_name = "Tomorrow available"
@@ -52,7 +53,130 @@ class TariffSaverTomorrowAvailableBinarySensor(CoordinatorEntity[TariffSaverCoor
     def is_on(self) -> bool:
         data = self.coordinator.data or {}
         stats = data.get("stats", {}) if isinstance(data, dict) else {}
-        return int(stats.get("tomorrow_slot_count", 0) or 0) >= 24
+        has_slots = int(stats.get("tomorrow_slot_count", 0) or 0) >= 24
+        is_valid = stats.get("tomorrow_data_valid", True)
+        return has_slots and is_valid
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        stats = data.get("stats", {}) if isinstance(data, dict) else {}
+        return {
+            "tomorrow_slot_count": stats.get("tomorrow_slot_count", 0),
+            "tomorrow_data_valid": stats.get("tomorrow_data_valid"),
+            "tomorrow_validity_error": stats.get("tomorrow_validity_error"),
+            "tomorrow_validity_details": stats.get("tomorrow_validity_details"),
+        }
+
+
+class TariffSaverStromSparenBinarySensor(CoordinatorEntity[TariffSaverCoordinator], BinarySensorEntity):
+    """On when current score exceeds the configured threshold — non-essential devices should be turned off."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Strom sparen"
+    _attr_icon = "mdi:power-plug-off"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_strom_sparen"
+        self._attr_device_info = _device_info(entry)
+        self._prev_is_on: bool | None = None
+
+    def _get_threshold(self) -> int:
+        from .const import CONF_STROM_SPAREN_SCORE, DEFAULT_STROM_SPAREN_SCORE
+        return int(float(
+            self._entry.options.get(CONF_STROM_SPAREN_SCORE,
+                self._entry.data.get(CONF_STROM_SPAREN_SCORE, DEFAULT_STROM_SPAREN_SCORE))
+            or DEFAULT_STROM_SPAREN_SCORE
+        ))
+
+    def _grid_needed(self) -> bool:
+        """Check if grid power is needed — False if PV surplus or battery covers demand until PV."""
+        from .const import (
+            CONF_PV_SURPLUS_ENTITY, CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD,
+        )
+        config = self._entry.options if self._entry.options else self._entry.data
+
+        # 1. PV surplus right now → no grid needed
+        pv_surplus_entity = str(config.get(CONF_PV_SURPLUS_ENTITY, "") or "").strip()
+        pv_threshold = float(config.get(CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD) or DEFAULT_AMPEL_PV_THRESHOLD)
+        if pv_surplus_entity:
+            pv_state = self.hass.states.get(pv_surplus_entity)
+            if pv_state and pv_state.state not in ("unavailable", "unknown", ""):
+                try:
+                    val = float(pv_state.state)
+                    pv_kw = val / 1000.0 if abs(val) > 100 else val
+                    if pv_kw >= pv_threshold:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+
+        # 2. Battery covers demand until PV → no grid needed
+        energy_until_pv = self.hass.states.get(f"sensor.tariff_saver_energy_until_pv")
+        if energy_until_pv and energy_until_pv.state not in ("unavailable", "unknown", ""):
+            missing = energy_until_pv.attributes.get("missing_kwh", None)
+            if isinstance(missing, (int, float)) and missing <= 0:
+                return False
+
+        return True
+
+    @property
+    def is_on(self) -> bool:
+        from .sensor import _current_score_live
+        score = _current_score_live(self.coordinator)
+        if score is None:
+            return False
+        if score <= self._get_threshold():
+            return False
+        # Score is high, but only activate if grid power is actually needed
+        return self._grid_needed()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Log state changes to activity log with explanation."""
+        current = self.is_on
+        if self._prev_is_on is not None and current != self._prev_is_on:
+            store = getattr(self.coordinator, "store", None)
+            if store is not None:
+                from .sensor import _current_score_live
+                score = _current_score_live(self.coordinator)
+                threshold = self._get_threshold()
+                grid_needed = self._grid_needed()
+                if current:
+                    # Build reason
+                    energy_pv = self.hass.states.get("sensor.tariff_saver_energy_until_pv")
+                    missing = None
+                    available = None
+                    if energy_pv and energy_pv.state not in ("unavailable", "unknown", ""):
+                        missing = energy_pv.attributes.get("missing_kwh")
+                        available = energy_pv.attributes.get("available_kwh")
+                    reason = f"Score {score} > {threshold}"
+                    if isinstance(missing, (int, float)) and isinstance(available, (int, float)):
+                        reason += f", Akku {round(available, 1)} kWh reicht nicht ({round(missing, 1)} kWh fehlen)"
+                    store.log_activity("🔴", f"Strom sparen EIN — {reason}")
+                else:
+                    if score is not None and score <= threshold:
+                        reason = f"Score {score} ≤ {threshold}"
+                    elif not grid_needed:
+                        reason = "Kein Grid-Bezug nötig"
+                    else:
+                        reason = f"Score {score}"
+                    store.log_activity("🟢", f"Strom sparen AUS — {reason}")
+        self._prev_is_on = current
+        super()._handle_coordinator_update()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        from .sensor import _current_score_live
+        score = _current_score_live(self.coordinator)
+        threshold = self._get_threshold()
+        grid_needed = self._grid_needed()
+        return {
+            "current_score": score,
+            "threshold": threshold,
+            "grid_needed": grid_needed,
+        }
 
 
 class TariffSaverConsumerShouldRunBinarySensor(CoordinatorEntity[TariffSaverCoordinator], BinarySensorEntity):
@@ -213,6 +337,34 @@ class TariffSaverConsumerShouldRunBinarySensor(CoordinatorEntity[TariffSaverCoor
         self._log_transition(result)
         return result
 
+    def _compute_status(self, plan: dict) -> str:
+        """Compute dynamic status from plan, time window, and reported feedback."""
+        # 1. Reported status from automation has highest priority
+        reported = plan.get("reported_status")
+        if reported:
+            return str(reported)
+
+        # 2. Auto-derive from time window
+        chosen_start = plan.get("chosen_start")
+        chosen_end = plan.get("chosen_end")
+        plan_status = plan.get("status", "")
+
+        if not chosen_start or not chosen_end:
+            return plan_status or "kein_plan"
+
+        now = dt_util.as_local(dt_util.utcnow())
+        start = dt_util.parse_datetime(str(chosen_start))
+        end = dt_util.parse_datetime(str(chosen_end))
+        if not start or not end:
+            return plan_status
+
+        if now < start:
+            return "geplant"
+        if start <= now < end:
+            return "aktiv" if self.is_on else "blockiert"
+        # now >= end
+        return "beendet"
+
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         plan = self._get_plan()
@@ -223,7 +375,9 @@ class TariffSaverConsumerShouldRunBinarySensor(CoordinatorEntity[TariffSaverCoor
             "slot": self.slot,
             "enabled": config.enabled,
             "name": config.configured_name,
-            "status": plan.get("status"),
+            "status": self._compute_status(plan),
+            "reported_status": plan.get("reported_status"),
+            "reported_status_at": plan.get("reported_status_at"),
             "source": plan.get("source"),
             "required_energy_kwh": plan.get("required_energy_kwh"),
             "power_kw": plan.get("power_kw"),

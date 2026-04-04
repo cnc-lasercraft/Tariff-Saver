@@ -12,8 +12,6 @@
           "feed_in_price_mode": "Feed-in price mode",
           "feed_in_fixed_price": "Feed-in fixed price (CHF/kWh)",
           "feed_in_price_entity": "Feed-in price entity",
-          "pv_forecast_entity": "PV forecast entity",
-          "pv_forecast_attribute": "PV forecast attribute",
           "battery_enabled": "Battery enabled",
           "battery_soc_entity": "Battery SoC entity",
           "battery_capacity_kwh": "Battery capacity (kWh)",
@@ -45,7 +43,28 @@
           "battery_soc_entity": "Battery SoC entity",
           "battery_capacity_kwh": "Battery capacity (kWh)",
           "battery_min_soc_percent": "Battery reserve SoC (%)",
-          "publish_time": "Publish time"
+          "publish_time": "Publish time",
+          "season_entity": "Season entity (optional, fallback: automatic)",
+          "battery_soc_margin_percent": "SOC safety margin (%)",
+          "ampel_pv_entity": "PV power entity (W or kW)",
+          "ampel_pv_threshold_kw": "PV threshold (kW)",
+          "ampel_score_good": "Score threshold good",
+          "ampel_score_bad": "Score threshold expensive",
+          "heating_wp_entity": "Heat pump entity (switch)",
+          "heating_wp_power_kw": "Heat pump power (kW)",
+          "heating_temp_sensor_1": "Temperature sensor 1",
+          "heating_temp_sensor_2": "Temperature sensor 2 (optional)",
+          "heating_temp_sensor_3": "Temperature sensor 3 (optional)",
+          "heating_comfort_min": "Comfort minimum (°C)",
+          "heating_pv_max": "PV heating maximum (°C)",
+          "heating_seasons": "Active seasons",
+          "heating_wp_off_value": "HP off value",
+          "heating_wp_ww_value": "HP hot water value",
+          "heating_wp_heat_value": "HP heating value",
+          "heating_max_score": "HP max score (never heat above)",
+          "heating_pv_wait_minutes": "Max wait time for PV (min)",
+          "heating_enabled": "Heating control enabled",
+          "heating_pv_surplus_entity": "PV surplus entity (W or kW)"
         }
       },
       "consumer_select": {
@@ -66,7 +85,9 @@
           "measurement_entity": "Measurement entity",
           "priority": "Priority (1-10)",
           "pv_required": "PV required",
-          "learning_enabled": "Learning enabled"
+          "learning_enabled": "Learning enabled",
+          "max_grid_score": "Max. grid score (0-100, without PV)",
+          "tariff_only": "Tariff only (no PV)"
         }
       }
     }

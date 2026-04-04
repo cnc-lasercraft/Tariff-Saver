@@ -146,6 +146,8 @@ async def async_heating_tick(
         CONF_HEATING_PV_MAX, DEFAULT_HEATING_PV_MAX,
         CONF_HEATING_WP_HEAT_VALUE, DEFAULT_HEATING_WP_HEAT_VALUE,
         CONF_HEATING_MAX_SCORE, DEFAULT_HEATING_MAX_SCORE,
+        CONF_HEATING_MAX_SCORE_ABSOLUTE, DEFAULT_HEATING_MAX_SCORE_ABSOLUTE,
+        CONF_HEATING_FROST_MIN, DEFAULT_HEATING_FROST_MIN,
         CONF_HEATING_PV_WAIT_MINUTES, DEFAULT_HEATING_PV_WAIT_MINUTES,
         CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD,
     )
@@ -160,6 +162,8 @@ async def async_heating_tick(
     wp_off = str(_get_cfg(entry, CONF_HEATING_WP_OFF_VALUE, DEFAULT_HEATING_WP_OFF_VALUE) or DEFAULT_HEATING_WP_OFF_VALUE)
     wp_heat = str(_get_cfg(entry, CONF_HEATING_WP_HEAT_VALUE, DEFAULT_HEATING_WP_HEAT_VALUE) or DEFAULT_HEATING_WP_HEAT_VALUE)
     max_score = int(float(_get_cfg(entry, CONF_HEATING_MAX_SCORE, DEFAULT_HEATING_MAX_SCORE) or DEFAULT_HEATING_MAX_SCORE))
+    max_score_abs = int(float(_get_cfg(entry, CONF_HEATING_MAX_SCORE_ABSOLUTE, DEFAULT_HEATING_MAX_SCORE_ABSOLUTE) or DEFAULT_HEATING_MAX_SCORE_ABSOLUTE))
+    frost_min = float(_get_cfg(entry, CONF_HEATING_FROST_MIN, DEFAULT_HEATING_FROST_MIN) or DEFAULT_HEATING_FROST_MIN)
     pv_wait = int(float(_get_cfg(entry, CONF_HEATING_PV_WAIT_MINUTES, DEFAULT_HEATING_PV_WAIT_MINUTES) or DEFAULT_HEATING_PV_WAIT_MINUTES))
     pv_threshold = float(_get_cfg(entry, CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD) or DEFAULT_AMPEL_PV_THRESHOLD)
 
@@ -219,17 +223,38 @@ async def async_heating_tick(
     wp_state_obj = hass.states.get(wp_entity)
     wp_current = wp_state_obj.state if wp_state_obj else None
 
-    # Remember previous state (only non-heat, non-off values like WW)
+    # Remember user's baseline state (what the WP was set to before heating module changed it)
+    # This includes "Aus" — if user manually turned WP off, we respect that.
     if store and not hasattr(store, "_heating_wp_previous"):
         store._heating_wp_previous = None
-    if store and wp_current and wp_current not in (wp_off, wp_heat):
+    if store and not hasattr(store, "_heating_module_active"):
+        store._heating_module_active = False
+    if store and wp_current and not store._heating_module_active:
+        # Heating module hasn't changed WP yet — current state is user's baseline
         store._heating_wp_previous = wp_current
 
     # --- Decision ---
     action = None  # None = no change, "heat" or "off"
     reason = ""
 
-    if avg_temp >= pv_max:
+    # --- Score-Stufe 2: Absolut-Grenze (auch bei Kälte aus, nur Frostschutz) ---
+    if score > max_score_abs and avg_temp >= frost_min and pv_surplus < pv_threshold:
+        if wp_current != wp_off:
+            action = "off"
+            reason = f"Score {score} > Absolut-Grenze {max_score_abs}, Temp {avg_temp}°C über Frostschutz {frost_min}°C"
+        else:
+            reason = f"Score {score} > Absolut-Grenze {max_score_abs}, WP bleibt aus"
+
+    # --- Score-Stufe 1: Teuer-Grenze (aus, ausser unter Komfort-Min) ---
+    elif score > max_score and avg_temp >= comfort_min and pv_surplus < pv_threshold:
+        if wp_current == wp_heat:
+            action = "off"
+            reason = f"Score {score} > Teuer-Grenze {max_score}, Temp {avg_temp}°C über Komfort {comfort_min}°C"
+        else:
+            reason = f"Score {score} > Teuer-Grenze {max_score}, WP bleibt aus"
+
+    # --- Temperaturzonen (normale Logik, Score unter Grenzwerten) ---
+    elif avg_temp >= pv_max:
         # Above PV-Max: stop heating, restore to previous (e.g. WW)
         if wp_current == wp_heat:
             action = "restore"
@@ -247,16 +272,8 @@ async def async_heating_tick(
                 reason = f"Kein PV-Überschuss, Temp {avg_temp}°C über Komfort-Min"
 
     else:
-        # Below comfort minimum
-        if score > max_score:
-            # Absolute score protection
-            if wp_current != wp_off:
-                action = "off"
-                reason = f"Score {score} > Max Score {max_score}, trotz Temp {avg_temp}°C"
-            else:
-                reason = f"Score {score} > Max Score {max_score}, WP bleibt aus"
-
-        elif pv_surplus >= pv_threshold:
+        # Below comfort minimum (and score <= max_score_abs or temp < frost_min)
+        if pv_surplus >= pv_threshold:
             # PV available: heat!
             if wp_current != wp_heat:
                 action = "heat"
@@ -300,28 +317,43 @@ async def async_heating_tick(
     elif store and action in ("restore", "off"):
         store._heating_wp_started_at = None
 
+    # --- Guard: respect user's manual "Aus" (don't heat if user turned WP off) ---
+    # Exception: frost protection always heats
+    if action == "heat" and store:
+        baseline = getattr(store, "_heating_wp_previous", None)
+        if baseline == wp_off and avg_temp >= frost_min:
+            _LOGGER.debug("Heating: user baseline is '%s', skipping heat (frost_min=%.1f, avg=%.1f)", wp_off, frost_min, avg_temp)
+            action = None
+            reason = f"WP manuell aus, Temp {avg_temp}°C über Frostschutz {frost_min}°C"
+
     # --- Execute ---
     if action == "heat":
         _LOGGER.info("Heating ON: %s → '%s' (%s)", wp_entity, wp_heat, reason)
         if store:
+            store._heating_module_active = True
             store.log_activity("🔥", f"WP → {wp_heat} ({reason})")
             hass.async_create_task(store.async_save())
         await _set_wp(hass, wp_entity, wp_heat)
     elif action == "off":
         _LOGGER.info("Heating OFF: %s → '%s' (%s)", wp_entity, wp_off, reason)
         if store:
+            store._heating_module_active = True
             store.log_activity("⏹️", f"WP → {wp_off} ({reason})")
             hass.async_create_task(store.async_save())
         await _set_wp(hass, wp_entity, wp_off)
     elif action == "restore":
-        # Restore to previous value (e.g. WW) or off
+        # Restore to user's baseline (WW, Aus, etc.)
         restore = getattr(store, "_heating_wp_previous", None) if store else None
         target = restore if restore and restore != wp_heat else wp_off
         _LOGGER.info("Heating RESTORE: %s → '%s' (%s)", wp_entity, target, reason)
         if store:
+            store._heating_module_active = False
             store.log_activity("↩️", f"WP → {target} ({reason})")
             hass.async_create_task(store.async_save())
         await _set_wp(hass, wp_entity, target)
     else:
         _LOGGER.debug("Heating: no change needed. WP='%s', Temp=%.1f°C, Score=%d. %s",
                        wp_current, avg_temp, score, reason)
+        # If heating module is not actively controlling and WP changed externally, update baseline
+        if store and not store._heating_module_active and wp_current != getattr(store, "_heating_wp_previous", None):
+            store._heating_wp_previous = wp_current

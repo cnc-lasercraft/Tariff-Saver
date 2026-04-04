@@ -87,10 +87,18 @@ class TariffSaverConsumerCard extends HTMLElement {
       const running = entity ? entity.state === 'on' : false;
 
       let statusIcon = '⬜';
+      let statusText = '';
       if (enabled) {
-        if (running) statusIcon = '🟢';
-        else if (status === 'planned') statusIcon = '📋';
-        else statusIcon = '⏸';
+        if (status === 'aktiv' || running) { statusIcon = '🟢'; statusText = 'aktiv'; }
+        else if (status === 'geplant') { statusIcon = '📋'; statusText = 'geplant'; }
+        else if (status === 'blockiert') { statusIcon = '🚫'; statusText = 'blockiert'; }
+        else if (status === 'beendet') { statusIcon = '✅'; statusText = 'beendet'; }
+        else if (status && status !== 'planned' && status !== 'error_no_plan' && status !== 'kein_plan') {
+          // Reported status from automation
+          statusIcon = '💬'; statusText = status;
+        }
+        else if (status === 'error_no_plan' || status === 'kein_plan') { statusIcon = '⏸'; statusText = ''; }
+        else { statusIcon = '⏸'; statusText = ''; }
       }
 
       let window = '';
@@ -122,7 +130,7 @@ class TariffSaverConsumerCard extends HTMLElement {
           <td class="num"><input type="number" value="${runOrder}" data-slot="${i}" data-key="run_order" min="0" max="10" step="1" style="width:50px"></td>
           <td class="meas"><input type="text" value="${this._esc(measurement)}" data-slot="${i}" data-key="measurement_entity" placeholder="—"></td>
           <td class="live">${source || '–'}</td>
-          <td class="live win">${window || '–'}</td>
+          <td class="live win">${window ? window + (statusText ? '<br><span class="stxt">' + statusText + '</span>' : '') : (statusText || '–')}</td>
         </tr>`;
     }
 
@@ -147,6 +155,7 @@ class TariffSaverConsumerCard extends HTMLElement {
         .meas input{width:100%;min-width:130px;font-size:12px}
         .live{color:var(--secondary-text-color);font-size:14px;white-space:nowrap}
         .win{font-size:13px}
+        .stxt{font-size:12px;color:var(--primary-color,#03a9f4)}
         input[type="text"],input[type="number"],select{
           padding:6px 8px;border:1px solid var(--divider-color,#444);border-radius:4px;
           background:var(--input-fill-color,var(--card-background-color,#1c1c1c));
@@ -164,9 +173,9 @@ class TariffSaverConsumerCard extends HTMLElement {
       <ha-card>
         <h2>Consumer Konfiguration</h2>
         <table><thead><tr>
-          <th></th><th>#</th><th>An</th><th>Name</th><th>Modus</th><th>kW</th><th>Min</th><th>Prio</th><th>Score</th><th>Grid</th><th>PV-Opp</th><th>Tage</th><th>LZ</th><th>RF</th><th>Mess-Entity</th><th>Quelle</th><th>Geplant</th>
+          <th></th><th>#</th><th>An</th><th>Name</th><th>Modus</th><th>kW</th><th>Min</th><th>Prio</th><th>Score</th><th>Grid</th><th>PV-Opp</th><th>Tage</th><th>LZ</th><th>RF</th><th>Mess-Entity</th><th>Quelle</th><th>Status</th>
         </tr></thead><tbody>${rows}</tbody></table>
-        <div class="foot">🟢 läuft · 📋 geplant · ⏸ wartend · ⬜ aus — Änderungen werden sofort gespeichert<br>
+        <div class="foot">🟢 aktiv · 📋 geplant · 🚫 blockiert · ✅ abgelaufen · 💬 Rückmeldung · ⏸ wartend · ⬜ aus<br>
         <b>Score</b> = Max Grid Score (nur ohne PV) · <b>Grid</b> = nur Tarif-Fenster, kein PV · <b>PV-Opp</b> = läuft immer bei PV-Überschuss · <b>Tage</b> = min-max Tage zwischen Läufen (0-0 = keine Vorgabe) · <b>LZ</b> = Min. Laufzeit in Minuten</div>
       </ha-card>`;
 

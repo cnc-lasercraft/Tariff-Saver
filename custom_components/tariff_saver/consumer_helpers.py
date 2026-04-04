@@ -323,8 +323,11 @@ def build_consumer_plan(
                 _store = _coord.store
                 break
         _last_start_key = f"_opp_start_{config.slot}"
+        _last_stop_key = f"_opp_stop_{config.slot}"
         _last_start = getattr(_store, _last_start_key, None) if _store else None
+        _last_stop = getattr(_store, _last_stop_key, None) if _store else None
         _min_rt = config.min_runtime_minutes
+        _cooldown = max(_min_rt, 3)  # Cooldown = min_runtime, mindestens 3 Minuten
 
         # Determine current state from binary sensor
         _bs = hass.states.get(f"binary_sensor.tariff_saver_consumer_{config.slot}_should_run")
@@ -340,11 +343,19 @@ def build_consumer_plan(
                     should_run = pv_surplus_kw >= threshold_off
             else:
                 should_run = pv_surplus_kw >= threshold_off
+            # Record stop time when turning off
+            if not should_run and _store:
+                setattr(_store, _last_stop_key, dt_util.utcnow())
         else:
-            # Not running: use higher threshold to start
+            # Not running: use higher threshold to start + cooldown check
             should_run = pv_surplus_kw >= threshold_on
-            if should_run and _store and _min_rt > 0:
+            if should_run and _last_stop and _cooldown > 0:
+                off_elapsed = (dt_util.utcnow() - _last_stop).total_seconds() / 60.0
+                if off_elapsed < _cooldown:
+                    should_run = False  # cooldown not reached
+            if should_run and _store:
                 setattr(_store, _last_start_key, dt_util.utcnow())
+                setattr(_store, _last_stop_key, None)
 
         return {
             "status": "pv_opportunist",

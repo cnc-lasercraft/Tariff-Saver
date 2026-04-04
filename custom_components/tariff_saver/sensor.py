@@ -285,7 +285,9 @@ async def async_setup_entry(
 
     entities.append(BaseLoadSensor(coordinator, entry))
     entities.append(ConsumerConfigSensor(coordinator, entry))
+    entities.append(EnergyUntilPvSensor(coordinator, entry))
     entities.append(StromAmpelSensor(coordinator, entry))
+    entities.append(BatteryManagerSensor(coordinator, entry))
     entities.append(ActivityLogSensor(coordinator, entry))
 
     for hours in WINDOW_HOURS:
@@ -862,10 +864,11 @@ class ConsumerConfigSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnti
             "consumption_energy_entity", "season_entity",
             "ekz_entry_id", "publish_time",
             "pv_forecast_entity", "pv_forecast_attribute",
-            "battery_enabled", "battery_capacity_kwh", "battery_min_soc_percent", "battery_soc_entity",
+            "battery_enabled", "battery_capacity_kwh", "battery_min_soc_percent", "battery_soc_entity", "battery_soc_margin_percent",
             "feed_in_price_mode", "feed_in_fixed_price", "feed_in_price_entity",
+            "min_valid_price", "max_valid_price",
             "ampel_pv_entity", "ampel_pv_threshold_kw", "ampel_score_good", "ampel_score_bad",
-            "heating_wp_entity", "heating_wp_power_kw", "heating_temp_sensor_1", "heating_temp_sensor_2", "heating_temp_sensor_3", "heating_comfort_min", "heating_pv_max", "heating_seasons", "heating_wp_off_value", "heating_wp_ww_value", "heating_wp_heat_value", "heating_max_score", "heating_pv_wait_minutes", "heating_enabled", "heating_pv_surplus_entity", "pv_surplus_entity",
+            "heating_wp_entity", "heating_wp_power_kw", "heating_temp_sensor_1", "heating_temp_sensor_2", "heating_temp_sensor_3", "heating_comfort_min", "heating_pv_max", "heating_seasons", "heating_wp_off_value", "heating_wp_ww_value", "heating_wp_heat_value", "heating_max_score", "heating_max_score_absolute", "heating_frost_min", "heating_wp_min_runtime", "heating_pv_wait_minutes", "heating_enabled", "heating_pv_surplus_entity", "pv_surplus_entity", "strom_sparen_score",
         ):
             val = self.entry.options.get(key, self.entry.data.get(key))
             if val is not None:
@@ -917,6 +920,223 @@ class ActivityLogSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity)
             "entries": entries,
             "count": len(entries),
         }
+
+
+class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Estimates total energy demand until PV production starts, including heat pump."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Energy until PV"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_icon = "mdi:battery-charging"
+    _attr_device_class = SensorDeviceClass.ENERGY
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_energy_until_pv"
+        self._attr_device_info = _device_info(entry)
+
+    def _cfg(self, key: str, default=None):
+        return self.entry.options.get(key, self.entry.data.get(key, default))
+
+    def _compute(self) -> dict[str, Any]:
+        from .const import (
+            CONF_PV_FORECAST_ENTITY, CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE,
+            CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD,
+            CONF_HEATING_ENABLED, CONF_HEATING_SEASONS, DEFAULT_HEATING_SEASONS,
+            CONF_HEATING_WP_POWER_KW, DEFAULT_HEATING_WP_POWER_KW,
+            CONF_HEATING_MAX_SCORE, DEFAULT_HEATING_MAX_SCORE,
+            CONF_BATTERY_ENABLED, CONF_BATTERY_CAPACITY_KWH,
+            CONF_BATTERY_MIN_SOC_PERCENT, DEFAULT_BATTERY_MIN_SOC_PERCENT,
+            CONF_BATTERY_SOC_ENTITY, CONF_BATTERY_SOC_MARGIN, DEFAULT_BATTERY_SOC_MARGIN,
+        )
+        from .__init__ import _get_season
+
+        now_utc = dt_util.utcnow()
+        now_local = dt_util.as_local(now_utc)
+        result = {
+            "base_load_kwh": 0.0, "heating_kwh": 0.0, "consumer_kwh": 0.0,
+            "total_kwh": 0.0, "pv_start_time": None, "slots_until_pv": 0,
+            "heating_slots": 0, "available_kwh": 0.0, "missing_kwh": 0.0,
+            "recommended_target_soc": 0,
+        }
+
+        # --- PV start time ---
+        pv_threshold = float(self._cfg(CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD) or DEFAULT_AMPEL_PV_THRESHOLD)
+        pv_entity = str(self._cfg(CONF_PV_FORECAST_ENTITY, "") or "").strip()
+        pv_attr = str(self._cfg(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE) or DEFAULT_PV_FORECAST_ATTRIBUTE).strip()
+        pv_start_utc = None
+
+        if pv_entity:
+            state = self.hass.states.get(pv_entity)
+            if state:
+                forecast = state.attributes.get(pv_attr, [])
+                if isinstance(forecast, list):
+                    for slot in forecast:
+                        if not isinstance(slot, dict):
+                            continue
+                        period = slot.get("period_start")
+                        pv_est = slot.get("pv_estimate", 0)
+                        if period and isinstance(pv_est, (int, float)) and pv_est >= pv_threshold:
+                            try:
+                                slot_dt = dt_util.parse_datetime(str(period))
+                                if slot_dt and slot_dt > now_utc:
+                                    pv_start_utc = slot_dt
+                                    break
+                            except Exception:
+                                pass
+
+        if pv_start_utc is None:
+            # No PV today — use noon as fallback
+            noon_local = now_local.replace(hour=12, minute=0, second=0, microsecond=0)
+            if noon_local <= now_local:
+                noon_local += timedelta(days=1)
+            pv_start_utc = dt_util.as_utc(noon_local)
+
+        pv_start_local = dt_util.as_local(pv_start_utc)
+        result["pv_start_time"] = pv_start_local.isoformat()
+
+        # --- Slot range: from now until PV start (30-min slots) ---
+        now_idx = now_local.hour * 2 + (1 if now_local.minute >= 30 else 0)
+        pv_idx = pv_start_local.hour * 2 + (1 if pv_start_local.minute >= 30 else 0)
+        # Handle overnight (e.g., now=03:00 idx=6, pv=08:00 idx=16)
+        if pv_idx <= now_idx:
+            pv_idx += 48  # next day
+        slots_until_pv = pv_idx - now_idx
+        result["slots_until_pv"] = slots_until_pv
+
+        # --- Base load from season profile ---
+        store = getattr(self.coordinator, "store", None)
+        current_season = _get_season(self.hass, self.entry)
+        profile = store.get_seasonal_load_profile(current_season) if store else {}
+        base_load_kwh = 0.0
+        for i in range(now_idx, now_idx + slots_until_pv):
+            idx = i % 48
+            base_load_kwh += float(profile.get(idx, 0.3))  # 0.3 kWh fallback per 30-min slot
+        result["base_load_kwh"] = round(base_load_kwh, 1)
+
+        # --- Heating (WP) consumption based on score per slot ---
+        heating_kwh = 0.0
+        heating_slots = 0
+        heating_enabled = self._cfg(CONF_HEATING_ENABLED, False)
+        seasons_str = str(self._cfg(CONF_HEATING_SEASONS, DEFAULT_HEATING_SEASONS) or DEFAULT_HEATING_SEASONS)
+        active_seasons = [s.strip() for s in seasons_str.split(",") if s.strip()]
+        wp_power_kw = float(self._cfg(CONF_HEATING_WP_POWER_KW, DEFAULT_HEATING_WP_POWER_KW) or DEFAULT_HEATING_WP_POWER_KW)
+        max_score = int(float(self._cfg(CONF_HEATING_MAX_SCORE, DEFAULT_HEATING_MAX_SCORE) or DEFAULT_HEATING_MAX_SCORE))
+
+        heating_active = bool(heating_enabled) and current_season in active_seasons
+
+        if heating_active:
+            # Get price data and historical min/max for score calculation
+            data = self.coordinator.data or {}
+            active_price_slots = data.get("active", []) if isinstance(data, dict) else []
+            hist_min = store.historical_price_min if store else 999.0
+            hist_max = store.historical_price_max if store else 0.0
+            baseline = _get_baseline_price(self.coordinator)
+
+            for i in range(now_idx, now_idx + slots_until_pv):
+                idx = i % 48
+                # Find the price slot matching this 30-min index
+                slot_start_local = now_local.replace(hour=(idx // 2), minute=(idx % 2) * 30, second=0, microsecond=0)
+                if i >= 48:
+                    slot_start_local += timedelta(days=1)
+                slot_start_utc = dt_util.as_utc(slot_start_local)
+
+                # Find matching price slot
+                matching_price = None
+                for ps in active_price_slots:
+                    if ps.start <= slot_start_utc < ps.start + timedelta(minutes=15):
+                        matching_price = _slot_total_price(ps.components_chf_per_kwh)
+                        break
+                    # Also check next 15-min slot (our slots are 30 min, price slots are 15 min)
+                    if ps.start <= slot_start_utc + timedelta(minutes=15) < ps.start + timedelta(minutes=15):
+                        if matching_price is None:
+                            matching_price = _slot_total_price(ps.components_chf_per_kwh)
+
+                if matching_price is not None and hist_min < 999.0 and hist_max > 0.0:
+                    slot_score = _absolute_score(float(matching_price), hist_min, hist_max, baseline)
+                else:
+                    slot_score = 50  # Unknown → assume neutral
+
+                # WP runs if score <= max_score (Teuer-Grenze)
+                if slot_score <= max_score:
+                    heating_kwh += wp_power_kw * 0.5  # 30-min slot
+                    heating_slots += 1
+
+        result["heating_kwh"] = round(heating_kwh, 1)
+        result["heating_slots"] = heating_slots
+
+        # --- Planned consumers running before PV ---
+        consumer_kwh = 0.0
+        pv_start_ts = pv_start_utc.timestamp()
+        now_ts = now_utc.timestamp()
+        for slot_nr in range(1, CONSUMER_COUNT + 1):
+            config = get_consumer_config(self.entry, slot_nr)
+            if not config.enabled:
+                continue
+            # Check if consumer has a plan that runs before PV
+            bs = self.hass.states.get(f"binary_sensor.tariff_saver_consumer_{slot_nr}_should_run")
+            if not bs or not bs.attributes:
+                continue
+            chosen_start = bs.attributes.get("chosen_start")
+            chosen_end = bs.attributes.get("chosen_end")
+            if not chosen_start or not chosen_end:
+                continue
+            try:
+                cs = dt_util.parse_datetime(str(chosen_start))
+                ce = dt_util.parse_datetime(str(chosen_end))
+                if cs and ce and cs.timestamp() < pv_start_ts and ce.timestamp() > now_ts:
+                    learning = store.get_consumer_learning(str(slot_nr)) if store else {}
+                    energy = effective_energy_kwh(config, learning)
+                    if energy and energy > 0:
+                        consumer_kwh += energy
+            except Exception:
+                pass
+        result["consumer_kwh"] = round(consumer_kwh, 1)
+
+        # --- Totals ---
+        total_kwh = base_load_kwh + heating_kwh + consumer_kwh
+        result["total_kwh"] = round(total_kwh, 1)
+
+        # --- Battery ---
+        battery_enabled = self._cfg(CONF_BATTERY_ENABLED, False)
+        capacity = float(self._cfg(CONF_BATTERY_CAPACITY_KWH, 0.0) or 0.0)
+        min_soc = float(self._cfg(CONF_BATTERY_MIN_SOC_PERCENT, DEFAULT_BATTERY_MIN_SOC_PERCENT) or DEFAULT_BATTERY_MIN_SOC_PERCENT)
+        margin = float(self._cfg(CONF_BATTERY_SOC_MARGIN, DEFAULT_BATTERY_SOC_MARGIN) or DEFAULT_BATTERY_SOC_MARGIN)
+
+        current_soc = 0.0
+        soc_entity = str(self._cfg(CONF_BATTERY_SOC_ENTITY, "") or "").strip()
+        if soc_entity:
+            soc_state = self.hass.states.get(soc_entity)
+            if soc_state:
+                try:
+                    current_soc = float(soc_state.state)
+                except (ValueError, TypeError):
+                    pass
+
+        available_kwh = max(0.0, (current_soc - min_soc) / 100.0 * capacity) if battery_enabled and capacity > 0 else 0.0
+        missing_kwh = max(0.0, total_kwh - available_kwh)
+        result["available_kwh"] = round(available_kwh, 1)
+        result["missing_kwh"] = round(missing_kwh, 1)
+
+        # Target SOC
+        if battery_enabled and capacity > 0:
+            target = current_soc + (missing_kwh / capacity * 100.0) + margin
+            target = max(12, min(100, int(round(target))))
+        else:
+            target = 0
+        result["recommended_target_soc"] = target
+
+        return result
+
+    @property
+    def native_value(self) -> float | None:
+        return self._compute().get("total_kwh", 0.0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return self._compute()
 
 
 class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
@@ -1060,13 +1280,29 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
                             except Exception:
                                 pass
 
+        # Check strom_sparen
+        strom_sparen = self.hass.states.get("binary_sensor.tariff_saver_strom_sparen")
+        is_strom_sparen = strom_sparen and strom_sparen.state == "on"
+
         # Determine state and lines
         state = "yellow"
         reason = "normal"
         line1 = ""
         line2 = ""
 
-        if pv_surplus_kw >= pv_threshold:
+        # Build next-hint suffix for line2
+        next_hint = ""
+        if next_pv_str:
+            next_hint = " · PV ab " + next_pv_str
+        elif next_good_str:
+            next_hint = " · günstig ab " + next_good_str
+
+        if is_strom_sparen:
+            state = "red"
+            reason = "strom_sparen"
+            line1 = "Strom sparen aktiv!"
+            line2 = "Unwichtige Geräte aus"
+        elif pv_surplus_kw >= pv_threshold:
             state = "green"
             reason = "pv_surplus"
             line1 = "Gratis Solarstrom!"
@@ -1080,19 +1316,17 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
             state = "green"
             reason = "cheap_grid"
             line1 = "Günstiger Zeitpunkt"
-            line2 = "Score " + str(score)
+            line2 = "Score " + str(score) + next_hint
         elif score >= score_bad:
             state = "red"
             reason = "expensive"
             if next_pv_str:
                 line1 = "Warten - PV ab " + next_pv_str
-                line2 = "Score " + str(score) + " (teuer)"
             elif next_good_str:
                 line1 = "Warten - günstig ab " + next_good_str
-                line2 = "Score " + str(score) + " (teuer)"
             else:
                 line1 = "Strom gerade teuer"
-                line2 = "Score " + str(score)
+            line2 = "Score " + str(score)
         else:
             state = "yellow"
             reason = "normal"
@@ -1102,9 +1336,13 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
                 line1 = "Günstig ab " + next_good_str
             else:
                 line1 = "Wenn nötig, jetzt OK"
-            line2 = "Score " + str(score)
+            line2 = "Score " + str(score) + next_hint
 
-        line3 = "Score " + str(score) + "  Heute Score " + str(day_score)
+        # line3: strom_sparen gets score + hint, others get day rating
+        if is_strom_sparen:
+            line3 = "Score " + str(score) + next_hint
+        else:
+            line3 = "Heute " + stars_str
 
         return {
             "state": state,
@@ -1120,3 +1358,84 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
             "next_pv": next_pv_str,
             "stars": stars_str,
         }
+
+
+class BatteryManagerSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Exposes the current battery management mode and state."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Battery Manager"
+    _attr_icon = "mdi:battery-sync"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_battery_manager"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> str:
+        state = self._get_battery_state()
+        return state.get("mode", "normal")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self._get_battery_state()
+
+        # Read live values
+        from .const import CONF_BATTERY_SOC_ENTITY
+        config = self.entry.options if self.entry.options else self.entry.data
+        soc_entity = str(config.get(CONF_BATTERY_SOC_ENTITY, "") or "").strip()
+        current_soc = None
+        if soc_entity:
+            soc_state = self.hass.states.get(soc_entity)
+            if soc_state and soc_state.state not in ("unavailable", "unknown", ""):
+                try:
+                    current_soc = round(float(soc_state.state), 1)
+                except (ValueError, TypeError):
+                    pass
+
+        score = _current_score_live(self.coordinator)
+
+        # Forcible charge status
+        forcible = self.hass.states.get("sensor.batteries_forcible_charge")
+        forcible_state = forcible.state if forcible else "unknown"
+
+        # Consumer 9 plan
+        data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
+        plans = data.get("consumer_plans", {})
+        plan_9 = plans.get(9, plans.get("9", {}))
+
+        # Battery stats
+        store = getattr(self.coordinator, "store", None)
+        today_str = dt_util.now().strftime("%Y-%m-%d")
+        today_stats = {}
+        stats_summary = {}
+        if store:
+            today_stats = store.battery_stats.get(today_str, {})
+            stats_summary = store.get_battery_stats_summary()
+
+        return {
+            "mode": state.get("mode", "normal"),
+            "reason": state.get("reason", ""),
+            "mode_since": state.get("mode_since", ""),
+            "soc": current_soc,
+            "score": score,
+            "forcible_charge": forcible_state,
+            "grid_charge_plan": plan_9.get("status", ""),
+            "grid_charge_window": plan_9.get("chosen_start", ""),
+            "battery_case": plan_9.get("battery_case", plan_9.get("source", "")),
+            "today_grid_kwh": today_stats.get("grid_charge_kwh", 0.0),
+            "today_grid_cost_chf": today_stats.get("grid_charge_cost_chf", 0.0),
+            "today_hold_minutes": today_stats.get("hold_minutes", 0),
+            "today_case": today_stats.get("case", ""),
+            "stats_days": stats_summary.get("days", 0),
+            "stats_total_grid_kwh": stats_summary.get("total_grid_kwh", 0.0),
+            "stats_total_grid_cost": stats_summary.get("total_grid_cost", 0.0),
+            "stats_avg_price": stats_summary.get("avg_price", 0.0),
+            "stats_total_hold_min": stats_summary.get("total_hold_min", 0),
+        }
+
+    def _get_battery_state(self) -> dict:
+        data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
+        return data.get("battery_state", {})

@@ -59,6 +59,8 @@ class TariffSaverSettingsCard extends HTMLElement {
         fields: [
           { key: 'ekz_entry_id', label: 'Provider Config Entry ID', type: 'text', hint: 'Leer = automatisch erster gefundener Provider' },
           { key: 'publish_time', label: 'Publish Time', type: 'text', hint: 'Uhrzeit wann der Provider die Tarife für morgen veröffentlicht (z.B. 18:15)' },
+          { key: 'min_valid_price', label: 'Min. gültiger Preis (CHF/kWh)', type: 'number', min: -0.5, max: 0.5, step: 0.01, hint: 'Darunter = Dummy-Preis ignoriert (DE: negative Preise möglich)' },
+          { key: 'max_valid_price', label: 'Max. gültiger Preis (CHF/kWh)', type: 'number', min: 0.1, max: 5.0, step: 0.1, hint: 'Darüber = Dummy-Preis ignoriert' },
         ]
       },
       {
@@ -82,6 +84,9 @@ class TariffSaverSettingsCard extends HTMLElement {
           { key: 'battery_capacity_kwh', label: 'Kapazität (kWh)', type: 'number', min: 0, max: 200, step: 0.5 },
           { key: 'battery_min_soc_percent', label: 'Min. SOC (%)', type: 'number', min: 0, max: 100, step: 1 },
           { key: 'battery_soc_margin_percent', label: 'SOC Sicherheitsmarge (%)', type: 'number', min: 0, max: 50, step: 1, hint: 'Wird zum berechneten Target SOC addiert' },
+          { key: 'battery_round_trip_loss_percent', label: 'Speicherverlust (%)', type: 'number', min: 0, max: 30, step: 1, hint: 'Round-Trip Verlust Grid→Akku→Verbrauch (Standard 10%)' },
+          { key: 'battery_max_charge_kw', label: 'Max. Ladeleistung (kW)', type: 'number', min: 0.5, max: 25, step: 0.5, hint: 'Maximale Grid-Ladeleistung' },
+          { key: 'battery_pv_charge_threshold_kw', label: 'PV Lade-Schwelle (kW)', type: 'number', min: 0.5, max: 10, step: 0.5, hint: 'Ab diesem PV-Überschuss lädt der Akku gratis (kein Grid-Laden nötig)' },
         ]
       },
       {
@@ -110,6 +115,7 @@ class TariffSaverSettingsCard extends HTMLElement {
           { key: 'ampel_pv_threshold_kw', label: 'PV Schwelle (kW)', type: 'number', min: 0.5, max: 20, step: 0.5, hint: 'Ab dieser PV-Leistung = grün (Gratis Solarstrom)' },
           { key: 'ampel_score_good', label: 'Score Grenze günstig', type: 'number', min: 0, max: 100, step: 5, hint: 'Darunter = grün' },
           { key: 'ampel_score_bad', label: 'Score Grenze teuer', type: 'number', min: 0, max: 100, step: 5, hint: 'Darüber = rot' },
+          { key: 'strom_sparen_score', label: 'Strom sparen ab Score', type: 'number', min: 0, max: 100, step: 5, hint: 'Über diesem Score: binary_sensor.tariff_saver_strom_sparen = on → nicht-essentielle Geräte abschalten' },
         ]
       },
       {
@@ -124,6 +130,11 @@ class TariffSaverSettingsCard extends HTMLElement {
           { key: 'heating_temp_sensor_3', label: 'Temp Sensor 3', type: 'text', hint: 'Optional — Durchschnitt wird berechnet' },
           { key: 'heating_comfort_min', label: 'Komfort-Minimum (°C)', type: 'number', min: 15, max: 25, step: 0.5, hint: 'Darunter heizt WP immer (auch vom Netz)' },
           { key: 'heating_pv_max', label: 'PV-Heiz-Maximum (°C)', type: 'number', min: 18, max: 28, step: 0.5, hint: 'Darüber stoppt PV-Heizen' },
+          { key: 'heating_max_score', label: 'Teuer-Grenze Score', type: 'number', min: 0, max: 100, step: 5, hint: 'WP aus wenn Score darüber (ausser unter Komfort-Min)' },
+          { key: 'heating_max_score_absolute', label: 'Absolut-Grenze Score', type: 'number', min: 0, max: 100, step: 5, hint: 'WP aus auch bei Kälte (nur Frostschutz bleibt)' },
+          { key: 'heating_frost_min', label: 'Frostschutz-Min (°C)', type: 'number', min: 10, max: 20, step: 0.5, hint: 'Unter diesem Wert wird IMMER geheizt' },
+          { key: 'heating_pv_wait_minutes', label: 'PV-Wartezeit (Min)', type: 'number', min: 0, max: 120, step: 5, hint: 'Minuten auf PV warten bevor Grid-Heizen' },
+          { key: 'heating_wp_min_runtime', label: 'Min. Laufzeit WP (Min)', type: 'number', min: 0, max: 60, step: 5, hint: 'Mindestlaufzeit bevor WP gestoppt wird' },
           { key: 'heating_seasons', label: 'Aktive Saisons', type: 'text', hint: 'Kommagetrennt, z.B. Frühling,Herbst' },
         ]
       }

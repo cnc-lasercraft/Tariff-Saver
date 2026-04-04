@@ -116,12 +116,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:
             pass
 
-        # 2. Calculate consumer plans for tomorrow
+        # 2. Verify date validity before planning (defensive — bus event should only fire on success)
+        data = coordinator.data or {}
+        date_validity = data.get("date_validity", {})
+        validity_record = date_validity.get(target_date)
+        if isinstance(validity_record, dict) and not validity_record.get("valid", True):
+            _LOGGER.warning(
+                "Received ekz_tariff_new_data for %s but date_validity says invalid: %s — skipping plan",
+                target_date, validity_record.get("details"),
+            )
+            return
+
+        # 3. Calculate consumer plans for tomorrow
         if not hasattr(coordinator, "entry") or coordinator.store is None:
             _LOGGER.warning("Cannot calculate plans — entry or store not ready")
             return
 
-        data = coordinator.data or {}
         all_active = data.get("active", [])
 
         # Filter slots to ONLY tomorrow's date
@@ -346,7 +356,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Type conversion
         if key in ("battery_enabled", "heating_enabled"):
             value = bool(value)
-        elif key in ("feed_in_fixed_price", "battery_capacity_kwh", "battery_min_soc_percent", "ampel_pv_threshold_kw", "heating_wp_power_kw", "heating_comfort_min", "heating_pv_max", "heating_max_score", "heating_pv_wait_minutes", "heating_wp_min_runtime"):
+        elif key in ("feed_in_fixed_price", "battery_capacity_kwh", "battery_min_soc_percent", "ampel_pv_threshold_kw", "heating_wp_power_kw", "heating_comfort_min", "heating_pv_max", "heating_max_score", "heating_max_score_absolute", "heating_frost_min", "heating_pv_wait_minutes", "heating_wp_min_runtime", "strom_sparen_score", "min_valid_price", "max_valid_price"):
             value = float(value or 0)
         else:
             value = str(value or "")
@@ -362,6 +372,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     service_name = "update_consumer"
     if not hass.services.has_service(DOMAIN, service_name):
         hass.services.async_register(DOMAIN, service_name, _update_consumer_service)
+
+    async def _update_consumer_status_service(call: ServiceCall) -> None:
+        """Set reported_status on a consumer plan (called from automations)."""
+        slot = int(call.data.get("slot", 0))
+        status = str(call.data.get("status", "")).strip()
+        if slot < 1 or slot > 10 or not status:
+            return
+        ts = dt_util.utcnow().isoformat()
+        # Update store copy
+        store = getattr(coordinator, "store", None)
+        if store is not None and store.consumer_plans:
+            plan = store.consumer_plans.get(str(slot)) or store.consumer_plans.get(slot)
+            if plan is not None:
+                plan["reported_status"] = status
+                plan["reported_status_at"] = ts
+                store.dirty = True
+                await store.async_save()
+        # Update coordinator.data copy (separate dict from store)
+        data = coordinator.data
+        if isinstance(data, dict):
+            data_plans = data.get("consumer_plans", {})
+            data_plan = data_plans.get(slot) or data_plans.get(str(slot))
+            if isinstance(data_plan, dict):
+                data_plan["reported_status"] = status
+                data_plan["reported_status_at"] = ts
+        # Trigger sensor update
+        coordinator.async_set_updated_data(coordinator.data)
+
+    hass.services.async_register(DOMAIN, "update_consumer_status", _update_consumer_status_service)
 
     async def _force_refresh() -> None:
         coordinator._last_fetch_date = None
@@ -536,6 +575,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, _heating_tick, timedelta(minutes=5)
     )
 
+    async def _battery_tick(now) -> None:
+        """Check battery mode every 5 minutes."""
+        from .battery import async_battery_tick
+        try:
+            await async_battery_tick(hass, entry, coordinator)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Battery tick failed")
+
+    hass.data[DOMAIN][entry.entry_id + "_unsub_battery_tick"] = async_track_time_interval(
+        hass, _battery_tick, timedelta(minutes=5)
+    )
 
     # Midnight refresh removed — plans are persisted and only recomputed
     # when new tariff data is published (18:15).
@@ -582,7 +633,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    for suffix in ("_unsub_daily", "_unsub_retry", "_unsub_energy_cost", "_unsub_energy_tick", "_unsub_consumer_tick", "_unsub_base_load", "_unsub_consumption_tick", "_unsub_ekz_signal"):
+    for suffix in ("_unsub_daily", "_unsub_retry", "_unsub_energy_cost", "_unsub_energy_tick", "_unsub_consumer_tick", "_unsub_base_load", "_unsub_consumption_tick", "_unsub_ekz_signal", "_unsub_battery_tick", "_unsub_heating_tick"):
         unsub = hass.data.get(DOMAIN, {}).pop(entry.entry_id + suffix, None)
         if unsub:
             unsub()
@@ -599,6 +650,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, "reset_energy_baseline")
         if not remaining_entries and hass.services.has_service(DOMAIN, "mark_consumer_run"):
             hass.services.async_remove(DOMAIN, "mark_consumer_run")
+        if not remaining_entries and hass.services.has_service(DOMAIN, "update_consumer_status"):
+            hass.services.async_remove(DOMAIN, "update_consumer_status")
     return unload_ok
 
 

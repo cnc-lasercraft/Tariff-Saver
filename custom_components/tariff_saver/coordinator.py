@@ -175,6 +175,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.link_status = provider_data.get("link_status")
         self.linking_url = provider_data.get("linking_url")
         self.last_api_success_utc = provider_data.get("last_api_success_utc")
+        date_validity = provider_data.get("date_validity") or {}
 
         if self.store is not None:
             if isinstance(self.last_api_success_utc, datetime):
@@ -188,14 +189,17 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             self.store.trim_price_slots(keep_days=7)
 
-        stats = self._compute_daily_stats(active_30m, baseline_30m)
-
-        # Update historical min/max prices
+        # Update historical min/max prices BEFORE computing stats (scores depend on these)
         if self.store is not None:
+            from .const import CONF_MIN_VALID_PRICE, DEFAULT_MIN_VALID_PRICE, CONF_MAX_VALID_PRICE, DEFAULT_MAX_VALID_PRICE
+            min_valid = float(self.config.get(CONF_MIN_VALID_PRICE, DEFAULT_MIN_VALID_PRICE) or DEFAULT_MIN_VALID_PRICE)
+            max_valid = float(self.config.get(CONF_MAX_VALID_PRICE, DEFAULT_MAX_VALID_PRICE) or DEFAULT_MAX_VALID_PRICE)
             all_prices = [_slot_total_price(s.components_chf_per_kwh) for s in active_30m]
-            self.store.update_historical_prices(all_prices)
+            self.store.update_historical_prices(all_prices, min_valid=min_valid, max_valid=max_valid)
             if self.store.dirty:
                 self.hass.async_create_task(self.store.async_save())
+
+        stats = self._compute_daily_stats(active_30m, baseline_30m, date_validity)
         feed_in_price = self._get_feed_in_price()
 
         if self.store is not None:
@@ -238,6 +242,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "baseline_publication_timestamp": provider_data.get("baseline_publication_timestamp"),
             },
             "consumer_plans": consumer_plans,
+            "date_validity": date_validity,
         }
 
     def _get_provider_data(self) -> dict[str, Any]:
@@ -290,7 +295,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             components_chf_per_kwh=components,
         )
 
-    def _compute_daily_stats(self, active: list[PriceSlot], baseline: list[PriceSlot]) -> dict[str, Any]:
+    def _compute_daily_stats(self, active: list[PriceSlot], baseline: list[PriceSlot], date_validity: dict[str, Any] | None = None) -> dict[str, Any]:
         # Filter to today only for daily averages/scores
         today_local = dt_util.now().date()
         today_active = [s for s in active if dt_util.as_local(s.start).date() == today_local]
@@ -341,6 +346,13 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         avg_tomorrow = _avg(tomorrow_values)
         tomorrow_score = score_from_prices(avg_tomorrow, year_min, year_max) if avg_tomorrow else None
 
+        # Date validity from EKZ provider
+        dv = date_validity or {}
+        today_val = dv.get(today_local.isoformat())
+        tomorrow_val = dv.get(tomorrow_local.isoformat())
+        today_data_valid = today_val.get("valid", True) if isinstance(today_val, dict) else True
+        tomorrow_data_valid = tomorrow_val.get("valid", True) if isinstance(tomorrow_val, dict) else True
+
         return {
             "calculated_at": dt_util.utcnow().isoformat(),
             "slot_day_local": slot_day_local,
@@ -359,6 +371,12 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "tomorrow_avg_chf_per_kwh": avg_tomorrow,
             "tomorrow_score_0_100": tomorrow_score,
             "tomorrow_slot_count": len(tomorrow_values),
+            "today_data_valid": today_data_valid,
+            "today_validity_error": today_val.get("error") if isinstance(today_val, dict) else None,
+            "today_validity_details": today_val.get("details") if isinstance(today_val, dict) else None,
+            "tomorrow_data_valid": tomorrow_data_valid,
+            "tomorrow_validity_error": tomorrow_val.get("error") if isinstance(tomorrow_val, dict) else None,
+            "tomorrow_validity_details": tomorrow_val.get("details") if isinstance(tomorrow_val, dict) else None,
         }
 
     @staticmethod
