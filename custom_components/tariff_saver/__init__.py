@@ -402,6 +402,88 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(DOMAIN, "update_consumer_status", _update_consumer_status_service)
 
+    # Strom-Sparen Snapshot Services (persistent in storage)
+    _SNAPSHOT_ENTITIES = [
+        "climate.klimaanlage_schlafen", "climate.klima_buero",
+        "fan.dyson_essen", "fan.dyson_schlafen", "fan.dyson_buero",
+        "switch.shelly_mini_1pm_venti_zi_og",
+        "switch.shelly_mini_1pm_ug_entfeuchter",
+        "switch.shelly_mini_1pm_og_entfeuchter_pool_switch_0",
+    ]
+
+    async def _save_strom_sparen_snapshot(call: ServiceCall) -> None:
+        """Save current device states to persistent storage."""
+        store = getattr(coordinator, "store", None)
+        if store is None:
+            return
+        snapshot = {}
+        for entity_id in _SNAPSHOT_ENTITIES:
+            state = hass.states.get(entity_id)
+            if state and state.state not in ("unavailable", "unknown"):
+                snapshot[entity_id] = state.state
+                # Save climate/fan attributes for proper restore
+                attrs = {}
+                if entity_id.startswith("climate."):
+                    for attr in ("temperature", "hvac_mode", "preset_mode"):
+                        v = state.attributes.get(attr)
+                        if v is not None:
+                            attrs[attr] = v
+                elif entity_id.startswith("fan."):
+                    for attr in ("percentage", "preset_mode", "oscillating"):
+                        v = state.attributes.get(attr)
+                        if v is not None:
+                            attrs[attr] = v
+                if attrs:
+                    snapshot[entity_id + "_attrs"] = attrs
+        store.strom_sparen_snapshot = snapshot
+        store.dirty = True
+        await store.async_save()
+        store.log_activity("📸", f"Strom-Sparen Snapshot gespeichert ({len([k for k in snapshot if not k.endswith('_attrs')])} Geräte)")
+        _LOGGER.info("Strom-Sparen snapshot saved: %s", list(snapshot.keys()))
+
+    hass.services.async_register(DOMAIN, "save_strom_sparen_snapshot", _save_strom_sparen_snapshot)
+
+    async def _restore_strom_sparen_snapshot(call: ServiceCall) -> None:
+        """Restore device states from persistent storage."""
+        store = getattr(coordinator, "store", None)
+        if store is None or not store.strom_sparen_snapshot:
+            _LOGGER.warning("No strom_sparen_snapshot to restore")
+            return
+        snapshot = store.strom_sparen_snapshot
+        restored = 0
+        for entity_id in _SNAPSHOT_ENTITIES:
+            saved_state = snapshot.get(entity_id)
+            if saved_state is None:
+                continue
+            attrs = snapshot.get(entity_id + "_attrs", {})
+            try:
+                domain = entity_id.split(".")[0]
+                if domain == "climate":
+                    if saved_state == "off":
+                        await hass.services.async_call("climate", "turn_off", {"entity_id": entity_id})
+                    else:
+                        svc_data = {"entity_id": entity_id, "hvac_mode": saved_state}
+                        if "temperature" in attrs:
+                            svc_data["temperature"] = attrs["temperature"]
+                        await hass.services.async_call("climate", "set_hvac_mode", svc_data)
+                elif domain == "fan":
+                    if saved_state == "off":
+                        await hass.services.async_call("fan", "turn_off", {"entity_id": entity_id})
+                    else:
+                        await hass.services.async_call("fan", "turn_on", {"entity_id": entity_id})
+                        if "percentage" in attrs:
+                            await hass.services.async_call("fan", "set_percentage", {"entity_id": entity_id, "percentage": attrs["percentage"]})
+                elif domain == "switch":
+                    svc = "turn_on" if saved_state == "on" else "turn_off"
+                    await hass.services.async_call("switch", svc, {"entity_id": entity_id})
+                restored += 1
+            except Exception as err:
+                _LOGGER.error("Failed to restore %s: %s", entity_id, err)
+        store.log_activity("♻️", f"Strom-Sparen Snapshot restored ({restored} Geräte)")
+        _LOGGER.info("Strom-Sparen snapshot restored: %d devices", restored)
+
+    hass.services.async_register(DOMAIN, "restore_strom_sparen_snapshot", _restore_strom_sparen_snapshot)
+
     async def _force_refresh() -> None:
         coordinator._last_fetch_date = None
         await coordinator.async_request_refresh()
@@ -652,6 +734,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, "mark_consumer_run")
         if not remaining_entries and hass.services.has_service(DOMAIN, "update_consumer_status"):
             hass.services.async_remove(DOMAIN, "update_consumer_status")
+        if not remaining_entries and hass.services.has_service(DOMAIN, "save_strom_sparen_snapshot"):
+            hass.services.async_remove(DOMAIN, "save_strom_sparen_snapshot")
+        if not remaining_entries and hass.services.has_service(DOMAIN, "restore_strom_sparen_snapshot"):
+            hass.services.async_remove(DOMAIN, "restore_strom_sparen_snapshot")
     return unload_ok
 
 

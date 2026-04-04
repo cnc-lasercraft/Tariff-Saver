@@ -61,6 +61,7 @@ class TariffSaverSettingsCard extends HTMLElement {
           { key: 'publish_time', label: 'Publish Time', type: 'text', hint: 'Uhrzeit wann der Provider die Tarife für morgen veröffentlicht (z.B. 18:15)' },
           { key: 'min_valid_price', label: 'Min. gültiger Preis (CHF/kWh)', type: 'number', min: -0.5, max: 0.5, step: 0.01, hint: 'Darunter = Dummy-Preis ignoriert (DE: negative Preise möglich)' },
           { key: 'max_valid_price', label: 'Max. gültiger Preis (CHF/kWh)', type: 'number', min: 0.1, max: 5.0, step: 0.1, hint: 'Darüber = Dummy-Preis ignoriert' },
+          { key: 'max_grid_power_kw', label: 'Max. Grid-Leistung (kW)', type: 'number', min: 1, max: 50, step: 1, hint: 'Maximale gleichzeitige Netzleistung für Consumer-Planung (Standard 25 kW)' },
         ]
       },
       {

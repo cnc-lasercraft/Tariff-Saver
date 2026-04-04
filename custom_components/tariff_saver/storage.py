@@ -57,6 +57,7 @@ class TariffSaverStore:
         self.consumer_plans: dict = {}
         self.plans_tariff_date: str | None = None
         self.battery_stats: dict[str, dict[str, Any]] = {}  # keyed by date "YYYY-MM-DD"
+        self.strom_sparen_snapshot: dict[str, str] = {}  # entity_id → state
         self.dirty: bool = False
 
     async def _async_migrate(self, old_version: int, old_minor_version: int, old_data: dict) -> dict:
@@ -129,6 +130,7 @@ class TariffSaverStore:
             for k, v in (data.get("battery_stats") or {}).items()
             if isinstance(v, dict)
         }
+        self.strom_sparen_snapshot = dict(data.get("strom_sparen_snapshot") or {})
         self.consumer_runs = {
             str(k): dict(v)
             for k, v in (data.get("consumer_runs") or {}).items()
@@ -179,6 +181,7 @@ class TariffSaverStore:
             "energy_baseline_kwh": self.energy_baseline_kwh,
             "energy_baseline_timestamp_utc": self.energy_baseline_timestamp_utc.isoformat() if self.energy_baseline_timestamp_utc else None,
             "battery_stats": self.battery_stats,
+            "strom_sparen_snapshot": self.strom_sparen_snapshot,
         }
 
     def set_last_api_success(self, when_utc: datetime) -> None:
