@@ -87,6 +87,9 @@ class TariffSaverSettingsCard extends HTMLElement {
           { key: 'battery_round_trip_loss_percent', label: 'Speicherverlust (%)', type: 'number', min: 0, max: 30, step: 1, hint: 'Round-Trip Verlust Grid→Akku→Verbrauch (Standard 10%)' },
           { key: 'battery_max_charge_kw', label: 'Max. Ladeleistung (kW)', type: 'number', min: 0.5, max: 25, step: 0.5, hint: 'Maximale Grid-Ladeleistung' },
           { key: 'battery_pv_charge_threshold_kw', label: 'PV Lade-Schwelle (kW)', type: 'number', min: 0.5, max: 10, step: 0.5, hint: 'Ab diesem PV-Überschuss lädt der Akku gratis (kein Grid-Laden nötig)' },
+          { key: 'battery_device_id', label: 'Huawei Device ID', type: 'text', hint: 'Device ID für forcible_charge_soc (z.B. 6b072fb05086945078a3150ac5d969ef)' },
+          { key: 'battery_hold_enter_score', label: 'Hold Ein (Score)', type: 'number', min: 0, max: 100, step: 5, hint: 'Akku schonen wenn Score ≤ diesem Wert (Standard 30)' },
+          { key: 'battery_hold_exit_score', label: 'Hold Aus (Score)', type: 'number', min: 0, max: 100, step: 5, hint: 'Akku wieder nutzen wenn Score ≥ diesem Wert (Standard 40)' },
         ]
       },
       {

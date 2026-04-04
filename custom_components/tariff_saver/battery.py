@@ -22,10 +22,6 @@ _LOGGER = logging.getLogger(__name__)
 # Minimum time in a mode before switching (prevents flapping)
 _MIN_DWELL_MINUTES = 15
 
-# Hysteresis for hold mode (score-based)
-_HOLD_ENTER_SCORE = 30   # Enter hold when score <= this
-_HOLD_EXIT_SCORE = 40    # Exit hold when score >= this
-
 
 def _get_cfg(entry: ConfigEntry, key: str, default=None):
     return entry.options.get(key, entry.data.get(key, default))
@@ -41,6 +37,9 @@ async def async_battery_tick(
         CONF_BATTERY_ENABLED, CONF_BATTERY_SOC_ENTITY,
         CONF_BATTERY_MIN_SOC_PERCENT, DEFAULT_BATTERY_MIN_SOC_PERCENT,
         CONF_BATTERY_MAX_CHARGE_KW, DEFAULT_BATTERY_MAX_CHARGE_KW,
+        CONF_BATTERY_DEVICE_ID, DEFAULT_BATTERY_DEVICE_ID,
+        CONF_BATTERY_HOLD_ENTER_SCORE, DEFAULT_BATTERY_HOLD_ENTER_SCORE,
+        CONF_BATTERY_HOLD_EXIT_SCORE, DEFAULT_BATTERY_HOLD_EXIT_SCORE,
         CONF_PV_SURPLUS_ENTITY,
         CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD,
     )
@@ -69,9 +68,13 @@ async def async_battery_tick(
     max_charge_kw = float(config.get(CONF_BATTERY_MAX_CHARGE_KW, DEFAULT_BATTERY_MAX_CHARGE_KW) or DEFAULT_BATTERY_MAX_CHARGE_KW)
     charge_power_w = int(max_charge_kw * 1000)
     pv_threshold = float(config.get(CONF_AMPEL_PV_THRESHOLD, DEFAULT_AMPEL_PV_THRESHOLD) or DEFAULT_AMPEL_PV_THRESHOLD)
+    hold_enter = int(float(config.get(CONF_BATTERY_HOLD_ENTER_SCORE, DEFAULT_BATTERY_HOLD_ENTER_SCORE) or DEFAULT_BATTERY_HOLD_ENTER_SCORE))
+    hold_exit = int(float(config.get(CONF_BATTERY_HOLD_EXIT_SCORE, DEFAULT_BATTERY_HOLD_EXIT_SCORE) or DEFAULT_BATTERY_HOLD_EXIT_SCORE))
 
-    # Huawei device ID (hardcoded for now, make configurable later)
-    device_id = "6b072fb05086945078a3150ac5d969ef"
+    # Huawei device ID
+    device_id = str(config.get(CONF_BATTERY_DEVICE_ID, DEFAULT_BATTERY_DEVICE_ID) or DEFAULT_BATTERY_DEVICE_ID).strip()
+    if not device_id:
+        return  # No device configured
 
     score = _current_score_live(coordinator)
     if score is None:
@@ -149,7 +152,7 @@ async def async_battery_tick(
             reason = "Grid-Laden Plan aktiv aber Ziel bereits erreicht"
 
     # Cheap tariff → hold (preserve battery)
-    elif score <= _HOLD_ENTER_SCORE or (current_mode == "hold" and score < _HOLD_EXIT_SCORE):
+    elif score <= hold_enter or (current_mode == "hold" and score < hold_exit):
         desired_mode = "hold"
         reason = f"Score {score} billig, Akku schonen"
 
