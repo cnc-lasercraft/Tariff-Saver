@@ -632,6 +632,15 @@ class TariffSaverConsumerSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
         coordinator.data['consumer_plans'] — sonst würde dieser Display-Sensor
         bei JEDEM State-Write die volle O(n²)-Scheduler-Optimierung neu rechnen
         (~0,5 s im Event-Loop)."""
+        # Bevorzugt den effektiven Plan, den binary_sensor._get_plan veroeffentlicht:
+        # nur der kennt den PV-Notlauf (Zustandsmaschine mit globaler Sperre, darf
+        # hier nicht ein zweites Mal laufen). Fehlt er - etwa im ersten Zyklus nach
+        # einem Refresh, weil coordinator.data neu gebaut wurde -, gilt unveraendert
+        # der bisherige Weg.
+        effective = (self.coordinator.data or {}).get("effective_plans", {})
+        published = effective.get(self.slot) or effective.get(str(self.slot))
+        if published is not None:
+            return published
         if not config.enabled:
             return {"status": "disabled", "should_run": False}
         if config.pv_opportunist:
