@@ -567,15 +567,23 @@ class TariffSaverConsumerShouldRunBinarySensor(CoordinatorEntity[TariffSaverCoor
         `sensor.tariff_saver_consumer_X` darf `_emergency_pv_plan` nicht selbst
         aufrufen: das ist eine Zustandsmaschine mit Timern und einer globalen
         Notlauf-Sperre, ein zweiter Aufrufer wuerde sie verfaelschen. Stattdessen
-        legen wir das Ergebnis hier in coordinator.data ab; der Sensor liest es
-        von dort und zeigt damit denselben Zustand wie dieser binary_sensor.
-        coordinator.data wird bei jedem Refresh neu gebaut und nirgends
-        persistiert - der Zusatzschluessel ist fluechtig und unkritisch.
+        legen wir das Ergebnis am Coordinator ab; der Sensor liest es von dort
+        und zeigt damit denselben Zustand wie dieser binary_sensor.
+
+        Bewusst NICHT in coordinator.data: das wird bei jedem Refresh neu
+        gebaut, und der Sensor schreibt seinen Zustand rund eine Millisekunde
+        VOR diesem binary_sensor - er faende dort also nie einen Eintrag und
+        fiele immer auf den Rohplan zurueck (am 30.08. live nachgemessen).
+        Am Coordinator ueberlebt der Eintrag den Refresh; der Sensor zeigt
+        damit hoechstens einen Zyklus Verzoegerung, was fuer eine Anzeige
+        genuegt. Rein fluechtig, nichts davon wird persistiert.
         """
         plan = self._compute_plan()
-        data = self.coordinator.data
-        if isinstance(data, dict):
-            data.setdefault("effective_plans", {})[self.slot] = plan
+        plans = getattr(self.coordinator, "effective_plans", None)
+        if plans is None:
+            plans = {}
+            self.coordinator.effective_plans = plans
+        plans[self.slot] = plan
         return plan
 
     def _compute_plan(self) -> dict:
