@@ -10,6 +10,18 @@ from homeassistant.util import dt as dt_util
 from .models import PriceSlot
 
 
+def score_from_prices(current_price: float | None, min_price: float | None, max_price: float | None) -> int | None:
+    """Return score where 0 is cheapest and 100 is most expensive."""
+    if not isinstance(current_price, (int, float)) or current_price < 0:
+        return None
+    if not isinstance(min_price, (int, float)) or not isinstance(max_price, (int, float)):
+        return None
+    if max_price <= min_price:
+        return 50
+    score = ((float(current_price) - float(min_price)) / (float(max_price) - float(min_price))) * 100.0
+    return max(0, min(100, int(round(score))))
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -142,3 +154,76 @@ def normalize_slots(raw_items: list[Any], *, price_scale: float = 1.0, ignore_ze
 
 def avg(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
+
+
+_STATE_TO_KW_WARNED: set[str] = set()
+
+
+def state_to_kw(state_obj) -> float:
+    """Convert an HA power entity state to kW using unit_of_measurement.
+    No unit → assume Watts (residential power sensors are almost always in W).
+    """
+    if state_obj is None or state_obj.state in ("unavailable", "unknown", ""):
+        return 0.0
+    try:
+        val = float(state_obj.state)
+    except (ValueError, TypeError):
+        return 0.0
+    unit = (state_obj.attributes.get("unit_of_measurement") or "").strip()
+    if unit == "W":
+        return val / 1000.0
+    if unit == "kW":
+        return val
+    eid = getattr(state_obj, "entity_id", "?")
+    if eid not in _STATE_TO_KW_WARNED:
+        import logging
+        logging.getLogger(__name__).warning(
+            "state_to_kw: %s hat keine unit_of_measurement — interpretiere als W. Setze Unit W/kW am Sensor um Warnung zu vermeiden.",
+            eid,
+        )
+        _STATE_TO_KW_WARNED.add(eid)
+    return val / 1000.0
+
+
+# --- Dreistufiges Energiemodell PV → Akku → Netz (Audit 2026-08-26, Cluster 2 / S5) ---
+
+def split_slot_energy(
+    load_kw: float,
+    pv_avail_kw: float,
+    battery_avail_kwh: float,
+    price: float,
+    battery_price: float,
+    *,
+    ignore_pv: bool = False,
+    battery_blocked: bool = False,
+    hours: float = 0.25,
+) -> tuple[float, float, float, float]:
+    """Teilt die Last eines Slots auf PV, Akku und Netz auf.
+
+    Reihenfolge: PV-Überschuss (0 CHF) → Akku-Budget (Wiederbeschaffungspreis) → Netz
+    (Slot-Preis). `ignore_pv` = tariff_only (PV wird nicht angerechnet, Akku schon —
+    nachts liefert physisch der Akku). `battery_blocked` = Akku lädt gerade aus dem
+    Netz (C9-Fenster) → keine Akku-Deckung möglich.
+
+    Rückgabe: (pv_kwh, battery_kwh, grid_kwh, cost_chf).
+    """
+    if load_kw <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    need_kwh = load_kw * hours
+    pv_kwh = 0.0 if ignore_pv else min(need_kwh, max(0.0, pv_avail_kw) * hours)
+    rest = need_kwh - pv_kwh
+    batt_kwh = 0.0 if battery_blocked else min(rest, max(0.0, battery_avail_kwh))
+    grid_kwh = rest - batt_kwh
+    cost = batt_kwh * battery_price + grid_kwh * price
+    return pv_kwh, batt_kwh, grid_kwh, cost
+
+
+def energy_source_label(pv_kwh: float, battery_kwh: float, grid_kwh: float) -> str:
+    """Dominante Quelle (≥ 80 %) oder 'mixed'."""
+    total = pv_kwh + battery_kwh + grid_kwh
+    if total <= 0:
+        return "pv"
+    for name, val in (("pv", pv_kwh), ("battery", battery_kwh), ("grid", grid_kwh)):
+        if val >= total * 0.8:
+            return name
+    return "mixed"

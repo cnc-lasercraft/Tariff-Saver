@@ -20,8 +20,10 @@ from .const import (
     DEFAULT_PUBLISH_TIME,
     FEED_IN_PRICE_MODE_ENTITY,
     DOMAIN,
+    SLOTS_PER_HOUR,
 )
 from .consumer_helpers import build_all_consumer_plans
+from .slot_helpers import score_from_prices
 from .storage import TariffSaverStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,11 +31,16 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PriceSlot:
-    """A normalized price slot."""
+    """A normalized price slot.
+
+    pv_kw: prognostizierte PV-Leistung in kW für diesen Slot (aus Solcast o.ä.),
+    bereits auf Slot-Granularität (SLOT_MINUTES) gemappt. 0.0 = kein Forecast verfügbar.
+    """
 
     start: datetime  # UTC, timezone-aware
     electricity_chf_per_kwh: float
     components_chf_per_kwh: dict[str, float]
+    pv_kw: float = 0.0
 
 
 WINDOW_HOURS: tuple[int, ...] = (1, 2, 3, 6)
@@ -62,62 +69,6 @@ def _slot_total_price(comps: dict[str, float] | None) -> float | None:
     return None
 
 
-
-
-def _aggregate_slots_30m(slots: list[PriceSlot]) -> list[PriceSlot]:
-    """Aggregate 15-minute price slots into 30-minute slots."""
-    buckets: dict[datetime, list[PriceSlot]] = {}
-    for slot in sorted(slots, key=lambda s: s.start):
-        local_start = dt_util.as_local(slot.start)
-        bucket_minute = 0 if local_start.minute < 30 else 30
-        bucket_local = local_start.replace(minute=bucket_minute, second=0, microsecond=0)
-        bucket_start = dt_util.as_utc(bucket_local)
-        buckets.setdefault(bucket_start, []).append(slot)
-
-    aggregated: list[PriceSlot] = []
-    for bucket_start in sorted(buckets):
-        bucket_slots = buckets[bucket_start]
-        components: dict[str, float] = {}
-        counts: dict[str, int] = {}
-        electricity_values: list[float] = []
-
-        for slot in bucket_slots:
-            if isinstance(slot.electricity_chf_per_kwh, (int, float)):
-                electricity_values.append(float(slot.electricity_chf_per_kwh))
-            for key, value in (slot.components_chf_per_kwh or {}).items():
-                if isinstance(value, (int, float)):
-                    components[key] = components.get(key, 0.0) + float(value)
-                    counts[key] = counts.get(key, 0) + 1
-
-        averaged_components = {
-            key: round(total / counts[key], 6)
-            for key, total in components.items()
-            if counts.get(key)
-        }
-        electricity = round(sum(electricity_values) / len(electricity_values), 6) if electricity_values else 0.0
-        if electricity > 0:
-            averaged_components["electricity"] = electricity
-
-        aggregated.append(
-            PriceSlot(
-                start=bucket_start,
-                electricity_chf_per_kwh=electricity,
-                components_chf_per_kwh=averaged_components,
-            )
-        )
-
-    return aggregated
-
-def score_from_prices(current_price: float | None, min_price: float | None, max_price: float | None) -> int | None:
-    """Return score where 0 is cheapest and 100 is most expensive."""
-    if not isinstance(current_price, (int, float)) or current_price < 0:
-        return None
-    if not isinstance(min_price, (int, float)) or not isinstance(max_price, (int, float)):
-        return None
-    if max_price <= min_price:
-        return 50
-    score = ((float(current_price) - float(min_price)) / (float(max_price) - float(min_price))) * 100.0
-    return max(0, min(100, int(round(score))))
 
 
 class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -152,54 +103,29 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await self.store.async_load()
                     break
 
-        now_local = dt_util.now()
-        today = now_local.date()
-        tomorrow = today + timedelta(days=1)
-
-        # Once per day fetch; EKZ signal resets _last_fetch_date to force re-fetch
-        if self._last_fetch_date == today and self.data:
-            return self.data
-
-        provider_data = self._get_provider_data()
-        active_raw = provider_data.get("active_slots") or []
-        baseline_raw = provider_data.get("baseline_slots") or []
-
-        active = [self._convert_slot(slot) for slot in active_raw]
-        baseline = [self._convert_slot(slot) for slot in baseline_raw]
-        active_30m = _aggregate_slots_30m(active)
-        baseline_30m = _aggregate_slots_30m(baseline)
-
+        # Build active slots from own store (populated by _on_ekz_bus_event)
+        active = self._build_active_from_store()
         if not active:
-            raise UpdateFailed("EKZ Tariff provider returned no active_slots")
+            if self.data:
+                return self.data
+            raise UpdateFailed("Keine Preisdaten im Store")
 
-        self.link_status = provider_data.get("link_status")
-        self.linking_url = provider_data.get("linking_url")
-        self.last_api_success_utc = provider_data.get("last_api_success_utc")
-        date_validity = provider_data.get("date_validity") or {}
-
-        if self.store is not None:
-            if isinstance(self.last_api_success_utc, datetime):
-                self.store.set_last_api_success(self.last_api_success_utc)
-            base_map = {s.start: s.components_chf_per_kwh for s in baseline}
-            for s in active:
-                self.store.set_price_slot(
-                    s.start,
-                    dyn_components_chf_per_kwh=s.components_chf_per_kwh,
-                    base_components_chf_per_kwh=base_map.get(s.start),
-                )
-            self.store.trim_price_slots(keep_days=7)
+        self.store.trim_price_slots(keep_days=400)
 
         # Update historical min/max prices BEFORE computing stats (scores depend on these)
         if self.store is not None:
             from .const import CONF_MIN_VALID_PRICE, DEFAULT_MIN_VALID_PRICE, CONF_MAX_VALID_PRICE, DEFAULT_MAX_VALID_PRICE
             min_valid = float(self.config.get(CONF_MIN_VALID_PRICE, DEFAULT_MIN_VALID_PRICE) or DEFAULT_MIN_VALID_PRICE)
             max_valid = float(self.config.get(CONF_MAX_VALID_PRICE, DEFAULT_MAX_VALID_PRICE) or DEFAULT_MAX_VALID_PRICE)
-            all_prices = [_slot_total_price(s.components_chf_per_kwh) for s in active_30m]
+            all_prices = [_slot_total_price(s.components_chf_per_kwh) for s in active]
             self.store.update_historical_prices(all_prices, min_valid=min_valid, max_valid=max_valid)
             if self.store.dirty:
-                self.hass.async_create_task(self.store.async_save())
+                # Gedrosselt: _async_update_data läuft via should_poll-Sensoren alle
+                # ~30 s, und dirty kann (Sample-Debounce) minutenlang stehen — ein
+                # direkter Save hier hiesse Voll-Serialize des Multi-MB-Stores pro Poll.
+                self.store.schedule_save()
 
-        stats = self._compute_daily_stats(active_30m, baseline_30m, date_validity)
+        stats = self._compute_daily_stats(active, [], {})
         feed_in_price = self._get_feed_in_price()
 
         if self.store is not None:
@@ -209,13 +135,11 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.store.set_day_average_price(slot_day, float(avg_active))
                 self.store.trim_day_average_prices(keep_days=400)
             if self.store.dirty:
-                await self.store.async_save()
+                self.store.schedule_save()
 
-        windows = self._compute_best_windows(active_30m)
-        self._last_fetch_date = today
+        windows = self._compute_best_windows(active)
 
-        # ── Consumer Plans: nur aus Storage laden ──
-        # Neuberechnung erfolgt NUR über EKZ-Signal (in __init__.py _on_ekz_bus_event)
+        # Consumer Plans: nur aus Storage laden
         consumer_plans: dict = {}
         if self.store is not None and self.store.consumer_plans:
             consumer_plans = {
@@ -224,10 +148,10 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
 
         return {
-            "active": active_30m,
-            "baseline": baseline_30m,
-            "active_raw": active,
-            "baseline_raw": baseline,
+            "active": active,
+            "baseline": [],
+            "active_raw": [],
+            "baseline_raw": [],
             "stats": stats,
             "feed_in": {
                 "mode": self.feed_in_price_mode,
@@ -235,28 +159,38 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "entity_id": self.feed_in_price_entity,
             },
             "windows": windows,
-            "provider": {
-                "entry_id": provider_data.get("entry_id"),
-                "provider": provider_data.get("provider"),
-                "active_publication_timestamp": provider_data.get("active_publication_timestamp"),
-                "baseline_publication_timestamp": provider_data.get("baseline_publication_timestamp"),
-            },
+            "provider": {},
             "consumer_plans": consumer_plans,
-            "date_validity": date_validity,
+            "date_validity": {},
         }
 
-    def _get_provider_data(self) -> dict[str, Any]:
-        try:
-            from custom_components.ekz_tariff import get_first_provider_data, get_provider_data
-        except ImportError as err:
-            raise UpdateFailed("Could not import custom_components.ekz_tariff provider helpers") from err
-
-        try:
-            if isinstance(self.ekz_entry_id, str) and self.ekz_entry_id.strip():
-                return get_provider_data(self.hass, self.ekz_entry_id.strip())
-            return get_first_provider_data(self.hass)
-        except KeyError as err:
-            raise UpdateFailed("No loaded EKZ Tariff entry found") from err
+    def _build_active_from_store(self) -> list[PriceSlot]:
+        """Build active PriceSlot list from own stored price_slots."""
+        if self.store is None or not self.store.price_slots:
+            return []
+        slots_15m: list[PriceSlot] = []
+        for ts_key, slot_data in self.store.price_slots.items():
+            parsed = dt_util.parse_datetime(ts_key)
+            if parsed is None:
+                continue
+            # price_slots store format: a_comp = dynamic components, b_comp = baseline
+            a_comp = slot_data.get("a_comp") or {}
+            if not a_comp:
+                continue
+            components = {str(k): float(v) for k, v in a_comp.items() if isinstance(v, (int, float))}
+            electricity = float(components.get("electricity", 0.0))
+            pv_kw_raw = slot_data.get("pv_kw")
+            try:
+                pv_kw = float(pv_kw_raw) if pv_kw_raw is not None else 0.0
+            except (TypeError, ValueError):
+                pv_kw = 0.0
+            slots_15m.append(PriceSlot(
+                start=dt_util.as_utc(parsed),
+                electricity_chf_per_kwh=electricity,
+                components_chf_per_kwh=components,
+                pv_kw=pv_kw,
+            ))
+        return sorted(slots_15m, key=lambda s: s.start)
 
     def _get_feed_in_price(self) -> float | None:
         if self.feed_in_price_mode == FEED_IN_PRICE_MODE_ENTITY and isinstance(self.feed_in_price_entity, str) and self.feed_in_price_entity:
@@ -325,7 +259,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current_baseline = _slot_total_price(current_base_slot.components_chf_per_kwh) if current_base_slot else None
 
         slot_day_local = today_local if today_active else None
-        year_prices = self.store.get_year_day_average_prices(slot_day_local) if self.store and isinstance(slot_day_local, date) else []
+        year_prices = self.store.get_year_day_average_prices(today_local) if self.store else []
         year_min = min(year_prices) if year_prices else None
         year_max = max(year_prices) if year_prices else None
         day_score = score_from_prices(avg_active, year_min, year_max)
@@ -391,7 +325,7 @@ class TariffSaverCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now_utc = dt_util.utcnow()
 
         for hours in WINDOW_HOURS:
-            slot_count = hours * 2
+            slot_count = hours * SLOTS_PER_HOUR
             candidates: list[tuple[datetime, float]] = []
             for idx in range(0, len(ordered) - slot_count + 1):
                 window_slots = ordered[idx : idx + slot_count]

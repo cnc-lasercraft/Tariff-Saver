@@ -13,7 +13,7 @@ class TariffSaverConsumerCard extends HTMLElement {
 
   _getStatusKey(hass) {
     let key = '';
-    for (let i = 1; i <= 10; i++) {
+    for (let i = 1; i <= 15; i++) {
       const e = hass.states[`binary_sensor.tariff_saver_consumer_${i}_should_run`];
       if (e) key += e.state + e.last_updated;
     }
@@ -34,15 +34,20 @@ class TariffSaverConsumerCard extends HTMLElement {
     return state.attributes.consumers;
   }
 
-  async _save(slot, key, value) {
-    if (!this._hass) return;
-    try {
-      await this._hass.callService('tariff_saver', 'update_consumer', {
-        slot: slot, key: key, value: value,
-      });
-    } catch (e) {
-      alert('Speichern fehlgeschlagen: ' + e.message);
-    }
+  _save(slot, key, value) {
+    if (!this._debounceTimers) this._debounceTimers = {};
+    const timerKey = `${slot}_${key}`;
+    clearTimeout(this._debounceTimers[timerKey]);
+    this._debounceTimers[timerKey] = setTimeout(async () => {
+      if (!this._hass) return;
+      try {
+        await this._hass.callService('tariff_saver', 'update_consumer', {
+          slot: slot, key: key, value: value,
+        });
+      } catch (e) {
+        alert('Speichern fehlgeschlagen: ' + e.message);
+      }
+    }, 500);
   }
 
   _render() {
@@ -62,7 +67,7 @@ class TariffSaverConsumerCard extends HTMLElement {
     ];
 
     let rows = '';
-    for (let i = 1; i <= 10; i++) {
+    for (let i = 1; i <= 15; i++) {
       const c = consumers[`consumer_${i}`] || {};
       const enabled = c.enabled || false;
       const name = c.name || '';
@@ -78,6 +83,13 @@ class TariffSaverConsumerCard extends HTMLElement {
       const minRuntime = c.min_runtime_minutes || 0;
       const runOrder = c.run_order || 0;
       const maxDays = c.max_days || 0;
+      const skipNext = c.skip_next_run || false;
+      const pauseVacation = c.pause_on_vacation || false;
+      const allowedFrom = c.allowed_from || '';
+      const allowedUntil = c.allowed_until || '';
+      const runtimeSensor = c.runtime_sensor || '';
+      const demandEntity = c.demand_entity || '';
+      const kind = c.kind || 'daily_fixed';
 
       const entity = this._hass.states[`binary_sensor.tariff_saver_consumer_${i}_should_run`];
       const status = entity ? entity.attributes.status || '' : '';
@@ -93,6 +105,7 @@ class TariffSaverConsumerCard extends HTMLElement {
         else if (status === 'geplant') { statusIcon = '📋'; statusText = 'geplant'; }
         else if (status === 'blockiert') { statusIcon = '🚫'; statusText = 'blockiert'; }
         else if (status === 'beendet') { statusIcon = '✅'; statusText = 'beendet'; }
+        else if (status === 'vacation') { statusIcon = '🏖️'; statusText = 'Ferienpause'; }
         else if (status && status !== 'planned' && status !== 'error_no_plan' && status !== 'kein_plan') {
           // Reported status from automation
           statusIcon = '💬'; statusText = status;
@@ -106,6 +119,14 @@ class TariffSaverConsumerCard extends HTMLElement {
         const s = new Date(chosenStart);
         const e = new Date(chosenEnd);
         window = `${s.toLocaleDateString('de-CH',{day:'2-digit',month:'2-digit'})} ${s.toLocaleTimeString('de-CH',{hour:'2-digit',minute:'2-digit'})}–${e.toLocaleTimeString('de-CH',{hour:'2-digit',minute:'2-digit'})}`;
+      } else if (pvOpp) {
+        const sensorEntity = this._hass.states[`sensor.tariff_saver_consumer_${i}`];
+        const wins = sensorEntity && sensorEntity.attributes.pv_windows ? sensorEntity.attributes.pv_windows : [];
+        window = wins.map(w => {
+          const ws = new Date(w.start);
+          const we = new Date(w.end);
+          return `PV ${ws.toLocaleTimeString('de-CH',{hour:'2-digit',minute:'2-digit'})}–${we.toLocaleTimeString('de-CH',{hour:'2-digit',minute:'2-digit'})}`;
+        }).join(', ');
       }
 
       let modeOptions = modes.map(m =>
@@ -119,6 +140,10 @@ class TariffSaverConsumerCard extends HTMLElement {
           <td class="toggle"><label class="sw"><input type="checkbox" ${enabled ? 'checked' : ''} data-slot="${i}" data-key="enabled"><span class="sl"></span></label></td>
           <td class="name"><input type="text" value="${this._esc(name)}" data-slot="${i}" data-key="name" placeholder="—"></td>
           <td class="mode"><select data-slot="${i}" data-key="mode">${modeOptions}</select></td>
+          <td class="kind"><select data-slot="${i}" data-key="kind">
+            <option value="daily_fixed" ${kind === 'daily_fixed' ? 'selected' : ''}>Täglich</option>
+            <option value="session" ${kind === 'session' ? 'selected' : ''}>Session</option>
+          </select></td>
           <td class="num"><input type="number" value="${power}" data-slot="${i}" data-key="power_kw" min="0" max="25" step="0.1"></td>
           <td class="num"><input type="number" value="${duration}" data-slot="${i}" data-key="duration_minutes" min="0" max="480" step="15"></td>
           <td class="num"><input type="number" value="${priority}" data-slot="${i}" data-key="priority" min="1" max="10"></td>
@@ -126,9 +151,15 @@ class TariffSaverConsumerCard extends HTMLElement {
           <td class="toggle"><label class="sw"><input type="checkbox" ${tariffOnly ? 'checked' : ''} data-slot="${i}" data-key="tariff_only"><span class="sl"></span></label></td>
           <td class="toggle"><label class="sw"><input type="checkbox" ${pvOpp ? 'checked' : ''} data-slot="${i}" data-key="pv_opportunist"><span class="sl"></span></label></td>
           <td class="num"><input type="text" value="${minDays}-${maxDays}" data-slot="${i}" data-key="days_range" style="width:45px;text-align:center" placeholder="0-0"></td>
-          <td class="num"><input type="number" value="${minRuntime}" data-slot="${i}" data-key="min_runtime_minutes" min="0" max="60" step="1" style="width:40px"></td>
+          <td class="num"><input type="number" value="${minRuntime}" data-slot="${i}" data-key="min_runtime_minutes" min="0" max="60" step="1" style="width:55px"></td>
           <td class="num"><input type="number" value="${runOrder}" data-slot="${i}" data-key="run_order" min="0" max="10" step="1" style="width:50px"></td>
           <td class="meas"><input type="text" value="${this._esc(measurement)}" data-slot="${i}" data-key="measurement_entity" placeholder="—"></td>
+          <td class="toggle"><label class="sw"><input type="checkbox" ${skipNext ? 'checked' : ''} data-slot="${i}" data-key="skip_next_run"><span class="sl"></span></label></td>
+          <td class="toggle"><label class="sw"><input type="checkbox" ${pauseVacation ? 'checked' : ''} data-slot="${i}" data-key="pause_on_vacation"><span class="sl"></span></label></td>
+          <td class="num"><input type="text" value="${this._esc(allowedFrom)}" data-slot="${i}" data-key="allowed_from" placeholder="HH:MM" style="width:70px;text-align:center"></td>
+          <td class="num"><input type="text" value="${this._esc(allowedUntil)}" data-slot="${i}" data-key="allowed_until" placeholder="HH:MM" style="width:70px;text-align:center"></td>
+          <td class="meas"><input type="text" value="${this._esc(runtimeSensor)}" data-slot="${i}" data-key="runtime_sensor" placeholder="—"></td>
+          <td class="meas"><input type="text" value="${this._esc(demandEntity)}" data-slot="${i}" data-key="demand_entity" placeholder="—" title="Bedarfs-Signal: on = fällig (auch mehrfach/Tag), off = warten"></td>
           <td class="live">${source || '–'}</td>
           <td class="live win">${window ? window + (statusText ? '<br><span class="stxt">' + statusText + '</span>' : '') : (statusText || '–')}</td>
         </tr>`;
@@ -149,6 +180,8 @@ class TariffSaverConsumerCard extends HTMLElement {
         .name input{width:100%;min-width:180px}
         .mode{width:110px}
         .mode select{width:110px}
+        .kind{width:100px}
+        .kind select{width:100px}
         .num{width:70px}
         .num input{width:70px;text-align:right}
         .meas{min-width:150px}
@@ -173,10 +206,10 @@ class TariffSaverConsumerCard extends HTMLElement {
       <ha-card>
         <h2>Consumer Konfiguration</h2>
         <table><thead><tr>
-          <th></th><th>#</th><th>An</th><th>Name</th><th>Modus</th><th>kW</th><th>Min</th><th>Prio</th><th>Score</th><th>Grid</th><th>PV-Opp</th><th>Tage</th><th>LZ</th><th>RF</th><th>Mess-Entity</th><th>Quelle</th><th>Status</th>
+          <th></th><th>#</th><th>An</th><th>Name</th><th>Modus</th><th>Typ</th><th>kW</th><th>Min</th><th>Prio</th><th>Score</th><th>Grid</th><th>PV-Opp</th><th>Tage</th><th>LZ</th><th>RF</th><th>Mess-Entity</th><th>Skip</th><th>Ferien</th><th>Von</th><th>Bis</th><th>Runtime-Sensor</th><th>Bedarf</th><th>Quelle</th><th>Status</th>
         </tr></thead><tbody>${rows}</tbody></table>
         <div class="foot">🟢 aktiv · 📋 geplant · 🚫 blockiert · ✅ abgelaufen · 💬 Rückmeldung · ⏸ wartend · ⬜ aus<br>
-        <b>Score</b> = Max Grid Score (nur ohne PV) · <b>Grid</b> = nur Tarif-Fenster, kein PV · <b>PV-Opp</b> = läuft immer bei PV-Überschuss · <b>Tage</b> = min-max Tage zwischen Läufen (0-0 = keine Vorgabe) · <b>LZ</b> = Min. Laufzeit in Minuten</div>
+        <b>Typ</b> = Täglich (fix geplant) oder Session (Wallbox via huawei_solar) · <b>Score</b> = Max Grid Score (nur ohne PV) · <b>Grid</b> = nur Tarif-Fenster, kein PV · <b>PV-Opp</b> = läuft immer bei PV-Überschuss · <b>Tage</b> = min-max Tage zwischen Läufen (0-0 = keine Vorgabe) · <b>LZ</b> = Min. Laufzeit in Minuten · <b>Skip</b> = nächsten Lauf auslassen (auto-Reset 00:00) · <b>Ferien</b> = im Ferienmodus pausiert (🏖️, An/Aus bleibt unangetastet) · <b>Von/Bis</b> = Zeitfenster HH:MM für Planung (leer = jederzeit) · <b>Runtime-Sensor</b> = Entity mit Laufzeit heute (h); Skip bei ≥ Min</div>
       </ha-card>`;
 
     this._bindEvents();

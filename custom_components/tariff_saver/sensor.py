@@ -1,7 +1,8 @@
 """Sensor platform for Tariff Saver."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import logging
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
@@ -15,11 +16,13 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import CONSUMER_COUNT, CONF_CONSUMERS, DOMAIN
+from .const import CONSUMER_COUNT, CONF_CONSUMERS, DOMAIN, SLOT_MINUTES, SLOTS_PER_HOUR, SLOTS_PER_DAY
 from .coordinator import PriceSlot, TariffSaverCoordinator, _slot_total_price
 from .models import ConsumerConfig
 from .consumer_helpers import build_consumer_plan, effective_energy_kwh, get_consumer_config
 from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
+
+_LOGGER = logging.getLogger(__name__)
 
 CONF_CONSUMPTION_ENERGY_ENTITY = "consumption_energy_entity"
 SIGNAL_STORE_UPDATED = "tariff_saver_store_updated"
@@ -98,23 +101,24 @@ def _absolute_score(price: float, hist_min: float, hist_max: float, baseline: fl
 
 
 def _get_baseline_price(coordinator) -> float:
-    """Get current baseline all-in price."""
-    data = coordinator.data or {}
-    if not isinstance(data, dict):
-        return 0.25
-    baseline = data.get("baseline", [])
-    if not baseline:
-        return 0.25
+    """Get baseline price for current season from config settings (netto CHF/kWh)."""
     from homeassistant.util import dt as dt_util
-    now_utc = dt_util.utcnow()
-    current = next((s for s in reversed(sorted(baseline, key=lambda s: s.start)) if s.start <= now_utc), None)
-    if current is None and baseline:
-        current = baseline[0]
-    if current:
-        p = _slot_total_price(current.components_chf_per_kwh)
-        if isinstance(p, (int, float)) and p > 0.10:
-            return float(p)
-    return 0.25
+    from .const import (
+        CONF_BASELINE_WINTER, CONF_BASELINE_FRUEHLING,
+        CONF_BASELINE_SOMMER, CONF_BASELINE_HERBST,
+        DEFAULT_BASELINE_WINTER, DEFAULT_BASELINE_FRUEHLING,
+        DEFAULT_BASELINE_SOMMER, DEFAULT_BASELINE_HERBST,
+    )
+    config = coordinator.config or {}
+    month = dt_util.now().month
+    if month in (12, 1, 2):
+        return float(config.get(CONF_BASELINE_WINTER, DEFAULT_BASELINE_WINTER))
+    elif month in (3, 4, 5):
+        return float(config.get(CONF_BASELINE_FRUEHLING, DEFAULT_BASELINE_FRUEHLING))
+    elif month in (6, 7, 8):
+        return float(config.get(CONF_BASELINE_SOMMER, DEFAULT_BASELINE_SOMMER))
+    else:
+        return float(config.get(CONF_BASELINE_HERBST, DEFAULT_BASELINE_HERBST))
 
 
 def _current_score_live(coordinator) -> int | None:
@@ -162,6 +166,33 @@ def _stars(score: int | None, scale: int) -> int | None:
     return max(0, min(scale, int(round(((100 - score) / 100) * scale))))
 
 
+def _stars_display_from_value(value: int | float, scale: int = 5) -> str:
+    """Return HTML string with MDI star icons for a given star value (e.g. 3.5 of 5)."""
+    value = max(0.0, min(float(scale), float(value)))
+    full = int(value)
+    has_half = (value - full) >= 0.5
+    empty = scale - full - (1 if has_half else 0)
+    sf = '<font color="#FFD700"><ha-icon icon="mdi:star"></ha-icon></font>'
+    sh = '<font color="#FFD700"><ha-icon icon="mdi:star-half-full"></ha-icon></font>'
+    se = '<font color="#555"><ha-icon icon="mdi:star-outline"></ha-icon></font>'
+    return (sf * full) + (sh if has_half else "") + (se * empty)
+
+
+def _stars_display(score: int | None, scale: int = 5) -> str | None:
+    """Return HTML string with MDI star icons (full, half, empty) colored gold/grey."""
+    if score is None:
+        return None
+    rating = round(((100 - score) / 100) * scale * 2) / 2  # half-star resolution
+    rating = max(0.0, min(float(scale), rating))
+    full = int(rating)
+    has_half = (rating - full) == 0.5
+    empty = scale - full - (1 if has_half else 0)
+    sf = '<font color="#FFD700"><ha-icon icon="mdi:star"></ha-icon></font>'
+    sh = '<font color="#FFD700"><ha-icon icon="mdi:star-half-full"></ha-icon></font>'
+    se = '<font color="#555"><ha-icon icon="mdi:star-outline"></ha-icon></font>'
+    return (sf * full) + (sh if has_half else "") + (se * empty)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -183,7 +214,9 @@ async def async_setup_entry(
             changed = store.add_sample(now_utc, kwh_total)
             finalized = store.finalize_due_slots(now_utc)
             if store.dirty:
-                hass.async_create_task(store.async_save())
+                # Gedrosselt: Samples kommen ~alle 30 s, ein Voll-Save des
+                # Multi-MB-Stores pro Sample stallt Loop + Disk.
+                store.schedule_save()
             if changed or finalized > 0:
                 async_dispatcher_send(hass, f"{SIGNAL_STORE_UPDATED}_{entry.entry_id}")
 
@@ -201,8 +234,8 @@ async def async_setup_entry(
         if current_state is not None:
             try:
                 _process_kwh(float(current_state.state))
-            except Exception:
-                pass
+            except Exception as _err:
+                _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "_on_energy_change", _err)
 
         hass.data[DOMAIN][f"{entry.entry_id}_unsub_energy_cost"] = async_track_state_change_event(
             hass, [energy_entity], _on_energy_change
@@ -224,6 +257,14 @@ async def async_setup_entry(
 
     @callback
     def _process_consumers() -> None:
+        """Poll measurement_entities — aber NUR wenn Consumer aktuell laufen soll.
+
+        Sonst misst ein gemeinsam genutzter Sensor (z.B. WP-Kreis Shelly für Slot 1+10)
+        permanent Energy vom Haupt-WP → Fake-Runs → Learning zumüllt →
+        ``last_run_end_utc`` fälschlich gesetzt → Consumer wird „waiting_window" obwohl
+        heute noch gar nicht gelaufen. Fix seit 2026-04-21: samplen nur wenn
+        ``binary_sensor.tariff_saver_consumer_X_should_run == on``.
+        """
         store = getattr(coordinator, "store", None)
         if store is None:
             return
@@ -232,6 +273,11 @@ async def async_setup_entry(
         for slot in range(1, CONSUMER_COUNT + 1):
             config = get_consumer_config(entry, slot)
             if not config.enabled or not config.learning_enabled or not config.measurement_entity:
+                store._finalize_consumer_run(str(slot))
+                continue
+            # Nur samplen während der Consumer aktiv laufen soll (oder gerade PV-Opp ist)
+            should_run_state = hass.states.get(f"binary_sensor.tariff_saver_consumer_{slot}_should_run")
+            if should_run_state is None or should_run_state.state != "on":
                 store._finalize_consumer_run(str(slot))
                 continue
             state = hass.states.get(config.measurement_entity)
@@ -244,7 +290,7 @@ async def async_setup_entry(
             except Exception:
                 continue
         if store.dirty:
-            hass.async_create_task(store.async_save())
+            store.schedule_save()
         if changed:
             async_dispatcher_send(hass, f"{SIGNAL_STORE_UPDATED}_{entry.entry_id}")
 
@@ -286,9 +332,17 @@ async def async_setup_entry(
     entities.append(BaseLoadSensor(coordinator, entry))
     entities.append(ConsumerConfigSensor(coordinator, entry))
     entities.append(EnergyUntilPvSensor(coordinator, entry))
+    entities.append(PvUeberschussVerfuegbarSensor(coordinator, entry))
     entities.append(StromAmpelSensor(coordinator, entry))
     entities.append(BatteryManagerSensor(coordinator, entry))
     entities.append(ActivityLogSensor(coordinator, entry))
+    entities.append(BillingSensor(coordinator, entry))
+    entities.append(WallboxTargetMaxSensor(coordinator, entry))
+    entities.append(WallboxPvReserveSensor(coordinator, entry))
+    entities.append(WallboxSessionModeSensor(coordinator, entry))
+    entities.append(LightAutoOffStatusSensor(coordinator, entry))
+    entities.append(PvDumpStatusSensor(coordinator, entry))
+    entities.append(StandbyWatchStatusSensor(coordinator, entry))
 
     for hours in WINDOW_HOURS:
         entities.append(BestWindowStartSensor(coordinator, entry, hours))
@@ -318,19 +372,11 @@ class TariffSaverPriceCurveSensor(CoordinatorEntity[TariffSaverCoordinator], Sen
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         active = _active_slots(self.coordinator)
-        baseline = _baseline_slots(self.coordinator)
-        baseline_map = {slot.start: slot for slot in baseline}
+        baseline = _get_baseline_price(self.coordinator)
         return {
-            "interval_minutes": 30,
+            "interval_minutes": SLOT_MINUTES,
             "slot_count": len(active),
-            "slots": [
-                {
-                    "start": slot.start.isoformat(),
-                    "price_all_in_chf_per_kwh": _all_in_from_slot(slot),
-                    "baseline_chf_per_kwh": _all_in_from_slot(baseline_map.get(slot.start)),
-                }
-                for slot in active
-            ],
+            "baseline_chf_per_kwh": round(baseline, 6) if baseline else None,
         }
 
 
@@ -365,8 +411,8 @@ class TariffSaverBaselinePriceNowSensor(CoordinatorEntity[TariffSaverCoordinator
 
     @property
     def native_value(self) -> float | None:
-        value = _all_in_from_slot(_current_slot(_baseline_slots(self.coordinator)))
-        return round(float(value), 6) if isinstance(value, (int, float)) and value >= 0 else None
+        value = _get_baseline_price(self.coordinator)
+        return round(float(value), 6) if isinstance(value, (int, float)) and value > 0 else None
 
 
 class TariffSaverNextPriceSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
@@ -410,6 +456,7 @@ class TariffSaverScoreNowSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
             "historical_min": store.historical_price_min if store else None,
             "historical_max": store.historical_price_max if store else None,
             "baseline": round(baseline, 4),
+            "stars_display": _stars_display(_current_score_live(self.coordinator), 5),
             "interpretation": "Score 0=hist.günstigster Preis, Score 50=Baseline(Flat), Score 100=hist.teuerster Preis",
         }
 
@@ -459,9 +506,11 @@ class TariffSaverDayScoreSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
             "year_min_day_avg_chf_per_kwh": stats.get("year_min_day_avg_chf_per_kwh"),
             "year_max_day_avg_chf_per_kwh": stats.get("year_max_day_avg_chf_per_kwh"),
             "year_day_samples": stats.get("year_day_samples"),
+            "stars_display": _stars_display(stats.get("day_score_0_100"), 5),
             "tomorrow_avg_chf_per_kwh": stats.get("tomorrow_avg_chf_per_kwh"),
             "tomorrow_score_0_100": stats.get("tomorrow_score_0_100"),
             "tomorrow_slot_count": stats.get("tomorrow_slot_count"),
+            "tomorrow_stars_display": _stars_display(stats.get("tomorrow_score_0_100"), 5),
         }
 
 
@@ -576,12 +625,35 @@ class TariffSaverConsumerSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
         value = effective_energy_kwh(config, learning)
         return round(float(value), 3) if isinstance(value, (int, float)) and value > 0 else None
 
+    def _get_plan(self, config, learning) -> dict[str, Any]:
+        """Vorberechneten Plan aus dem Store lesen (gleiche Quelle wie der
+        binary_sensor). Nur pv_opportunist-Consumer brauchen eine Live-Berechnung
+        (Echtzeit-PV-Check); alle anderen lesen das Scheduler-Ergebnis aus
+        coordinator.data['consumer_plans'] — sonst würde dieser Display-Sensor
+        bei JEDEM State-Write die volle O(n²)-Scheduler-Optimierung neu rechnen
+        (~0,5 s im Event-Loop)."""
+        if not config.enabled:
+            return {"status": "disabled", "should_run": False}
+        if config.pv_opportunist:
+            return build_consumer_plan(
+                self.hass, self.entry, config, learning, _active_slots(self.coordinator)
+            )
+        plans = (self.coordinator.data or {}).get("consumer_plans", {})
+        plan = plans.get(self.slot) or plans.get(str(self.slot))
+        if plan is not None:
+            return plan
+        if config.trigger_entity:
+            return {"status": "waiting_trigger", "should_run": False, "source": "on_demand"}
+        if config.kind == "session":
+            return {"status": "waiting_session", "should_run": False, "source": "session"}
+        return {"status": "error_no_plan", "should_run": False}
+
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         config = get_consumer_config(self.entry, self.slot)
         store = getattr(self.coordinator, "store", None)
         learning = store.get_consumer_learning(str(self.slot)) if store is not None else {}
-        plan = build_consumer_plan(self.hass, self.entry, config, learning, _active_slots(self.coordinator))
+        plan = self._get_plan(config, learning)
 
         # Consumer transition logging moved to binary_sensor.py
 
@@ -613,11 +685,12 @@ class TariffSaverConsumerSensor(CoordinatorEntity[TariffSaverCoordinator], Senso
             "should_run": plan.get("should_run"),
             "chosen_start": plan.get("chosen_start"),
             "chosen_end": plan.get("chosen_end"),
-            "expected_pv_energy_kwh": plan.get("expected_pv_energy_kwh"),
+            "expected_pv_energy_kwh": plan.get("expected_pv_energy_kwh", plan.get("expected_energy_kwh")),
             "battery_available_kwh": plan.get("battery_available_kwh"),
             "tariff_window_start": plan.get("tariff_window_start"),
             "tariff_window_end": plan.get("tariff_window_end"),
             "tariff_avg_price_chf_per_kwh": plan.get("tariff_avg_price_chf_per_kwh"),
+            "pv_windows": plan.get("pv_windows"),
         }
 
 
@@ -794,9 +867,10 @@ class BaseLoadSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
             import datetime as _dtmod
             month = _dtmod.datetime.now().month
             current_season = {12:"Winter",1:"Winter",2:"Winter",3:"Frühling",4:"Frühling",5:"Frühling",6:"Sommer",7:"Sommer",8:"Sommer",9:"Herbst",10:"Herbst",11:"Herbst"}.get(month, "Unknown")
-        season_profile = store.get_seasonal_load_profile(current_season)
-        all_seasons = ("Winter", "Frühling", "Sommer", "Herbst")
-        season_profiles = {s: store.get_seasonal_load_profile(s) for s in all_seasons}
+        # Alle Saison-Profile in EINEM Scan über load_profiles bauen, statt
+        # get_seasonal_load_profile() 5× aufzurufen (je ein Full-Scan).
+        season_profiles = store.get_all_seasonal_load_profiles()
+        season_profile = season_profiles.get(current_season, {})
         return {
             "last_date": last.get("date"),
             "last_total_kwh": last.get("emma_kwh"),
@@ -835,7 +909,7 @@ class ConsumerConfigSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnti
     def extra_state_attributes(self) -> dict[str, Any]:
         consumers = self.entry.options.get("consumers", {})
         result = {}
-        for slot in range(1, 11):
+        for slot in range(1, CONSUMER_COUNT + 1):
             cfg = consumers.get(str(slot), {})
             if not isinstance(cfg, dict):
                 cfg = {}
@@ -857,6 +931,13 @@ class ConsumerConfigSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnti
                 "min_days": cfg.get("min_days", 0),
                 "max_days": cfg.get("max_days", 0),
                 "measurement_entity": cfg.get("measurement_entity", ""),
+                "kind": cfg.get("kind", "daily_fixed"),
+                "skip_next_run": cfg.get("skip_next_run", False),
+                "pause_on_vacation": cfg.get("pause_on_vacation", False),
+                "allowed_from": cfg.get("allowed_from", ""),
+                "allowed_until": cfg.get("allowed_until", ""),
+                "runtime_sensor": cfg.get("runtime_sensor", ""),
+                "demand_entity": cfg.get("demand_entity", ""),
             }
         # General settings
         general = {}
@@ -865,16 +946,35 @@ class ConsumerConfigSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnti
             "ekz_entry_id", "publish_time",
             "pv_forecast_entity", "pv_forecast_attribute",
             "battery_enabled", "battery_capacity_kwh", "battery_min_soc_percent", "battery_soc_entity", "battery_soc_margin_percent",
+            "battery_round_trip_loss_percent", "battery_max_charge_kw", "battery_pv_charge_threshold_kw", "battery_pv_full_charge_ratio",
+            "battery_charge_cost_tolerance_pct", "battery_device_id", "battery_hold_enter_score", "battery_hold_exit_score",
             "feed_in_price_mode", "feed_in_fixed_price", "feed_in_price_entity",
             "min_valid_price", "max_valid_price",
             "ampel_pv_entity", "ampel_pv_threshold_kw", "ampel_score_good", "ampel_score_bad",
-            "heating_wp_entity", "heating_wp_power_kw", "heating_temp_sensor_1", "heating_temp_sensor_2", "heating_temp_sensor_3", "heating_comfort_min", "heating_pv_max", "heating_seasons", "heating_wp_off_value", "heating_wp_ww_value", "heating_wp_heat_value", "heating_max_score", "heating_max_score_absolute", "heating_frost_min", "heating_wp_min_runtime", "heating_pv_wait_minutes", "heating_enabled", "heating_pv_surplus_entity", "pv_surplus_entity", "strom_sparen_score",
+            "heating_wp_entity", "heating_wp_power_kw", "heating_temp_sensor_1", "heating_temp_sensor_2", "heating_temp_sensor_3", "heating_comfort_min", "heating_pv_max", "heating_seasons", "heating_wp_off_value", "heating_wp_ww_value", "heating_wp_heat_value", "heating_max_score", "heating_max_score_absolute", "heating_frost_min", "heating_wp_min_runtime", "heating_pv_wait_minutes", "heating_enabled", "heating_pv_surplus_entity", "heating_block_entity", "pv_surplus_entity", "strom_sparen_score",
+            "pool_filter_min_surplus_kw", "pool_wp_min_surplus_kw", "pool_dwell_minutes", "pool_wp_min_runtime",
+            "flat_tariff_spread_rp", "flat_grid_earliest_hour",
+            "pv_dump_enabled", "pv_dump_grid_out_entity", "pv_dump_grid_in_entity", "pv_dump_pv_power_entity", "pv_dump_on_watts", "pv_dump_off_watts", "pv_dump_dwell_seconds", "pv_dump_min_on_minutes", "pv_dump_pause_on_vacation",
+            "standby_watch_enabled", "standby_watch_max_watts", "standby_watch_default_hours", "standby_watch_hours", "standby_watch_watts",
+            "vacation_entity", "vacation_state",
+            "light_helper_pattern", "light_auto_off_timeout_minutes",
+            "ladeempfehlung_enabled", "ladeempfehlung_max_score", "ladeempfehlung_window_hours", "ladeempfehlung_min_pv_kwh",
+            "emergency_pv_run_enabled",
         ):
             val = self.entry.options.get(key, self.entry.data.get(key))
             if val is not None:
                 general[key] = val
             else:
                 general[key] = ""
+        # Effektive Defaults für Keys deren Default nicht falsy ist (Card zeigt sonst "aus"/"")
+        if general.get("pv_dump_pause_on_vacation") == "":
+            general["pv_dump_pause_on_vacation"] = True
+        if general.get("vacation_state") == "":
+            general["vacation_state"] = "on"
+        if general.get("ladeempfehlung_enabled") == "":
+            general["ladeempfehlung_enabled"] = True
+        if general.get("emergency_pv_run_enabled") == "":
+            general["emergency_pv_run_enabled"] = True
         return {"consumers": result, "general": general, "entry_id": self.entry.entry_id}
 
 
@@ -919,6 +1019,105 @@ class ActivityLogSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity)
         return {
             "entries": entries,
             "count": len(entries),
+        }
+
+
+class PvUeberschussVerfuegbarSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """PV-Überschuss der für externe Verbraucher (z.B. Wallbox) verfügbar ist.
+
+    Liest den konfigurierten PV-Surplus-Wert (normalerweise Netz-Einspeisung) —
+    dieser reflektiert bereits alle aktuell laufenden Haus-Verbraucher inklusive
+    aller von Tariff Saver gesteuerten Consumer (Heizboost, Akku-Grid-Laden,
+    Motorrad-Erhaltung). Dient als Eingabe für loose gekoppelte Wallbox-Logik
+    (huawei_solar) — Wallbox darf diesen Wert gefahrlos ziehen ohne andere
+    Verbraucher zu stören.
+
+    Einheit: Watt. Wert ≥ 0.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "PV Ueberschuss verfuegbar"
+    _attr_native_unit_of_measurement = "W"
+    _attr_icon = "mdi:solar-power-variant"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_should_poll = False
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_pv_ueberschuss_verfuegbar"
+        self._attr_device_info = _device_info(entry)
+        self._unsub_state: Any = None
+        self._unsub_timer: Any = None
+
+    def _cfg(self, key: str, default: Any = None) -> Any:
+        return self.entry.options.get(key, self.entry.data.get(key, default))
+
+    def _source_entity(self) -> str:
+        from .const import CONF_PV_SURPLUS_ENTITY
+        return str(self._cfg(CONF_PV_SURPLUS_ENTITY, "") or "").strip()
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        src = self._source_entity()
+        if src:
+            self._unsub_state = async_track_state_change_event(
+                self.hass, [src], self._on_source_changed
+            )
+        # Fallback-Timer: spätestens alle 15 Minuten neu auswerten
+        self._unsub_timer = async_track_time_interval(
+            self.hass, self._on_timer, timedelta(minutes=15)
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_state:
+            self._unsub_state()
+            self._unsub_state = None
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _on_source_changed(self, event: Event) -> None:
+        self.async_write_ha_state()
+
+    @callback
+    def _on_timer(self, _now) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        src = self._source_entity()
+        if not src:
+            return None
+        state = self.hass.states.get(src)
+        if state is None or state.state in ("unavailable", "unknown", ""):
+            return None
+        try:
+            val = float(state.state)
+        except (ValueError, TypeError):
+            return None
+        unit = str(state.attributes.get("unit_of_measurement", "") or "").lower()
+        if unit == "kw":
+            watts = val * 1000.0
+        elif unit == "w":
+            watts = val
+        else:
+            # Heuristik: |val| > 100 → wohl schon Watt, sonst Kilowatt
+            watts = val if abs(val) > 100 else val * 1000.0
+        return max(0, int(round(watts)))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        src = self._source_entity()
+        return {
+            "source_entity": src or None,
+            "note": (
+                "Netto-Überschuss aus der konfigurierten PV-Surplus-Entity. "
+                "Laufende TS-Consumer sind bereits im Hausverbrauch enthalten, "
+                "somit direkt als Headroom für externe Verbraucher (z.B. Wallbox) nutzbar."
+            ),
         }
 
 
@@ -968,27 +1167,39 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
         pv_attr = str(self._cfg(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE) or DEFAULT_PV_FORECAST_ATTRIBUTE).strip()
         pv_start_utc = None
 
+        # Try today forecast first, then tomorrow if no future PV slot found
+        forecast_entities = [pv_entity]
         if pv_entity:
-            state = self.hass.states.get(pv_entity)
-            if state:
-                forecast = state.attributes.get(pv_attr, [])
-                if isinstance(forecast, list):
-                    for slot in forecast:
-                        if not isinstance(slot, dict):
-                            continue
-                        period = slot.get("period_start")
-                        pv_est = slot.get("pv_estimate", 0)
-                        if period and isinstance(pv_est, (int, float)) and pv_est >= pv_threshold:
-                            try:
-                                slot_dt = dt_util.parse_datetime(str(period))
-                                if slot_dt and slot_dt > now_utc:
-                                    pv_start_utc = slot_dt
-                                    break
-                            except Exception:
-                                pass
+            # Derive tomorrow entity: replace "heute" with "morgen" or "_today" with "_tomorrow"
+            tomorrow_entity = pv_entity.replace("heute", "morgen").replace("_today", "_tomorrow")
+            if tomorrow_entity != pv_entity:
+                forecast_entities.append(tomorrow_entity)
+
+        for fc_entity in forecast_entities:
+            if not fc_entity or pv_start_utc is not None:
+                break
+            state = self.hass.states.get(fc_entity)
+            if not state:
+                continue
+            forecast = state.attributes.get(pv_attr, [])
+            if not isinstance(forecast, list):
+                continue
+            for slot in forecast:
+                if not isinstance(slot, dict):
+                    continue
+                period = slot.get("period_start")
+                pv_est = slot.get("pv_estimate", 0)
+                if period and isinstance(pv_est, (int, float)) and pv_est >= pv_threshold:
+                    try:
+                        slot_dt = dt_util.parse_datetime(str(period))
+                        if slot_dt and slot_dt > now_utc:
+                            pv_start_utc = slot_dt
+                            break
+                    except Exception as _err:
+                        _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "break", _err)
 
         if pv_start_utc is None:
-            # No PV today — use noon as fallback
+            # No PV in any forecast — use noon tomorrow as fallback
             noon_local = now_local.replace(hour=12, minute=0, second=0, microsecond=0)
             if noon_local <= now_local:
                 noon_local += timedelta(days=1)
@@ -997,12 +1208,11 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
         pv_start_local = dt_util.as_local(pv_start_utc)
         result["pv_start_time"] = pv_start_local.isoformat()
 
-        # --- Slot range: from now until PV start (30-min slots) ---
-        now_idx = now_local.hour * 2 + (1 if now_local.minute >= 30 else 0)
-        pv_idx = pv_start_local.hour * 2 + (1 if pv_start_local.minute >= 30 else 0)
-        # Handle overnight (e.g., now=03:00 idx=6, pv=08:00 idx=16)
+        # --- Slot range: from now until PV start (SLOT_MINUTES granularity) ---
+        now_idx = now_local.hour * SLOTS_PER_HOUR + now_local.minute // SLOT_MINUTES
+        pv_idx = pv_start_local.hour * SLOTS_PER_HOUR + pv_start_local.minute // SLOT_MINUTES
         if pv_idx <= now_idx:
-            pv_idx += 48  # next day
+            pv_idx += SLOTS_PER_DAY
         slots_until_pv = pv_idx - now_idx
         result["slots_until_pv"] = slots_until_pv
 
@@ -1010,10 +1220,12 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
         store = getattr(self.coordinator, "store", None)
         current_season = _get_season(self.hass, self.entry)
         profile = store.get_seasonal_load_profile(current_season) if store else {}
+        # Fallback per slot = 0.3 kWh war Default für 30-min Slots → bei 15-min entsprechend halbiert
+        fallback_per_slot = 0.3 / (SLOTS_PER_HOUR / 2)  # 0.15 bei 15-min
         base_load_kwh = 0.0
         for i in range(now_idx, now_idx + slots_until_pv):
-            idx = i % 48
-            base_load_kwh += float(profile.get(idx, 0.3))  # 0.3 kWh fallback per 30-min slot
+            idx = i % SLOTS_PER_DAY
+            base_load_kwh += float(profile.get(idx, fallback_per_slot))
         result["base_load_kwh"] = round(base_load_kwh, 1)
 
         # --- Heating (WP) consumption based on score per slot ---
@@ -1025,7 +1237,7 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
         wp_power_kw = float(self._cfg(CONF_HEATING_WP_POWER_KW, DEFAULT_HEATING_WP_POWER_KW) or DEFAULT_HEATING_WP_POWER_KW)
         max_score = int(float(self._cfg(CONF_HEATING_MAX_SCORE, DEFAULT_HEATING_MAX_SCORE) or DEFAULT_HEATING_MAX_SCORE))
 
-        heating_active = bool(heating_enabled) and current_season in active_seasons
+        heating_active = bool(heating_enabled) and current_season == "Winter"
 
         if heating_active:
             # Get price data and historical min/max for score calculation
@@ -1036,10 +1248,12 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
             baseline = _get_baseline_price(self.coordinator)
 
             for i in range(now_idx, now_idx + slots_until_pv):
-                idx = i % 48
-                # Find the price slot matching this 30-min index
-                slot_start_local = now_local.replace(hour=(idx // 2), minute=(idx % 2) * 30, second=0, microsecond=0)
-                if i >= 48:
+                idx = i % SLOTS_PER_DAY
+                # Find the price slot matching this slot index
+                slot_hour = idx // SLOTS_PER_HOUR
+                slot_minute = (idx % SLOTS_PER_HOUR) * SLOT_MINUTES
+                slot_start_local = now_local.replace(hour=slot_hour, minute=slot_minute, second=0, microsecond=0)
+                if i >= SLOTS_PER_DAY:
                     slot_start_local += timedelta(days=1)
                 slot_start_utc = dt_util.as_utc(slot_start_local)
 
@@ -1061,7 +1275,7 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
 
                 # WP runs if score <= max_score (Teuer-Grenze)
                 if slot_score <= max_score:
-                    heating_kwh += wp_power_kw * 0.5  # 30-min slot
+                    heating_kwh += wp_power_kw * (1.0 / SLOTS_PER_HOUR)
                     heating_slots += 1
 
         result["heating_kwh"] = round(heating_kwh, 1)
@@ -1091,8 +1305,8 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
                     energy = effective_energy_kwh(config, learning)
                     if energy and energy > 0:
                         consumer_kwh += energy
-            except Exception:
-                pass
+            except Exception as _err:
+                _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "consumer_kwh += energy", _err)
         result["consumer_kwh"] = round(consumer_kwh, 1)
 
         # --- Totals ---
@@ -1112,8 +1326,8 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
             if soc_state:
                 try:
                     current_soc = float(soc_state.state)
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as _err:
+                    _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "current_soc = float(soc_state.state)", _err)
 
         available_kwh = max(0.0, (current_soc - min_soc) / 100.0 * capacity) if battery_enabled and capacity > 0 else 0.0
         missing_kwh = max(0.0, total_kwh - available_kwh)
@@ -1183,8 +1397,8 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
                 try:
                     val = float(pv_state.state)
                     pv_kw = val / 1000.0 if abs(val) > 100 else val  # auto-detect W vs kW
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as _err:
+                    _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "pv_kw = val / 1000.0 if abs(val) > 100 e", _err)
 
         # Get real PV surplus
         from .const import CONF_PV_SURPLUS_ENTITY
@@ -1196,8 +1410,8 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
                 try:
                     val = float(pv_surplus_state.state)
                     pv_surplus_kw = val / 1000.0 if abs(val) > 100 else val
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as _err:
+                    _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "pv_surplus_kw = val / 1000.0 if abs(val)", _err)
 
         # Get current score (absolute: 0=hist.min, 50=baseline, 100=hist.max)
         score = _current_score_live(self.coordinator)
@@ -1214,8 +1428,8 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
             if soc_state:
                 try:
                     soc = float(soc_state.state)
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as _err:
+                    _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "soc = float(soc_state.state)", _err)
 
         # Get day score for stars
         day_score = stats.get("day_score_0_100")
@@ -1277,59 +1491,103 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
                                 if slot_ts and slot_ts.timestamp() > now_ts:
                                     next_pv_str = dt_util.as_local(slot_ts).strftime("%H:%M")
                                     break
-                            except Exception:
-                                pass
+                            except Exception as _err:
+                                _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "break", _err)
 
         # Check strom_sparen
         strom_sparen = self.hass.states.get("binary_sensor.tariff_saver_strom_sparen")
         is_strom_sparen = strom_sparen and strom_sparen.state == "on"
 
-        # Determine state and lines
-        state = "yellow"
-        reason = "normal"
-        line1 = ""
-        line2 = ""
+        # Get energy_until_pv data for battery assessment
+        from .const import CONF_AMPEL_BATTERY_MARGIN_KWH, DEFAULT_AMPEL_BATTERY_MARGIN_KWH
+        battery_margin = float(self._get_config(CONF_AMPEL_BATTERY_MARGIN_KWH, DEFAULT_AMPEL_BATTERY_MARGIN_KWH) or DEFAULT_AMPEL_BATTERY_MARGIN_KWH)
+        eup_state = self.hass.states.get("sensor.tariff_saver_energy_until_pv")
+        available_kwh = 0.0
+        total_need_kwh = 0.0
+        battery_comfortable = False  # Akku reicht inkl. Marge
+        battery_tight = False        # Akku reicht knapp (ohne Marge)
+        if eup_state and eup_state.state not in ("unavailable", "unknown", ""):
+            try:
+                available_kwh = float(eup_state.attributes.get("available_kwh", 0))
+                total_need_kwh = float(eup_state.attributes.get("total_kwh", 0))
+                missing_kwh = float(eup_state.attributes.get("missing_kwh", 0))
+                battery_comfortable = available_kwh >= (total_need_kwh + battery_margin)
+                battery_tight = missing_kwh <= 0 and not battery_comfortable
+            except (ValueError, TypeError) as _err:
+                _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "battery_tight = missing_kwh <= 0 and not", _err)
 
-        # Build next-hint suffix for line2
+        # Build next-hint suffix
         next_hint = ""
         if next_pv_str:
             next_hint = " · PV ab " + next_pv_str
         elif next_good_str:
             next_hint = " · günstig ab " + next_good_str
 
+        # Determine ampel state, reason, and ampel_stars (0-5)
+        # Priority order: strom_sparen > pv_surplus > pv+battery_full > cheap > battery_comfortable > expensive+grid > expensive+battery > normal
+        state = "yellow"
+        reason = "normal"
+        line1 = ""
+        line2 = ""
+        ampel_stars = 3  # default: neutral
+
         if is_strom_sparen:
             state = "red"
             reason = "strom_sparen"
+            ampel_stars = 0
             line1 = "Strom sparen aktiv!"
             line2 = "Unwichtige Geräte aus"
         elif pv_surplus_kw >= pv_threshold:
             state = "green"
             reason = "pv_surplus"
+            ampel_stars = 5
             line1 = "Gratis Solarstrom!"
             line2 = str(round(pv_surplus_kw, 1)) + " kW Überschuss"
         elif pv_kw >= pv_threshold * 0.5 and soc >= 90:
             state = "green"
             reason = "pv_battery_full"
+            ampel_stars = 5
             line1 = "Akku voll + PV"
             line2 = "Akku " + str(int(soc)) + "%, PV " + str(round(pv_kw, 1)) + " kW"
         elif score <= score_good:
             state = "green"
             reason = "cheap_grid"
+            ampel_stars = 5 if battery_comfortable else 4
             line1 = "Günstiger Zeitpunkt"
             line2 = "Score " + str(score) + next_hint
+        elif battery_comfortable and score < score_bad:
+            state = "green"
+            reason = "battery_comfortable"
+            ampel_stars = 4
+            line1 = "Akku reicht — freie Fahrt"
+            line2 = "Akku " + str(int(soc)) + "%" + next_hint
+        elif battery_comfortable and score >= score_bad:
+            state = "yellow"
+            reason = "battery_expensive"
+            ampel_stars = 3
+            line1 = "Akku reicht, aber teuer"
+            line2 = "Score " + str(score) + next_hint
+        elif battery_tight and score < score_bad:
+            state = "yellow"
+            reason = "battery_tight"
+            ampel_stars = 3
+            line1 = "Akku reicht knapp"
+            line2 = "Score " + str(score) + next_hint
         elif score >= score_bad:
-            state = "red"
-            reason = "expensive"
+            state = "orange" if battery_tight else "red"
+            reason = "expensive_grid" if not battery_tight else "expensive_tight"
+            ampel_stars = 2 if battery_tight else 1
             if next_pv_str:
-                line1 = "Warten - PV ab " + next_pv_str
+                line1 = "Warten — PV ab " + next_pv_str
             elif next_good_str:
-                line1 = "Warten - günstig ab " + next_good_str
+                line1 = "Warten — günstig ab " + next_good_str
             else:
                 line1 = "Strom gerade teuer"
             line2 = "Score " + str(score)
         else:
             state = "yellow"
             reason = "normal"
+            ampel_stars = 3
             if next_pv_str:
                 line1 = "PV ab " + next_pv_str + " besser"
             elif next_good_str:
@@ -1338,11 +1596,11 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
                 line1 = "Wenn nötig, jetzt OK"
             line2 = "Score " + str(score) + next_hint
 
-        # line3: strom_sparen gets score + hint, others get day rating
-        if is_strom_sparen:
-            line3 = "Score " + str(score) + next_hint
-        else:
-            line3 = "Heute " + stars_str
+        # Ampel stars display (HTML with MDI icons)
+        ampel_stars_display = _stars_display_from_value(ampel_stars, 5)
+
+        # line3: ampel stars
+        line3 = ampel_stars_display
 
         return {
             "state": state,
@@ -1354,9 +1612,15 @@ class StromAmpelSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
             "day_score": day_score,
             "pv_kw": round(pv_kw, 1),
             "soc": round(soc, 0),
+            "available_kwh": round(available_kwh, 1),
+            "total_need_kwh": round(total_need_kwh, 1),
+            "battery_comfortable": battery_comfortable,
             "next_good": next_good_str,
             "next_pv": next_pv_str,
-            "stars": stars_str,
+            "ampel_stars": ampel_stars,
+            "ampel_stars_display": ampel_stars_display,
+            "tariff_stars_display": _stars_display(score, 5),
+            "day_stars_display": _stars_display(day_score, 5),
         }
 
 
@@ -1392,8 +1656,8 @@ class BatteryManagerSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnti
             if soc_state and soc_state.state not in ("unavailable", "unknown", ""):
                 try:
                     current_soc = round(float(soc_state.state), 1)
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as _err:
+                    _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "extra_state_attributes", _err)
 
         score = _current_score_live(self.coordinator)
 
@@ -1439,3 +1703,646 @@ class BatteryManagerSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEnti
     def _get_battery_state(self) -> dict:
         data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
         return data.get("battery_state", {})
+
+
+class BillingSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Billing sensor: current period costs with MWST, fixed costs, and comparisons."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Billing"
+    _attr_native_unit_of_measurement = "CHF"
+    _attr_icon = "mdi:receipt-text"
+    _attr_should_poll = True
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_billing"
+        self._attr_device_info = _device_info(entry)
+
+    def _cfg(self, key: str, default: Any = None) -> Any:
+        return self._entry.options.get(key, self._entry.data.get(key, default))
+
+    def _get_period_dates(self) -> tuple[date, date]:
+        """Calculate current billing period start and end dates."""
+        from .const import CONF_BILLING_PERIOD_MONTHS, DEFAULT_BILLING_PERIOD_MONTHS, CONF_BILLING_START_DATE
+        period_months = int(self._cfg(CONF_BILLING_PERIOD_MONTHS, DEFAULT_BILLING_PERIOD_MONTHS) or DEFAULT_BILLING_PERIOD_MONTHS)
+        start_str = str(self._cfg(CONF_BILLING_START_DATE, "") or "").strip()
+
+        today = dt_util.now().date()
+
+        if start_str:
+            parsed = dt_util.parse_date(start_str)
+            if parsed:
+                # Roll forward to current period
+                period_start = parsed
+                while True:
+                    if period_months == 1:
+                        if period_start.month == 12:
+                            next_start = period_start.replace(year=period_start.year + 1, month=1)
+                        else:
+                            next_start = period_start.replace(month=period_start.month + 1)
+                    else:
+                        month = period_start.month + period_months
+                        year = period_start.year
+                        while month > 12:
+                            month -= 12
+                            year += 1
+                        next_start = period_start.replace(year=year, month=month)
+                    if next_start > today:
+                        return period_start, next_start
+                    period_start = next_start
+        # Fallback: current quarter
+        quarter_start_month = ((today.month - 1) // 3) * 3 + 1
+        period_start = today.replace(month=quarter_start_month, day=1)
+        month = quarter_start_month + period_months
+        year = period_start.year
+        while month > 12:
+            month -= 12
+            year += 1
+        period_end = date(year, month, 1)
+        return period_start, period_end
+
+    def _compute_fixed_costs(self, period_start: date, today: date, period_end: date) -> tuple[float, list]:
+        """Compute fixed costs proportional to elapsed days."""
+        from .const import CONF_BILLING_FIXED_COSTS
+        import json as _json
+        raw = self._cfg(CONF_BILLING_FIXED_COSTS, "[]")
+        if isinstance(raw, str):
+            try:
+                items = _json.loads(raw)
+            except Exception:
+                items = []
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            items = []
+
+        total = 0.0
+        details = []
+        months_in_period = (period_end.year - period_start.year) * 12 + period_end.month - period_start.month
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            amount = float(item.get("amount", 0.0) or 0.0)
+            period_type = str(item.get("period", "monthly")).strip()
+            if not label or amount <= 0:
+                continue
+
+            if period_type == "monthly":
+                # Full amount per month × number of months in period
+                cost = amount * months_in_period
+            else:
+                # Once per billing period
+                cost = amount
+
+            total += cost
+            details.append({"label": label, "amount_chf": round(cost, 2), "period": period_type})
+
+        return round(total, 2), details
+
+    @property
+    def native_value(self) -> float | None:
+        store = self.coordinator.store
+        if store is None:
+            return None
+        from .const import CONF_MWST_PERCENT, DEFAULT_MWST_PERCENT
+        period_start, period_end = self._get_period_dates()
+        today = dt_util.now().date()
+        start_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(period_start, time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        end_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(min(today + timedelta(days=1), period_end), time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        summary = store.compute_period_summary(start_dt, end_dt)
+        fixed, _ = self._compute_fixed_costs(period_start, today, period_end)
+        subtotal = summary["dyn_chf"] + fixed
+        mwst_pct = float(self._cfg(CONF_MWST_PERCENT, DEFAULT_MWST_PERCENT) or DEFAULT_MWST_PERCENT)
+        total = subtotal * (1 + mwst_pct / 100)
+        return round(total, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        store = self.coordinator.store
+        if store is None:
+            return {}
+        from .const import (
+            CONF_MWST_PERCENT, DEFAULT_MWST_PERCENT,
+            CONF_BILLING_PERIOD_MONTHS, DEFAULT_BILLING_PERIOD_MONTHS,
+        )
+
+        period_start, period_end = self._get_period_dates()
+        today = dt_util.now().date()
+        period_days = (period_end - period_start).days
+        elapsed_days = (today - period_start).days + 1
+
+        # Current period
+        start_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(period_start, time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        end_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(min(today + timedelta(days=1), period_end), time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        summary = store.compute_period_summary(start_dt, end_dt)
+
+        fixed, fixed_details = self._compute_fixed_costs(period_start, today, period_end)
+        subtotal = summary["dyn_chf"] + fixed
+        mwst_pct = float(self._cfg(CONF_MWST_PERCENT, DEFAULT_MWST_PERCENT) or DEFAULT_MWST_PERCENT)
+        mwst_chf = subtotal * (mwst_pct / 100)
+        total = subtotal + mwst_chf
+
+        # Projection
+        if elapsed_days > 0:
+            projected_total = total * (period_days / elapsed_days)
+            projected_kwh = summary["kwh"] * (period_days / elapsed_days)
+        else:
+            projected_total = 0.0
+            projected_kwh = 0.0
+
+        # Previous year same month
+        prev_year_start = today.replace(year=today.year - 1, month=today.month, day=1)
+        if prev_year_start.month == 12:
+            prev_year_end = prev_year_start.replace(year=prev_year_start.year + 1, month=1)
+        else:
+            prev_year_end = prev_year_start.replace(month=prev_year_start.month + 1)
+        prev_start_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(prev_year_start, time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        prev_end_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(prev_year_end, time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        prev_summary = store.compute_period_summary(prev_start_dt, prev_end_dt)
+        prev_days = (prev_year_end - prev_year_start).days
+        prev_avg_kwh = prev_summary["kwh"] / prev_days if prev_days > 0 and prev_summary["slots"] > 0 else None
+        prev_avg_cost = prev_summary["dyn_chf"] / prev_days if prev_days > 0 and prev_summary["slots"] > 0 else None
+
+        # Year average (last 365 days)
+        year_start = today - timedelta(days=365)
+        year_start_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(year_start, time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        year_end_dt = dt_util.as_local(dt_util.as_utc(datetime.combine(today + timedelta(days=1), time(0, 0), tzinfo=dt_util.now().tzinfo)))
+        year_summary = store.compute_period_summary(year_start_dt, year_end_dt)
+        year_avg_kwh = year_summary["kwh"] / 365 if year_summary["slots"] > 0 else None
+        year_avg_cost = year_summary["dyn_chf"] / 365 if year_summary["slots"] > 0 else None
+
+        return {
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "period_day": elapsed_days,
+            "period_days": period_days,
+            "consumption_kwh": summary["kwh"],
+            "cost_netto_chf": round(summary["dyn_chf"], 2),
+            "baseline_netto_chf": round(summary["base_chf"], 2),
+            "savings_netto_chf": round(summary["savings_chf"], 2),
+            "savings_percent": summary["savings_percent"],
+            "fixed_costs_netto_chf": fixed,
+            "fixed_costs_details": fixed_details,
+            "subtotal_netto_chf": round(subtotal, 2),
+            "mwst_percent": mwst_pct,
+            "mwst_chf": round(mwst_chf, 2),
+            "total_brutto_chf": round(total, 2),
+            "projected_consumption_kwh": round(projected_kwh, 1),
+            "projected_total_brutto_chf": round(projected_total, 2),
+            "prev_year_month_avg_kwh_per_day": round(prev_avg_kwh, 1) if prev_avg_kwh else None,
+            "prev_year_month_avg_cost_per_day_chf": round(prev_avg_cost, 2) if prev_avg_cost else None,
+            "year_avg_kwh_per_day": round(year_avg_kwh, 1) if year_avg_kwh else None,
+            "year_avg_cost_per_day_chf": round(year_avg_cost, 2) if year_avg_cost else None,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Wallbox Session Sensors (TS v2 — Phase 2 Sub-Phase 2c)
+#  Status-Sensoren die huawei_solar v2 liest. Bis Scheduler v2 (2d) live ist
+#  geben sie Default-Werte zurück — keine echte Plan-Berechnung.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _WallboxSensorBase(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry, key: str, name: str) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        self._attr_name = name
+        self._attr_device_info = _device_info(entry)
+
+    def _active_session(self) -> dict[str, Any] | None:
+        store = getattr(self.coordinator, "store", None)
+        if store is None or not hasattr(store, "get_active_sessions"):
+            return None
+        sessions = store.get_active_sessions()
+        for s in sessions.values():
+            if isinstance(s, dict) and s.get("active"):
+                return s
+        return None
+
+    def _active_session_plan(self) -> dict[str, Any] | None:
+        """Liefert den Scheduler-v2-Plan für die aktive Session (aus store.consumer_plans)."""
+        store = getattr(self.coordinator, "store", None)
+        if store is None or not store.consumer_plans:
+            return None
+        for slot_key, plan in store.consumer_plans.items():
+            if isinstance(plan, dict) and plan.get("kind") == "session":
+                return plan
+        return None
+
+
+class WallboxTargetMaxSensor(_WallboxSensorBase):
+    """Aktueller Power-Cap für die Wallbox in W. 0 = nicht laden.
+
+    Bis Scheduler v2 live ist:
+    - Session aktiv mit Deadline → max_power_w (TS plant noch nicht, gibt nur das Limit weiter)
+    - Session aktiv ohne Deadline → 0 (huawei_solar v1 fällt auf eigene PV-Logik zurück)
+    - Keine Session → 0
+    """
+
+    _attr_native_unit_of_measurement = "W"
+    _attr_icon = "mdi:ev-station"
+    # Spec (ladeplanung_design.md 5.5.7) nutzt `_w`-Suffix — HA strippt das sonst wegen unit=W
+    entity_id = "sensor.tariff_saver_wallbox_target_max_w"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "wallbox_target_max_w", "Wallbox Target Max")
+
+    @property
+    def native_value(self) -> int | None:
+        s = self._active_session()
+        if not s:
+            return 0
+        if not s.get("deadline_utc"):
+            return 0  # pure PV-only-Modus → huawei_solar v1
+        # Scheduler v2: target_now_w aus Plan lesen
+        plan = self._active_session_plan()
+        if plan is not None:
+            return int(plan.get("target_now_w", 0) or 0)
+        # Fallback (kein Plan berechnet noch): max_power_w
+        return int(s.get("max_power_w", 0) or 0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        s = self._active_session() or {}
+        plan = self._active_session_plan() or {}
+        return {
+            "session_active": bool(s.get("active", False)),
+            "session_slot": s.get("slot"),
+            "session_remaining_kwh": s.get("energy_needed_kwh"),
+            "session_deadline": s.get("deadline_utc"),
+            "session_min_power_w": s.get("min_power_w"),
+            "session_max_power_w": s.get("max_power_w"),
+            "session_prefer_pv": s.get("prefer_pv"),
+            "feasible": plan.get("feasible", True),
+            "delivered_kwh": plan.get("delivered_kwh"),
+            "energy_needed_kwh": plan.get("energy_needed_kwh"),
+            "total_cost_chf": plan.get("total_cost_chf"),
+            "chosen_windows": plan.get("chosen_windows", []),
+            "current_window": plan.get("current_window"),
+            "next_window": plan.get("next_window"),
+            "scheduler_version": "v2",
+        }
+
+
+class WallboxPvReserveSensor(_WallboxSensorBase):
+    """PV-Leistung die die Wallbox frei lassen muss für andere TS-Consumer (W).
+
+    huawei_solar zieht das vom rohen PV-Surplus ab.
+    Bis Scheduler v2 live ist: 0 (kein Reserve).
+    """
+
+    _attr_native_unit_of_measurement = "W"
+    _attr_icon = "mdi:solar-power"
+    # Spec-konformer entity_id (sonst würde HA `_w` wegen unit=W strippen)
+    entity_id = "sensor.tariff_saver_wallbox_pv_reserve_w"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "wallbox_pv_reserve_w", "Wallbox PV Reserve")
+
+    @property
+    def native_value(self) -> int:
+        from .scheduler import compute_pv_reserve_for_wallbox
+        store = getattr(self.coordinator, "store", None)
+        if store is None:
+            return 0
+        return compute_pv_reserve_for_wallbox(store.consumer_plans or {}, dt_util.utcnow())
+
+
+class WallboxSessionModeSensor(_WallboxSensorBase):
+    """Mode-Indikator für huawei_solar.
+
+    `pv_only`: Default — huawei_solar nutzt v1-PV-Logik
+    `pv_plus_tariff`: Session aktiv mit Deadline, TS plant Slots (nach 2d)
+    `tariff_only`: Notladung ohne PV — TS hart-Plan (nach 2d)
+    """
+
+    _attr_icon = "mdi:state-machine"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "wallbox_session_mode", "Wallbox Session Mode")
+
+    @property
+    def native_value(self) -> str:
+        s = self._active_session()
+        if not s:
+            return "pv_only"
+        if not s.get("deadline_utc"):
+            return "pv_only"
+        if s.get("prefer_pv", True):
+            return "pv_plus_tariff"
+        return "tariff_only"
+
+
+class LightAutoOffStatusSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Übersicht aller vom Light-Auto-Off-Modul erfassten Lichter.
+
+    State: Anzahl überwachter Lichter (mit auto_off_*h-Label).
+    Attribute `lights`: Liste von Dicts mit pro Licht:
+      - entity_id, friendly_name, domain, state ("on"/"off")
+      - on_since_iso (UTC ISO wenn an, sonst null)
+      - threshold_h (vom Label, sonst null)
+      - snooze_until_iso (UTC ISO wenn snoozed)
+      - source ("pattern" | "label" | "both")
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Light Auto-Off Status"
+    _attr_icon = "mdi:lightbulb-alert"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_light_auto_off_status"
+        self._attr_device_info = _device_info(entry)
+
+    def _build(self) -> tuple[int, list[dict[str, Any]]]:
+        from .auto_off import (
+            _discover_entities, _entity_threshold_hours, _is_on,
+            _label_to_hours,
+        )
+        from .const import (
+            CONF_LIGHT_HELPER_PATTERN,
+            DEFAULT_LIGHT_HELPER_PATTERN,
+            LIGHT_AUTO_OFF_LABEL_PREFIX,
+        )
+        import fnmatch
+
+        from homeassistant.helpers import entity_registry as er
+
+        src = self.entry.options if self.entry.options else self.entry.data
+        pattern = str(src.get(CONF_LIGHT_HELPER_PATTERN, DEFAULT_LIGHT_HELPER_PATTERN) or DEFAULT_LIGHT_HELPER_PATTERN)
+        registry = er.async_get(self.hass)
+        entity_ids = _discover_entities(self.hass, pattern)
+        store_state = (getattr(self.coordinator, "store", None) and self.coordinator.store.light_auto_off_state) or {}
+
+        out: list[dict[str, Any]] = []
+        monitored = 0
+        for eid in entity_ids:
+            rec = registry.async_get(eid)
+            domain = eid.split(".", 1)[0]
+            state_obj = self.hass.states.get(eid)
+            state = state_obj.state if state_obj else None
+            on = _is_on(domain, state)
+            on_since_iso = None
+            if on and state_obj and state_obj.last_changed:
+                on_since_iso = dt_util.as_utc(state_obj.last_changed).isoformat()
+            threshold_h = _entity_threshold_hours(registry, eid)
+            in_pattern = fnmatch.fnmatchcase(eid, pattern)
+            has_label = False
+            if rec is not None:
+                for label in rec.labels or set():
+                    if _label_to_hours(label) is not None:
+                        has_label = True
+                        break
+            if in_pattern and has_label:
+                source = "both"
+            elif has_label:
+                source = "label"
+            else:
+                source = "pattern"
+            snooze_until = None
+            entry_state = store_state.get(eid) if isinstance(store_state, dict) else None
+            if isinstance(entry_state, dict):
+                snooze_until = entry_state.get("snooze_until_iso")
+            friendly = (state_obj.attributes.get("friendly_name") if state_obj else None) or eid
+            if threshold_h is not None:
+                monitored += 1
+            out.append({
+                "entity_id": eid,
+                "friendly_name": friendly,
+                "domain": domain,
+                "state": "on" if on else "off",
+                "on_since_iso": on_since_iso,
+                "threshold_h": threshold_h,
+                "snooze_until_iso": snooze_until,
+                "source": source,
+            })
+        out.sort(key=lambda r: (0 if r["threshold_h"] is None else 1, r["friendly_name"]))
+        return monitored, out
+
+    @property
+    def native_value(self) -> int:
+        try:
+            return self._build()[0]
+        except Exception as _err:
+            _LOGGER.debug("LightAutoOffStatusSensor: %s in native_value: %s", type(_err).__name__, _err)
+            return 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        try:
+            monitored, lights = self._build()
+        except Exception as _err:
+            _LOGGER.debug("LightAutoOffStatusSensor: %s in attrs: %s", type(_err).__name__, _err)
+            return {"monitored_count": 0, "lights": []}
+        return {
+            "monitored_count": monitored,
+            "total_count": len(lights),
+            "lights": lights,
+        }
+
+
+class StandbyWatchStatusSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Status des Standby-Wächters.
+
+    State: "aus" (Modul deaktiviert) / "aktiv".
+    Attribute:
+      - enabled, max_watts, default_hours, hour_choices
+      - devices: alle getaggten Switches {entity_id, friendly_name, state,
+        watts, power_entity, hours, effective_hours, watts_limit,
+        effective_watts, low_since_iso, pv_dump_managed}
+      - total_count
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Standby-Wächter Status"
+    _attr_icon = "mdi:power-sleep"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_standby_watch_status"
+        self._attr_device_info = _device_info(entry)
+
+    def _build(self) -> dict[str, Any]:
+        from .standby_watch import (
+            _config_value, _read_watts, discover_switches, find_power_sensor,
+        )
+        from .const import (
+            CONF_STANDBY_WATCH_ENABLED, DEFAULT_STANDBY_WATCH_ENABLED,
+            CONF_STANDBY_WATCH_MAX_WATTS, DEFAULT_STANDBY_WATCH_MAX_WATTS,
+            CONF_STANDBY_WATCH_DEFAULT_HOURS, DEFAULT_STANDBY_WATCH_DEFAULT_HOURS,
+            STANDBY_WATCH_HOUR_CHOICES,
+        )
+
+        enabled = bool(_config_value(self.entry, CONF_STANDBY_WATCH_ENABLED, DEFAULT_STANDBY_WATCH_ENABLED))
+        max_watts = float(_config_value(self.entry, CONF_STANDBY_WATCH_MAX_WATTS, DEFAULT_STANDBY_WATCH_MAX_WATTS))
+        default_hours = float(_config_value(self.entry, CONF_STANDBY_WATCH_DEFAULT_HOURS, DEFAULT_STANDBY_WATCH_DEFAULT_HOURS))
+
+        manager = getattr(self.coordinator, "standby_watch", None)
+        overrides = manager.hours_overrides() if manager is not None else {}
+        watt_overrides = manager.watts_overrides() if manager is not None else {}
+        pv_managed: set[str] = set()
+        store = getattr(self.coordinator, "store", None)
+        if store is not None and getattr(store, "pv_dump_state", None):
+            pv_managed = set((store.pv_dump_state or {}).get("managed") or {})
+
+        devices = []
+        for eid in discover_switches(self.hass):
+            state_obj = self.hass.states.get(eid)
+            friendly = (state_obj.attributes.get("friendly_name") if state_obj else None) or eid
+            power_entity = find_power_sensor(self.hass, eid)
+            watts = _read_watts(self.hass, power_entity) if power_entity else None
+            low_since = manager.low_since(eid) if manager is not None else None
+            devices.append({
+                "entity_id": eid,
+                "friendly_name": friendly,
+                "state": state_obj.state if state_obj else "unavailable",
+                "power_entity": power_entity,
+                "watts": round(watts, 1) if watts is not None else None,
+                "hours": overrides.get(eid),
+                "effective_hours": overrides.get(eid, default_hours),
+                "watts_limit": watt_overrides.get(eid),
+                "effective_watts": watt_overrides.get(eid, max_watts),
+                "low_since_iso": low_since.isoformat() if low_since else None,
+                "pv_dump_managed": eid in pv_managed,
+            })
+        devices.sort(key=lambda r: r["friendly_name"])
+
+        return {
+            "enabled": enabled,
+            "max_watts": max_watts,
+            "default_hours": default_hours,
+            "hour_choices": list(STANDBY_WATCH_HOUR_CHOICES),
+            "total_count": len(devices),
+            "devices": devices,
+        }
+
+    @property
+    def native_value(self) -> str:
+        try:
+            d = self._build()
+        except Exception as _err:
+            _LOGGER.debug("StandbyWatchStatusSensor: %s in native_value: %s", type(_err).__name__, _err)
+            return "unbekannt"
+        return "aktiv" if d["enabled"] else "aus"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        try:
+            return self._build()
+        except Exception as _err:
+            _LOGGER.debug("StandbyWatchStatusSensor: %s in attrs: %s", type(_err).__name__, _err)
+            return {"enabled": False, "devices": []}
+
+
+class PvDumpStatusSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntity):
+    """Status der PV-Überschuss Dump-Loads.
+
+    State: "aktiv" / "inaktiv" / "aus" (Modul deaktiviert).
+    Attribute:
+      - enabled, active
+      - grid_out_w (Netzeinspeisung), grid_in_w (Netzbezug)
+      - on_watts / off_watts / dwell_seconds / min_on_minutes (Settings)
+      - devices: Liste aller getaggten Geräte {entity_id, friendly_name, state, managed}
+      - managed_count, total_count, on_since_iso
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "PV-Überschuss Status"
+    _attr_icon = "mdi:solar-power-variant"
+
+    def __init__(self, coordinator: TariffSaverCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self.entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_pv_dump_status"
+        self._attr_device_info = _device_info(entry)
+
+    def _build(self) -> dict[str, Any]:
+        from .pv_dump import _config_value, _read_watts, discover_entities, _is_on
+        from .const import (
+            CONF_PV_DUMP_ENABLED, DEFAULT_PV_DUMP_ENABLED,
+            CONF_PV_DUMP_GRID_OUT_ENTITY, DEFAULT_PV_DUMP_GRID_OUT_ENTITY,
+            CONF_PV_DUMP_GRID_IN_ENTITY, DEFAULT_PV_DUMP_GRID_IN_ENTITY,
+            CONF_PV_DUMP_ON_WATTS, DEFAULT_PV_DUMP_ON_WATTS,
+            CONF_PV_DUMP_OFF_WATTS, DEFAULT_PV_DUMP_OFF_WATTS,
+            CONF_PV_DUMP_DWELL_SECONDS, DEFAULT_PV_DUMP_DWELL_SECONDS,
+            CONF_PV_DUMP_MIN_ON_MINUTES, DEFAULT_PV_DUMP_MIN_ON_MINUTES,
+            CONF_PV_DUMP_PV_POWER_ENTITY, DEFAULT_PV_DUMP_PV_POWER_ENTITY,
+            PV_DUMP_PV_ZERO_WATTS,
+        )
+
+        from .const import CONF_PV_DUMP_PAUSE_ON_VACATION, DEFAULT_PV_DUMP_PAUSE_ON_VACATION
+        from .vacation import is_vacation_active
+
+        enabled = bool(_config_value(self.entry, CONF_PV_DUMP_ENABLED, DEFAULT_PV_DUMP_ENABLED))
+        vacation_paused = bool(
+            _config_value(self.entry, CONF_PV_DUMP_PAUSE_ON_VACATION, DEFAULT_PV_DUMP_PAUSE_ON_VACATION)
+        ) and is_vacation_active(self.hass, self.entry)
+        grid_out = _read_watts(self.hass, str(_config_value(self.entry, CONF_PV_DUMP_GRID_OUT_ENTITY, DEFAULT_PV_DUMP_GRID_OUT_ENTITY)))
+        grid_in = _read_watts(self.hass, str(_config_value(self.entry, CONF_PV_DUMP_GRID_IN_ENTITY, DEFAULT_PV_DUMP_GRID_IN_ENTITY)))
+        pv = _read_watts(self.hass, str(_config_value(self.entry, CONF_PV_DUMP_PV_POWER_ENTITY, DEFAULT_PV_DUMP_PV_POWER_ENTITY)))
+
+        store = getattr(self.coordinator, "store", None)
+        st = (store.pv_dump_state if store is not None and getattr(store, "pv_dump_state", None) else {}) or {}
+        active = bool(st.get("active", False))
+        managed = st.get("managed") or {}
+
+        devices = []
+        for eid in discover_entities(self.hass):
+            state_obj = self.hass.states.get(eid)
+            friendly = (state_obj.attributes.get("friendly_name") if state_obj else None) or eid
+            devices.append({
+                "entity_id": eid,
+                "friendly_name": friendly,
+                "state": "on" if _is_on(self.hass, eid) else "off",
+                "managed": eid in managed,
+            })
+        devices.sort(key=lambda r: r["friendly_name"])
+
+        return {
+            "enabled": enabled,
+            "active": active,
+            "vacation_paused": vacation_paused,
+            "grid_out_w": round(grid_out) if grid_out is not None else None,
+            "grid_in_w": round(grid_in) if grid_in is not None else None,
+            "pv_w": round(pv) if pv is not None else None,
+            "pv_zero_watts": PV_DUMP_PV_ZERO_WATTS,
+            "on_watts": float(_config_value(self.entry, CONF_PV_DUMP_ON_WATTS, DEFAULT_PV_DUMP_ON_WATTS)),
+            "off_watts": float(_config_value(self.entry, CONF_PV_DUMP_OFF_WATTS, DEFAULT_PV_DUMP_OFF_WATTS)),
+            "dwell_seconds": float(_config_value(self.entry, CONF_PV_DUMP_DWELL_SECONDS, DEFAULT_PV_DUMP_DWELL_SECONDS)),
+            "min_on_minutes": float(_config_value(self.entry, CONF_PV_DUMP_MIN_ON_MINUTES, DEFAULT_PV_DUMP_MIN_ON_MINUTES)),
+            "managed_count": len(managed),
+            "total_count": len(devices),
+            "on_since_iso": st.get("on_since_iso"),
+            "devices": devices,
+        }
+
+    @property
+    def native_value(self) -> str:
+        try:
+            d = self._build()
+        except Exception as _err:
+            _LOGGER.debug("PvDumpStatusSensor: %s in native_value: %s", type(_err).__name__, _err)
+            return "unbekannt"
+        if not d["enabled"]:
+            return "aus"
+        if d.get("vacation_paused"):
+            return "ferien"
+        return "aktiv" if d["active"] else "inaktiv"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        try:
+            return self._build()
+        except Exception as _err:
+            _LOGGER.debug("PvDumpStatusSensor: %s in attrs: %s", type(_err).__name__, _err)
+            return {"enabled": False, "active": False, "devices": []}

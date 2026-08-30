@@ -1,12 +1,17 @@
 """Lightweight persistent storage for Tariff Saver."""
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+_LOGGER = logging.getLogger(__name__)
+
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
+
+from .const import SLOT_MINUTES, SLOTS_PER_HOUR, SLOTS_PER_DAY
 
 
 IMPORT_ALLIN_COMPONENTS: tuple[str, ...] = (
@@ -16,6 +21,17 @@ IMPORT_ALLIN_COMPONENTS: tuple[str, ...] = (
 )
 
 _FALLBACK_TOTAL_KEYS: tuple[str, ...] = ("integrated", "all_in")
+
+# Mindest-Lauf-Schwellen für die Consumer-Run-Erkennung. Schützt vor Phantom-Läufen,
+# wenn ein Consumer mit einem geteilten Mess-Sensor (z.B. WP-Kreis-Shelly für Slot 1+10)
+# Standby-Trickle (~14 W) als Lauf zählt. Echter Lauf ist kW-/kWh-Skala.
+MIN_RUN_KWH: float = 0.3
+MIN_RUN_POWER_KW: float = 0.5
+
+# Drossel für die Hochfrequenz-Save-Pfade (Verbrauchs-Samples alle ~30 s):
+# der Store ist mehrere MB gross, ein Voll-Serialize pro Sample stallt den
+# Event-Loop und schreibt zweistellige GB/Tag auf die Disk.
+SAVE_DEBOUNCE_SECONDS: float = 300.0
 
 
 class TariffSaverStore:
@@ -56,9 +72,17 @@ class TariffSaverStore:
         self.activity_log: list[dict] = []
         self.consumer_plans: dict = {}
         self.plans_tariff_date: str | None = None
+        self.battery_budget: dict[str, Any] = {}  # Akku-Budget-Kurve des letzten Scheduler-Laufs (Audit Cluster 2)
         self.battery_stats: dict[str, dict[str, Any]] = {}  # keyed by date "YYYY-MM-DD"
         self.strom_sparen_snapshot: dict[str, str] = {}  # entity_id → state
+        self.heating_wp_previous: str | None = None  # user's WP baseline before module changed it
+        self.heating_module_active: bool = False  # True while heating module controls WP
+        self.energy_readings_15m: dict[str, float] = {}  # UTC-ISO → cumulative kWh (15-min resolution, 400 days)
+        self.consumer_sessions: dict[str, dict[str, Any]] = {}  # slot → SessionState dict (kind=session, e.g. Wallbox)
+        self.light_auto_off_state: dict[str, dict[str, Any]] = {}  # entity_id → {snooze_until_iso}
+        self.pv_dump_state: dict[str, Any] = {}  # {active, on_since_iso, managed:{entity_id:on_ts_iso}}
         self.dirty: bool = False
+        self._save_pending: bool = False  # delayed Write armiert (schedule_save)
 
     async def _async_migrate(self, old_version: int, old_minor_version: int, old_data: dict) -> dict:
         data = dict(old_data or {})
@@ -112,6 +136,7 @@ class TariffSaverStore:
         self.historical_price_max = float(_raw_max) if _raw_max is not None and float(_raw_max) > 0 else 0.0
         self.consumer_slot_buffers = dict(data.get("consumer_slot_buffers") or {})
         self.load_profiles = list(data.get("load_profiles") or [])
+        self._migrate_load_profiles_to_15min()
         self.day_average_prices = {
             str(k): float(v)
             for k, v in (data.get("day_average_prices") or {}).items()
@@ -120,6 +145,7 @@ class TariffSaverStore:
         self.activity_log = list(data.get("activity_log") or [])
         self.consumer_plans = dict(data.get("consumer_plans") or {})
         self.plans_tariff_date = data.get("plans_tariff_date")
+        self.battery_budget = dict(data.get("battery_budget") or {})
         self.consumer_learning = {
             str(k): dict(v)
             for k, v in (data.get("consumer_learning") or {}).items()
@@ -131,11 +157,31 @@ class TariffSaverStore:
             if isinstance(v, dict)
         }
         self.strom_sparen_snapshot = dict(data.get("strom_sparen_snapshot") or {})
+        self.energy_readings_15m = {
+            str(k): float(v)
+            for k, v in (data.get("energy_readings_15m") or {}).items()
+            if isinstance(v, (int, float))
+        }
+        hwp = data.get("heating_wp_previous")
+        self.heating_wp_previous = str(hwp) if hwp is not None else None
+        self.heating_module_active = bool(data.get("heating_module_active", False))
         self.consumer_runs = {
             str(k): dict(v)
             for k, v in (data.get("consumer_runs") or {}).items()
             if isinstance(v, dict)
         }
+        self.consumer_sessions = {
+            str(k): dict(v)
+            for k, v in (data.get("consumer_sessions") or {}).items()
+            if isinstance(v, dict)
+        }
+        self.light_auto_off_state = {
+            str(k): dict(v)
+            for k, v in (data.get("light_auto_off_state") or {}).items()
+            if isinstance(v, dict)
+        }
+        pvd = data.get("pv_dump_state")
+        self.pv_dump_state = dict(pvd) if isinstance(pvd, dict) else {}
 
         ts = data.get("last_api_success_utc")
         if isinstance(ts, str):
@@ -157,8 +203,32 @@ class TariffSaverStore:
         self.dirty = False
 
     async def async_save(self) -> None:
+        # Ein direkter Save ersetzt einen evtl. anstehenden delayed Save
+        # (Store.async_save cancelt dessen Timer, ohne die data_func je
+        # aufzurufen) — Flag zurücksetzen, sonst blockiert es schedule_save.
+        self._save_pending = False
         await self._store.async_save(self._as_dict())
         self.dirty = False
+
+    @callback
+    def schedule_save(self, delay: float = SAVE_DEBOUNCE_SECONDS) -> None:
+        """Gedrosselter Save für Hochfrequenz-Pfade (Sample-Ticks).
+
+        Nutzt Store.async_delay_save, armiert den Timer aber nur, wenn noch
+        kein delayed Write ansteht — jeder erneute async_delay_save-Aufruf
+        würde den Timer sonst neu starten und der Write bei ~30-s-Samples nie
+        feuern. Der Store flusht anstehende delayed Writes bei HA-Stop selbst.
+        """
+        if self._save_pending:
+            return
+        self._save_pending = True
+
+        def _data() -> dict[str, Any]:
+            self._save_pending = False
+            self.dirty = False
+            return self._as_dict()
+
+        self._store.async_delay_save(_data, delay)
 
     def _as_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +245,7 @@ class TariffSaverStore:
             "activity_log": self.activity_log,
             "consumer_plans": self.consumer_plans,
             "plans_tariff_date": self.plans_tariff_date,
+            "battery_budget": self.battery_budget,
             "consumer_learning": self.consumer_learning,
             "consumer_runs": self.consumer_runs,
             "last_api_success_utc": self.last_api_success_utc.isoformat() if self.last_api_success_utc else None,
@@ -182,6 +253,12 @@ class TariffSaverStore:
             "energy_baseline_timestamp_utc": self.energy_baseline_timestamp_utc.isoformat() if self.energy_baseline_timestamp_utc else None,
             "battery_stats": self.battery_stats,
             "strom_sparen_snapshot": self.strom_sparen_snapshot,
+            "heating_wp_previous": self.heating_wp_previous,
+            "heating_module_active": self.heating_module_active,
+            "energy_readings_15m": self.energy_readings_15m,
+            "consumer_sessions": self.consumer_sessions,
+            "light_auto_off_state": self.light_auto_off_state,
+            "pv_dump_state": self.pv_dump_state,
         }
 
     def set_last_api_success(self, when_utc: datetime) -> None:
@@ -202,6 +279,23 @@ class TariffSaverStore:
             k: v for k, v in self.day_average_prices.items() if k >= cutoff.isoformat()
         }
         if len(self.day_average_prices) != before:
+            self.dirty = True
+
+    # -- 15-min energy readings (long-term, for billing) --
+
+    def record_energy_reading_15m(self, slot_start_utc_iso: str, cumulative_kwh: float) -> None:
+        """Record cumulative energy meter reading for a 15-min slot."""
+        self.energy_readings_15m[slot_start_utc_iso] = round(cumulative_kwh, 4)
+        self.dirty = True
+
+    def trim_energy_readings_15m(self, keep_days: int = 400) -> None:
+        """Remove readings older than keep_days."""
+        cutoff = (dt_util.utcnow() - timedelta(days=keep_days)).isoformat()
+        before = len(self.energy_readings_15m)
+        self.energy_readings_15m = {
+            k: v for k, v in self.energy_readings_15m.items() if k >= cutoff
+        }
+        if len(self.energy_readings_15m) != before:
             self.dirty = True
 
     def get_year_day_average_prices(self, reference_local_day: date | None = None) -> list[float]:
@@ -286,12 +380,31 @@ class TariffSaverStore:
         a_total = self._total_from_components(a_comp)
         b_total = self._total_from_components(b_comp)
 
+        # Behalte existierenden pv_kw-Wert bei (wird via set_slot_pv_kw aktualisiert)
+        existing_pv_kw = (self.price_slots.get(key) or {}).get("pv_kw")
+
         self.price_slots[key] = {
             "a_total": float(a_total) if isinstance(a_total, (int, float)) else None,
             "b_total": float(b_total) if isinstance(b_total, (int, float)) else None,
             "a_comp": a_comp,
             "b_comp": b_comp,
+            "pv_kw": float(existing_pv_kw) if isinstance(existing_pv_kw, (int, float)) else 0.0,
         }
+        self.dirty = True
+
+    def set_slot_pv_kw(self, start_utc: datetime, pv_kw: float) -> None:
+        """Setze/aktualisiere PV-Prognose (kW) für einen existierenden Price-Slot.
+
+        Erstellt einen leeren Slot-Eintrag wenn noch nicht vorhanden (dann mit pv_kw only,
+        a_comp/b_comp leer — sollte in der Praxis nicht vorkommen, weil pv immer NACH
+        den Preisen gesetzt wird).
+        """
+        start_utc = dt_util.as_utc(start_utc)
+        key = start_utc.isoformat()
+        if key in self.price_slots:
+            self.price_slots[key]["pv_kw"] = float(pv_kw)
+        else:
+            self.price_slots[key] = {"a_total": None, "b_total": None, "a_comp": {}, "b_comp": {}, "pv_kw": float(pv_kw)}
         self.dirty = True
 
     def get_price_totals(self, start_utc: datetime) -> tuple[float | None, float | None]:
@@ -524,6 +637,43 @@ class TariffSaverStore:
                 continue
         return dyn, base, sav
 
+    def compute_period_summary(self, start_local: datetime, end_local: datetime) -> dict[str, Any]:
+        """Compute consumption and costs for an arbitrary period from booked slots."""
+        start_utc = dt_util.as_utc(start_local)
+        end_utc = dt_util.as_utc(end_local)
+
+        kwh = 0.0
+        dyn_chf = 0.0
+        base_chf = 0.0
+        slot_count = 0
+
+        for b in self.booked:
+            dtp = dt_util.parse_datetime(str(b.get("start", "")))
+            if dtp is None:
+                continue
+            s_utc = dt_util.as_utc(dtp)
+            if not (start_utc <= s_utc < end_utc):
+                continue
+            try:
+                kwh += float(b.get("kwh", 0.0))
+                dyn_chf += float(b.get("dyn_chf", 0.0))
+                base_chf += float(b.get("base_chf", 0.0))
+                slot_count += 1
+            except Exception:
+                continue
+
+        savings_chf = base_chf - dyn_chf
+        savings_pct = ((savings_chf / base_chf) * 100.0) if base_chf > 0 else 0.0
+
+        return {
+            "kwh": round(kwh, 2),
+            "dyn_chf": round(dyn_chf, 4),
+            "base_chf": round(base_chf, 4),
+            "savings_chf": round(savings_chf, 4),
+            "savings_percent": round(savings_pct, 1),
+            "slots": slot_count,
+        }
+
     def compute_today_totals(self) -> tuple[float, float, float]:
         now = dt_util.now()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -732,12 +882,12 @@ class TariffSaverStore:
 
             consumer_kwh = min(consumer_kwh, delta)
             base_kwh = max(0.0, delta - consumer_kwh)
-            # Compute slot index (0-47) from time
+            # Compute slot index (0..SLOTS_PER_DAY-1) from time
             try:
                 slot_dt = dt_util.parse_datetime(current_key)
                 if slot_dt:
                     local_dt = dt_util.as_local(slot_dt)
-                    slot_index = local_dt.hour * 2 + (1 if local_dt.minute >= 30 else 0)
+                    slot_index = local_dt.hour * SLOTS_PER_HOUR + local_dt.minute // SLOT_MINUTES
                 else:
                     slot_index = i
             except Exception:
@@ -761,16 +911,78 @@ class TariffSaverStore:
 
         self.load_profiles = [p for p in self.load_profiles if p.get("date") != date_str]
         self.load_profiles.append(profile)
+        self.trim_load_profiles()
         self.dirty = True
         return profile
+
+    def trim_load_profiles(self, keep_days: int = 400) -> None:
+        """Remove daily load profiles older than keep_days.
+
+        load_profiles is keyed by date (1 entry/day, up to SLOTS_PER_DAY slots each)
+        and was previously never trimmed → unbounded growth. 400 Tage analog zu
+        price_slots/energy_readings/day_average_prices."""
+        cutoff = (dt_util.now().date() - timedelta(days=keep_days)).isoformat()
+        before = len(self.load_profiles)
+        self.load_profiles = [
+            p for p in self.load_profiles if str(p.get("date", "")) >= cutoff
+        ]
+        if len(self.load_profiles) != before:
+            self.dirty = True
 
     def clear_consumption_slot_buffer(self) -> None:
         self.consumption_slot_buffer = {}
         self.consumer_slot_buffers = {}
         self.dirty = True
 
+    def _migrate_load_profiles_to_15min(self) -> None:
+        """One-time migration: split 30-min slot profiles (slot_index 0..47) into 15-min (0..95).
+
+        Each old 30-min slot becomes two 15-min slots with halved kWh values
+        (uniform-distribution assumption). Idempotent: already-migrated profiles
+        (max slot_index >= 48) are skipped. Sets dirty so migration persists.
+        """
+        migrated_any = False
+        for profile in self.load_profiles:
+            slots = profile.get("slots", [])
+            if not slots:
+                continue
+            indices = [s.get("slot_index") for s in slots if s.get("slot_index") is not None]
+            if not indices:
+                continue
+            try:
+                max_idx = max(int(i) for i in indices)
+            except (ValueError, TypeError):
+                continue
+            if max_idx >= 48:
+                continue  # already 15-min granularity
+            if max_idx < 24:
+                continue  # too few indices to confidently identify as 30-min profile
+            new_slots = []
+            for s in slots:
+                old_idx = s.get("slot_index")
+                if old_idx is None:
+                    new_slots.append(s)
+                    continue
+                old_idx = int(old_idx)
+                base_kwh = float(s.get("base_kwh", 0.0) or 0.0) / 2.0
+                consumer_kwh = float(s.get("consumer_kwh", 0.0) or 0.0) / 2.0
+                total_kwh = float(s.get("total_kwh", 0.0) or 0.0) / 2.0
+                for offset in (0, 1):
+                    new_slots.append({
+                        **s,
+                        "slot_index": old_idx * 2 + offset,
+                        "base_kwh": round(base_kwh, 4),
+                        "consumer_kwh": round(consumer_kwh, 4),
+                        "total_kwh": round(total_kwh, 4),
+                        "_migrated_from_30min": True,
+                    })
+            profile["slots"] = new_slots
+            migrated_any = True
+        if migrated_any:
+            self.dirty = True
+
     def get_seasonal_load_profile(self, season: str | None = None) -> dict[int, float]:
-        """Get average base load per 30-min slot index (0-47) for a season.
+        """Get average base load per slot index (0..SLOTS_PER_DAY-1) for a season.
 
         Returns dict {slot_index: avg_base_kwh}.
         If season is None, averages across all seasons.
@@ -788,7 +1000,7 @@ class TariffSaverStore:
                         slot_dt = dt_util.parse_datetime(slot.get("start", ""))
                         if slot_dt:
                             local_dt = dt_util.as_local(slot_dt)
-                            idx = local_dt.hour * 2 + (1 if local_dt.minute >= 30 else 0)
+                            idx = local_dt.hour * SLOTS_PER_HOUR + local_dt.minute // SLOT_MINUTES
                     except Exception:
                         continue
                 if idx is None:
@@ -801,6 +1013,50 @@ class TariffSaverStore:
             idx: round(sum(vals) / len(vals), 4)
             for idx, vals in slot_totals.items()
             if vals
+        }
+
+    def get_all_seasonal_load_profiles(
+        self, seasons: tuple[str, ...] = ("Winter", "Frühling", "Sommer", "Herbst")
+    ) -> dict[str, dict[int, float]]:
+        """Build the per-slot base-load profile for every season in a SINGLE
+        pass over self.load_profiles.
+
+        Equivalent to calling get_seasonal_load_profile() once per season, but
+        scans load_profiles only once instead of len(seasons) times — relevant
+        because load_profiles grows ~1 profile/day × up to SLOTS_PER_DAY slots
+        and the BaseLoadSensor reads this on every state write.
+        """
+        from collections import defaultdict
+        per_season: dict[str, dict[int, list[float]]] = {s: defaultdict(list) for s in seasons}
+
+        for profile in self.load_profiles:
+            season = profile.get("season")
+            if season not in per_season:
+                continue
+            bucket = per_season[season]
+            for slot in profile.get("slots", []):
+                idx = slot.get("slot_index")
+                if idx is None:
+                    try:
+                        slot_dt = dt_util.parse_datetime(slot.get("start", ""))
+                        if slot_dt:
+                            local_dt = dt_util.as_local(slot_dt)
+                            idx = local_dt.hour * SLOTS_PER_HOUR + local_dt.minute // SLOT_MINUTES
+                    except Exception:
+                        continue
+                if idx is None:
+                    continue
+                base = slot.get("base_kwh")
+                if isinstance(base, (int, float)):
+                    bucket[int(idx)].append(float(base))
+
+        return {
+            season: {
+                idx: round(sum(vals) / len(vals), 4)
+                for idx, vals in totals.items()
+                if vals
+            }
+            for season, totals in per_season.items()
         }
 
     def add_base_load_daily(
@@ -850,6 +1106,18 @@ class TariffSaverStore:
             if vals
         }
 
+    def _marker_only_via_service(self, consumer_id: str) -> bool:
+        """True wenn last_run_end_utc für diesen Consumer nur über mark_consumer_run gesetzt werden darf."""
+        try:
+            from homeassistant.config_entries import ConfigEntry  # noqa: F401
+            entry = next((e for e in self.hass.config_entries.async_entries("tariff_saver") if e.entry_id == self.entry_id), None)
+            if entry is None:
+                return False
+            raw = (entry.options.get("consumers") or {}).get(str(consumer_id)) or {}
+            return int(raw.get("max_days", 0) or 0) > 0 or bool(str(raw.get("demand_entity", "") or "").strip())
+        except Exception:
+            return False
+
     def _finalize_consumer_run(self, consumer_id: str) -> None:
         run = self.consumer_runs.get(str(consumer_id))
         if not isinstance(run, dict) or not run.get("active"):
@@ -857,15 +1125,20 @@ class TariffSaverStore:
         start_kwh = float(run.get("start_kwh", run.get("last_kwh", 0.0)) or 0.0)
         last_kwh = float(run.get("last_kwh", start_kwh) or start_kwh)
         delta = last_kwh - start_kwh
-        if delta <= 0.01:
-            self.consumer_runs.pop(str(consumer_id), None)
-            self.dirty = True
-            return
         start_ts = dt_util.parse_datetime(str(run.get("start_ts", "")))
         last_ts = dt_util.parse_datetime(str(run.get("last_ts", "")))
         duration_min = 0.0
         if isinstance(start_ts, datetime) and isinstance(last_ts, datetime):
             duration_min = max(0.0, (dt_util.as_utc(last_ts) - dt_util.as_utc(start_ts)).total_seconds() / 60.0)
+        run_power = (delta / (duration_min / 60.0)) if duration_min > 0 else 0.0
+        # Mindest-Lauf-Gate gegen Phantom-Läufe: der geteilte WP-Kreis-Shelly (Slot 1+10)
+        # zählt auch ~14 W Standby-Trickle, was sonst als "Lauf" finalisiert wird und
+        # fälschlich last_run_end_utc setzt (→ Consumer gilt als erledigt → kein WW).
+        # Echter Lauf zieht kW-/kWh-Skala; darunter verwerfen, kein last_run-Marker.
+        if delta < MIN_RUN_KWH or (run_power > 0 and run_power < MIN_RUN_POWER_KW):
+            self.consumer_runs.pop(str(consumer_id), None)
+            self.dirty = True
+            return
         learned = dict(self.consumer_learning.get(str(consumer_id), {}) or {})
         samples = int(learned.get("sample_count", 0) or 0) + 1
         prev_energy = float(learned.get("avg_energy_kwh", 0.0) or 0.0)
@@ -873,7 +1146,6 @@ class TariffSaverStore:
         prev_power = float(learned.get("avg_power_kw", 0.0) or 0.0)
         avg_energy = ((prev_energy * (samples - 1)) + delta) / samples
         avg_duration = ((prev_duration * (samples - 1)) + duration_min) / samples if duration_min > 0 else prev_duration
-        run_power = (delta / (duration_min / 60.0)) if duration_min > 0 else 0.0
         avg_power = ((prev_power * (samples - 1)) + run_power) / samples if run_power > 0 else prev_power
         learned.update(
             {
@@ -881,9 +1153,14 @@ class TariffSaverStore:
                 "avg_energy_kwh": avg_energy,
                 "avg_duration_minutes": avg_duration,
                 "avg_power_kw": avg_power,
-                "last_run_end_utc": dt_util.as_utc(last_ts).isoformat() if isinstance(last_ts, datetime) else None,
             }
         )
+        # Audit 9.2: Für Hygiene-/Bedarfs-Consumer (max_days > 0 oder demand_entity) setzt NUR
+        # `mark_consumer_run` den last_run-Marker — das Learning misst am geteilten WP-Kreis
+        # auch fremde Läufe (Heizung, abgebrochene Hygiene) und darf den Consumer nicht als
+        # „erledigt" markieren. Gleiche Regel wie binary_sensor._log_transition.
+        if not self._marker_only_via_service(consumer_id):
+            learned["last_run_end_utc"] = dt_util.as_utc(last_ts).isoformat() if isinstance(last_ts, datetime) else None
         self.consumer_learning[str(consumer_id)] = learned
         self.consumer_runs.pop(str(consumer_id), None)
         self.dirty = True
@@ -917,6 +1194,21 @@ class TariffSaverStore:
             self.dirty = True
             return True
         if abs(float(kwh_total) - last_kwh) > 1e-6:
+            # Hard-Cap: bei gemeinsam genutztem Sensor (z.B. WP-Kreis-Shelly für Slot 1+10)
+            # zählt der Sensor permanent — der 20-Min-Stale-Check unten greift nie. Nach 6h
+            # Run-Laufzeit Run zwangsfinalisieren, sonst hängt active=True für immer.
+            start_ts = dt_util.parse_datetime(str(run.get("start_ts", "")))
+            if isinstance(start_ts, datetime) and (ts_utc - dt_util.as_utc(start_ts)).total_seconds() >= 6 * 60 * 60:
+                self._finalize_consumer_run(key)
+                self.consumer_runs[key] = {
+                    "active": True,
+                    "start_kwh": float(kwh_total),
+                    "last_kwh": float(kwh_total),
+                    "start_ts": ts_utc.isoformat(),
+                    "last_ts": ts_utc.isoformat(),
+                }
+                self.dirty = True
+                return True
             run["active"] = True
             run["last_kwh"] = float(kwh_total)
             run["last_ts"] = ts_utc.isoformat()
@@ -978,4 +1270,96 @@ class TariffSaverStore:
         learned["last_run_end_utc"] = ts_utc.isoformat()
         self.consumer_learning[key] = learned
         self.dirty = True
+
+    # --- Session Management (kind=session consumers, e.g. Wallbox) ---
+
+    def session_start(
+        self,
+        consumer_id: str,
+        *,
+        energy_kwh: float,
+        deadline_utc: datetime | None,
+        min_power_w: int,
+        max_power_w: int,
+        prefer_pv: bool = True,
+    ) -> dict[str, Any]:
+        now = dt_util.utcnow().isoformat()
+        key = str(consumer_id)
+        session = {
+            "slot": int(consumer_id) if str(consumer_id).isdigit() else consumer_id,
+            "active": True,
+            "energy_needed_kwh": float(energy_kwh),
+            "deadline_utc": deadline_utc.isoformat() if isinstance(deadline_utc, datetime) else None,
+            "min_power_w": int(min_power_w),
+            "max_power_w": int(max_power_w),
+            "prefer_pv": bool(prefer_pv),
+            "started_utc": now,
+            "last_update_utc": now,
+            "last_heartbeat_utc": now,
+        }
+        self.consumer_sessions[key] = session
+        self.dirty = True
+        return session
+
+    def session_update(
+        self,
+        consumer_id: str,
+        *,
+        remaining_kwh: float | None = None,
+    ) -> dict[str, Any] | None:
+        key = str(consumer_id)
+        session = self.consumer_sessions.get(key)
+        if not isinstance(session, dict):
+            return None
+        now = dt_util.utcnow().isoformat()
+        if remaining_kwh is not None:
+            session["energy_needed_kwh"] = float(remaining_kwh)
+        session["last_update_utc"] = now
+        session["last_heartbeat_utc"] = now
+        self.consumer_sessions[key] = session
+        self.dirty = True
+        return session
+
+    def session_heartbeat(self, consumer_id: str) -> None:
+        """Producer (huawei_solar) sends heartbeat to keep session alive."""
+        key = str(consumer_id)
+        session = self.consumer_sessions.get(key)
+        if not isinstance(session, dict):
+            return
+        session["last_heartbeat_utc"] = dt_util.utcnow().isoformat()
+        self.consumer_sessions[key] = session
+        self.dirty = True
+
+    def session_end(self, consumer_id: str, reason: str = "ended") -> dict[str, Any] | None:
+        key = str(consumer_id)
+        session = self.consumer_sessions.pop(key, None)
+        if isinstance(session, dict):
+            session["active"] = False
+            session["ended_reason"] = reason
+            session["ended_utc"] = dt_util.utcnow().isoformat()
+        self.dirty = True
+        return session
+
+    def get_active_sessions(self) -> dict[str, dict[str, Any]]:
+        """All currently active sessions, keyed by slot string."""
+        return {k: v for k, v in self.consumer_sessions.items() if isinstance(v, dict) and v.get("active")}
+
+    def session_stale_check(self, max_stale_seconds: int = 300) -> list[str]:
+        """Returns slot keys of sessions whose heartbeat is older than max_stale_seconds.
+        Caller decides whether to call session_end on them."""
+        now = dt_util.utcnow()
+        stale: list[str] = []
+        for key, session in self.consumer_sessions.items():
+            if not isinstance(session, dict) or not session.get("active"):
+                continue
+            hb = session.get("last_heartbeat_utc")
+            if not isinstance(hb, str):
+                continue
+            try:
+                hb_dt = dt_util.as_utc(dt_util.parse_datetime(hb))
+            except Exception:
+                continue
+            if hb_dt and (now - hb_dt).total_seconds() > max_stale_seconds:
+                stale.append(key)
+        return stale
 

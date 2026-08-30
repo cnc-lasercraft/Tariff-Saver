@@ -22,8 +22,12 @@ from .const import (
     DEFAULT_CONSUMER10_MAX_DAYS,
     DEFAULT_CONSUMER10_MIN_DAYS,
     DEFAULT_PV_FORECAST_ATTRIBUTE,
+    SLOT_MINUTES,
+    SLOT_HOUR_FRACTION,
+    SLOTS_PER_HOUR,
 )
 from .models import ConsumerConfig, ConsumerLearning, PriceSlot
+from .slot_helpers import score_from_prices
 from .storage import IMPORT_ALLIN_COMPONENTS, TariffSaverStore
 
 
@@ -51,6 +55,15 @@ def get_consumer_config(entry: ConfigEntry, slot: int) -> ConsumerConfig:
         pv_opportunist=bool(raw.get("pv_opportunist", False)),
         min_runtime_minutes=int(raw.get("min_runtime_minutes", 0) or 0),
         run_order=int(raw.get("run_order", 0) or 0),
+        trigger_entity=str(raw.get("trigger_entity", "") or "").strip(),
+        skip_next_run=bool(raw.get("skip_next_run", False)),
+        allowed_from=str(raw.get("allowed_from", "") or "").strip(),
+        allowed_until=str(raw.get("allowed_until", "") or "").strip(),
+        runtime_sensor=str(raw.get("runtime_sensor", "") or "").strip(),
+        demand_entity=str(raw.get("demand_entity", "") or "").strip(),
+        pause_on_vacation=bool(raw.get("pause_on_vacation", False)),
+        is_battery_charger=bool(raw.get("is_battery_charger", False)),
+        kind=str(raw.get("kind", "daily_fixed") or "daily_fixed"),
     )
 
 
@@ -116,12 +129,12 @@ def effective_power_kw(
 def required_slot_count(config: ConsumerConfig, learning: ConsumerLearning | dict[str, Any] | None) -> int:
     dur = effective_duration_minutes(config, learning)
     if isinstance(dur, int) and dur > 0:
-        return max(1, (dur + 29) // 30)
+        return max(1, (dur + SLOT_MINUTES - 1) // SLOT_MINUTES)
     energy = effective_energy_kwh(config, learning)
     power = effective_power_kw(config, learning)
     if energy and power and power > 0:
         minutes = int(round((float(energy) / float(power)) * 60.0))
-        return max(1, (minutes + 29) // 30)
+        return max(1, (minutes + SLOT_MINUTES - 1) // SLOT_MINUTES)
     return 2
 
 
@@ -137,72 +150,40 @@ def _all_in_from_slot(slot: PriceSlot | None) -> float | None:
     return total if total > 0 else None
 
 
-def _read_entity_forecast(hass: HomeAssistant, entity_id: str, attr_name: str) -> list[dict[str, Any]]:
-    """Read forecast slots from one entity attribute."""
-    if not entity_id:
-        return []
-    state = hass.states.get(entity_id)
-    if state is None:
-        return []
-    raw = state.attributes.get(attr_name)
-    if not isinstance(raw, list):
-        return []
+def _forecast_from_slots(active_slots: list) -> list[dict[str, Any]]:
+    """Baue Forecast-Liste aus active PriceSlots (nutzt slot.pv_kw).
+
+    Kompatibler Ersatz für `_parse_forecast_slots` — liefert selbe Struktur,
+    aber aus slot.pv_kw statt externer Solcast-Lookup. Slot-Granularität folgt
+    SLOT_MINUTES (heute 15).
+    """
+    from .const import SLOT_HOUR_FRACTION
     out: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        dtp = dt_util.parse_datetime(str(item.get("period_start", "")))
-        if dtp is None:
-            continue
-        pv_power_kw = float(item.get("pv_estimate", 0.0) or 0.0)
-        out.append(
-            {
-                "start": dt_util.as_local(dtp),
-                "pv_power_kw": pv_power_kw,
-                "pv_energy_kwh": pv_power_kw * 0.5,
-            }
-        )
-    return out
+    for slot in active_slots or []:
+        pv_kw = float(getattr(slot, "pv_kw", 0.0) or 0.0)
+        out.append({
+            "start": dt_util.as_local(slot.start),
+            "pv_power_kw": pv_kw,
+            "pv_energy_kwh": pv_kw * SLOT_HOUR_FRACTION,
+        })
+    return sorted(out, key=lambda x: x["start"])
 
 
 def _parse_forecast_slots(hass: HomeAssistant, entry: ConfigEntry) -> list[dict[str, Any]]:
-    entity_id = str(
-        entry.options.get(CONF_PV_FORECAST_ENTITY, entry.data.get(CONF_PV_FORECAST_ENTITY, "")) or ""
-    ).strip()
-    attr_name = str(
-        entry.options.get(
-            CONF_PV_FORECAST_ATTRIBUTE,
-            entry.data.get(CONF_PV_FORECAST_ATTRIBUTE, DEFAULT_PV_FORECAST_ATTRIBUTE),
-        )
-        or DEFAULT_PV_FORECAST_ATTRIBUTE
-    ).strip()
-    if not entity_id:
-        return []
+    """DEPRECATED: Kept for backward-compat. Use _forecast_from_slots(active_slots) instead.
 
-    # Read primary entity
-    slots = _read_entity_forecast(hass, entity_id, attr_name)
-
-    # Auto-detect companion "morgen" entity for Solcast (enables 30h planning window)
-    companion_id: str | None = None
-    for today_term, tomorrow_term in [
-        ("prognose_heute", "prognose_morgen"),
-        ("forecast_today", "forecast_tomorrow"),
-        ("_today", "_tomorrow"),
-    ]:
-        if today_term in entity_id:
-            companion_id = entity_id.replace(today_term, tomorrow_term, 1)
-            break
-
-    if companion_id:
-        slots += _read_entity_forecast(hass, companion_id, attr_name)
-
-    # Deduplicate by start time and sort
-    seen: dict = {}
-    for s in slots:
-        k = s["start"]
-        if k not in seen:
-            seen[k] = s
-    return sorted(seen.values(), key=lambda x: x["start"])
+    Fallback-Implementierung für Stellen die noch keine active_slots übergeben —
+    liest über den Store die aktuellen Slots und baut Forecast-Liste.
+    """
+    coords = hass.data.get("tariff_saver", {})
+    for _eid, coord in coords.items():
+        if not hasattr(coord, "data"):
+            continue
+        data = coord.data or {}
+        active = data.get("active", []) if isinstance(data, dict) else []
+        if active:
+            return _forecast_from_slots(active)
+    return []
 
 
 def battery_available_kwh(hass: HomeAssistant, entry: ConfigEntry) -> float:
@@ -238,32 +219,35 @@ def battery_available_kwh(hass: HomeAssistant, entry: ConfigEntry) -> float:
 
 
 def _pv_covers_window(forecast: list[dict], base_profile: dict, w_start, w_end, pv_threshold_kw: float = 0.5) -> bool:
-    """Check if PV forecast exceeds base load for ALL slots in the window."""
+    """Check if PV forecast exceeds base load for ALL slots in the window.
+
+    `forecast` ist jetzt Slot-granular (SLOT_MINUTES) — ein Eintrag pro 15-min-Slot
+    mit `start` (local datetime) und `pv_power_kw`.
+    """
     if not forecast:
         return False
-    slot_minutes = 30
+    from .const import SLOT_MINUTES, SLOTS_PER_HOUR
+    fallback_per_slot = 0.3 / (SLOTS_PER_HOUR / 2)  # 0.15 kWh bei 15-min
+    # Build lookup by slot_start (local)
+    fc_by_start: dict = {}
+    for f in forecast:
+        f_start = f.get("start")
+        if f_start is not None and hasattr(f_start, "hour"):
+            fc_by_start[f_start.replace(second=0, microsecond=0)] = float(f.get("pv_power_kw", 0.0))
+
     current = w_start
     while current < w_end:
-        slot_idx = current.hour * 2 + (1 if current.minute >= 30 else 0)
-        # Get base load for this slot (kW = kWh per 30min * 2)
-        base_kwh = float(base_profile.get(str(slot_idx), base_profile.get(slot_idx, 0.3)))
-        base_kw = base_kwh * 2  # convert 30-min kWh to average kW
+        slot_idx = current.hour * SLOTS_PER_HOUR + current.minute // SLOT_MINUTES
+        base_kwh = float(base_profile.get(str(slot_idx), base_profile.get(slot_idx, fallback_per_slot)))
+        base_kw = base_kwh * SLOTS_PER_HOUR
 
-        # Find PV forecast for this slot
-        pv_kw = 0.0
-        for f in forecast:
-            f_start = f.get("start")
-            if f_start is not None:
-                if hasattr(f_start, "hour"):
-                    if f_start.hour == current.hour and ((f_start.minute < 30) == (current.minute < 30)):
-                        pv_kw = float(f.get("pv_power_kw", 0.0))
-                        break
+        key = current.replace(second=0, microsecond=0)
+        pv_kw = fc_by_start.get(key, 0.0)
 
-        # If PV doesn't exceed base load + threshold, window is NOT PV-covered
         if pv_kw < base_kw + pv_threshold_kw:
             return False
 
-        current = current + __import__("datetime").timedelta(minutes=slot_minutes)
+        current = current + __import__("datetime").timedelta(minutes=SLOT_MINUTES)
     return True
 
 
@@ -297,21 +281,79 @@ def build_consumer_plan(
             "slot_count": slot_count,
         }
 
+    # Ferienmodus: markierter Consumer wird nicht geplant/gestartet (Overlay).
+    # Deckt auch den Live-Pfad der pv_opportunist-Consumer ab.
+    if config.pause_on_vacation:
+        from .vacation import is_vacation_active
+        if is_vacation_active(hass, entry):
+            return {
+                "status": "vacation",
+                "should_run": False,
+                "source": "-",
+                "required_energy_kwh": req_energy,
+                "slot_count": slot_count,
+            }
+
     # PV-Opportunist: run whenever PV surplus exceeds consumer power
+    # Priority-aware: higher priority consumers get first dibs on surplus.
+    # Constrained by PV windows from scheduler (if available).
     if config.pv_opportunist:
+        # Check PV window constraint from pre-computed plan
+        pv_windows = []
+        for _eid, _coord in hass.data.get("tariff_saver", {}).items():
+            if hasattr(_coord, "store") and _coord.store is not None and _coord.store.consumer_plans:
+                _plan = _coord.store.consumer_plans.get(str(config.slot)) or _coord.store.consumer_plans.get(config.slot)
+                if isinstance(_plan, dict):
+                    pv_windows = _plan.get("pv_windows", [])
+                break
+
+        # If we have PV windows, check if we're inside one
+        if pv_windows:
+            in_window = False
+            for w in pv_windows:
+                w_start = dt_util.parse_datetime(str(w.get("start", "")))
+                w_end = dt_util.parse_datetime(str(w.get("end", "")))
+                if w_start and w_end:
+                    now_local = dt_util.now()
+                    if w_start <= now_local <= w_end:
+                        in_window = True
+                        break
+            if not in_window:
+                return {
+                    "status": "pv_opportunist",
+                    "should_run": False,
+                    "source": None,
+                    "reason": "outside_pv_window",
+                    "pv_windows": pv_windows,
+                }
+
         from .const import CONF_PV_SURPLUS_ENTITY
         pv_entity = str(
             entry.options.get(CONF_PV_SURPLUS_ENTITY, entry.data.get(CONF_PV_SURPLUS_ENTITY, "")) or ""
         ).strip()
-        pv_surplus_kw = 0.0
-        if pv_entity:
-            pv_state = hass.states.get(pv_entity)
-            if pv_state and pv_state.state not in ("unavailable", "unknown", ""):
-                try:
-                    val = float(pv_state.state)
-                    pv_surplus_kw = val / 1000.0 if val > 100 else val
-                except (ValueError, TypeError):
-                    pass
+        from .slot_helpers import state_to_kw
+        pv_surplus_kw = state_to_kw(hass.states.get(pv_entity)) if pv_entity else 0.0
+
+        # Priority-aware surplus: higher priority gets first dibs.
+        # Actual surplus already reflects all running consumers' power draw.
+        # Higher-prio consumer sees surplus + lower-prio running power → more headroom → stops last.
+        # Lower-prio consumer sees surplus as-is → less headroom → stops first.
+        consumers_cfg = entry.options.get("consumers", {})
+        lower_prio_power = 0.0
+        for other_slot, other_cfg in consumers_cfg.items():
+            if not isinstance(other_cfg, dict) or not other_cfg.get("enabled"):
+                continue
+            if not other_cfg.get("pv_opportunist"):
+                continue
+            if str(other_slot) == str(config.slot):
+                continue
+            other_prio = int(other_cfg.get("priority", 5) or 5)
+            if other_prio < config.priority:
+                other_bs = hass.states.get(f"binary_sensor.tariff_saver_consumer_{other_slot}_should_run")
+                if other_bs and other_bs.state == "on":
+                    lower_prio_power += float(other_cfg.get("power_kw", 0) or 0)
+        effective_surplus = pv_surplus_kw + lower_prio_power
+
         # Hysteresis: start at 120% of power, stop at 80%
         threshold_on = power_kw * 1.2 if power_kw > 0 else 0.1
         threshold_off = power_kw * 0.8 if power_kw > 0 else 0.05
@@ -340,15 +382,15 @@ def build_consumer_plan(
                 if elapsed < _min_rt:
                     should_run = True  # min runtime not reached
                 else:
-                    should_run = pv_surplus_kw >= threshold_off
+                    should_run = effective_surplus >= threshold_off
             else:
-                should_run = pv_surplus_kw >= threshold_off
+                should_run = effective_surplus >= threshold_off
             # Record stop time when turning off
             if not should_run and _store:
                 setattr(_store, _last_stop_key, dt_util.utcnow())
         else:
             # Not running: use higher threshold to start + cooldown check
-            should_run = pv_surplus_kw >= threshold_on
+            should_run = effective_surplus >= threshold_on
             if should_run and _last_stop and _cooldown > 0:
                 off_elapsed = (dt_util.utcnow() - _last_stop).total_seconds() / 60.0
                 if off_elapsed < _cooldown:
@@ -375,6 +417,7 @@ def build_consumer_plan(
             "tariff_avg_price_chf_per_kwh": None,
             "days_since_last_run": None,
             "due_status": None,
+            "pv_windows": pv_windows,
         }
 
     if req_energy is None or req_energy <= 0:
@@ -406,12 +449,31 @@ def build_consumer_plan(
     price_min = min(all_prices) if all_prices else None
     price_max = max(all_prices) if all_prices else None
 
+    # Flat-Tariff-Erkennung: bei geringem Tages-Spread sind alle Grid-Slots preislich
+    # gleich, der bisherige `avg < best` Tie-Break würde chronologisch erste Slots (=Nacht)
+    # bevorzugen. Ab `flat_grid_earliest_hour` werden Windows zugelassen, sonst
+    # übersprungen — damit landet Grid-Consumer bei flat nicht nachts.
+    from .const import (
+        CONF_FLAT_TARIFF_SPREAD_RP, DEFAULT_FLAT_TARIFF_SPREAD_RP,
+        CONF_FLAT_GRID_EARLIEST_HOUR, DEFAULT_FLAT_GRID_EARLIEST_HOUR,
+    )
+    flat_spread_rp = float(entry.options.get(CONF_FLAT_TARIFF_SPREAD_RP, entry.data.get(CONF_FLAT_TARIFF_SPREAD_RP, DEFAULT_FLAT_TARIFF_SPREAD_RP)) or DEFAULT_FLAT_TARIFF_SPREAD_RP)
+    flat_earliest_hour = int(entry.options.get(CONF_FLAT_GRID_EARLIEST_HOUR, entry.data.get(CONF_FLAT_GRID_EARLIEST_HOUR, DEFAULT_FLAT_GRID_EARLIEST_HOUR)) or DEFAULT_FLAT_GRID_EARLIEST_HOUR)
+    is_flat_tariff = (
+        price_min is not None and price_max is not None
+        and (price_max - price_min) * 100.0 < flat_spread_rp
+    )
+
+    from .const import SLOT_MINUTES as _SLOT_MIN_LOCAL
     best_tariff = None
     for i in range(0, max(0, len(future_price_slots) - slot_count + 1)):
         window = future_price_slots[i : i + slot_count]
         w_start = dt_util.as_local(window[0].start)
-        w_end = dt_util.as_local(window[-1].start) + timedelta(minutes=30)
+        w_end = dt_util.as_local(window[-1].start) + timedelta(minutes=_SLOT_MIN_LOCAL)
         if claimed_windows and any(w_start < ce and cs < w_end for cs, ce in claimed_windows):
+            continue
+        # Flat-Tariff: Grid-Slot-Start vor der erlaubten Stunde überspringen
+        if is_flat_tariff and w_start.hour < flat_earliest_hour:
             continue
         prices = [_all_in_from_slot(s) for s in window]
         if any(p is None for p in prices):
@@ -422,20 +484,21 @@ def build_consumer_plan(
         avg = sum(prices) / len(prices)
         # Skip windows where any slot exceeds max_grid_score
         if config.max_grid_score < 100:
-            from .coordinator import score_from_prices
             window_scores = [score_from_prices(p, price_min, price_max) for p in prices]
             if any(s is not None and s > config.max_grid_score for s in window_scores):
                 continue
         if best_tariff is None or avg < best_tariff["avg_price_chf_per_kwh"]:
             best_tariff = {
                 "start": dt_util.as_local(window[0].start),
-                "end": dt_util.as_local(window[-1].start) + timedelta(minutes=30),
+                "end": dt_util.as_local(window[-1].start) + timedelta(minutes=_SLOT_MIN_LOCAL),
                 "avg_price_chf_per_kwh": avg,
                 "slot_count": slot_count,
             }
 
-    forecast = _parse_forecast_slots(hass, entry)
-    now_floor = now_local.replace(minute=0 if now_local.minute < 30 else 30, second=0, microsecond=0)
+    from .const import SLOT_MINUTES
+    # Forecast aus active_slots (slot.pv_kw) — Slot-Granularität folgt SLOT_MINUTES
+    forecast = _forecast_from_slots(active_slots)
+    now_floor = now_local.replace(minute=(now_local.minute // SLOT_MINUTES) * SLOT_MINUTES, second=0, microsecond=0)
     forecast = [f for f in forecast if f["start"] >= now_floor]
 
     best_pv = None
@@ -444,12 +507,12 @@ def build_consumer_plan(
         for i in range(0, len(forecast) - slot_count + 1):
             window = forecast[i : i + slot_count]
             w_start = window[0]["start"]
-            w_end = window[-1]["start"] + timedelta(minutes=30)
+            w_end = window[-1]["start"] + timedelta(minutes=SLOT_MINUTES)
             if claimed_windows and any(w_start < ce and cs < w_end for cs, ce in claimed_windows):
                 continue
             ok = True
             for j in range(1, len(window)):
-                if window[j]["start"] - window[j - 1]["start"] != timedelta(minutes=30):
+                if window[j]["start"] - window[j - 1]["start"] != timedelta(minutes=SLOT_MINUTES):
                     ok = False
                     break
             if not ok:
@@ -457,7 +520,7 @@ def build_consumer_plan(
             energy = sum(float(s["pv_energy_kwh"]) for s in window)
             candidate = {
                 "start": window[0]["start"],
-                "end": window[-1]["start"] + timedelta(minutes=30),
+                "end": window[-1]["start"] + timedelta(minutes=SLOT_MINUTES),
                 "expected_pv_energy_kwh": energy,
                 "slot_count": slot_count,
             }
@@ -497,7 +560,7 @@ def build_consumer_plan(
                 _fws = dt_util.as_local(_fw[0].start)
                 if _fws.date() != today_date:
                     continue
-                _fwe = dt_util.as_local(_fw[-1].start) + timedelta(minutes=30)
+                _fwe = dt_util.as_local(_fw[-1].start) + timedelta(minutes=SLOT_MINUTES)
                 if claimed_windows and any(_fws < ce and cs < _fwe for cs, ce in claimed_windows):
                     continue
                 _fp = [_all_in_from_slot(s) for s in _fw]
@@ -517,10 +580,10 @@ def build_consumer_plan(
                 _fws = _fw[0]["start"]
                 if _fws.date() != today_date:
                     continue
-                _fwe = _fw[-1]["start"] + timedelta(minutes=30)
+                _fwe = _fw[-1]["start"] + timedelta(minutes=SLOT_MINUTES)
                 if claimed_windows and any(_fws < ce and cs < _fwe for cs, ce in claimed_windows):
                     continue
-                if not all(_fw[j]["start"] - _fw[j-1]["start"] == timedelta(minutes=30) for j in range(1, len(_fw))):
+                if not all(_fw[j]["start"] - _fw[j-1]["start"] == timedelta(minutes=SLOT_MINUTES) for j in range(1, len(_fw))):
                     continue
                 _fen = sum(float(s["pv_energy_kwh"]) for s in _fw)
                 if _fen >= req_energy and (best_pv_today is None or _fen > best_pv_today["expected_pv_energy_kwh"]):
@@ -569,7 +632,7 @@ def build_consumer_plan(
                 for i in range(0, max(0, len(future_price_slots) - slot_count + 1)):
                     window = future_price_slots[i : i + slot_count]
                     w_start = dt_util.as_local(window[0].start)
-                    w_end = dt_util.as_local(window[-1].start) + timedelta(minutes=30)
+                    w_end = dt_util.as_local(window[-1].start) + timedelta(minutes=SLOT_MINUTES)
                     if claimed_windows and any(w_start < ce and cs < w_end for cs, ce in claimed_windows):
                         continue
                     prices = [_all_in_from_slot(s) for s in window]

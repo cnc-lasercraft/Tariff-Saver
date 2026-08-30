@@ -85,3 +85,107 @@ mark_consumer_run:
           step: 0.001
           mode: box
           unit_of_measurement: CHF/kWh
+
+
+session_start:
+  name: Session-Consumer Start
+  description: Start a charging session for a kind=session consumer (Wallbox). Producer (e.g. huawei_solar) calls this on plug-in.
+  fields:
+    slot:
+      name: Consumer slot
+      description: Slot of the session-consumer (e.g. 11 for Wallbox Zeekr).
+      required: true
+      example: 11
+      selector:
+        number: {min: 1, max: 15, mode: box}
+    energy_kwh:
+      name: Energy needed (kWh)
+      description: Total kWh that need to be charged in this session.
+      required: true
+      example: 28
+      selector:
+        number: {min: 0, max: 200, step: 0.1, mode: box, unit_of_measurement: kWh}
+    deadline:
+      name: Deadline (optional)
+      description: ISO datetime by which the session must be complete. Empty = pure PV-opportunistic (TS does not plan).
+      required: false
+      example: "2026-04-22T06:30:00+02:00"
+      selector:
+        text:
+    min_power_w:
+      name: Minimum power (W)
+      description: Wallbox minimum charge power. Default 1380 (Huawei 1-phase).
+      required: false
+      example: 1380
+      selector:
+        number: {min: 0, max: 22000, step: 100, mode: box, unit_of_measurement: W}
+    max_power_w:
+      name: Maximum power (W)
+      description: Wallbox maximum charge power. Default 11000 (Huawei 3-phase nominal).
+      required: false
+      example: 11000
+      selector:
+        number: {min: 0, max: 22000, step: 100, mode: box, unit_of_measurement: W}
+    prefer_pv:
+      name: Prefer PV
+      description: If true, PV-slots get a price-bonus over grid-slots in planning.
+      required: false
+      default: true
+      selector:
+        boolean:
+
+
+session_update:
+  name: Session-Consumer Update
+  description: Update remaining energy and refresh heartbeat for an active session. Producer calls this when SOC changes significantly.
+  fields:
+    slot:
+      name: Consumer slot
+      required: true
+      example: 11
+      selector:
+        number: {min: 1, max: 15, mode: box}
+    remaining_kwh:
+      name: Remaining (kWh)
+      description: Energy still needed to complete the session.
+      required: false
+      example: 12.5
+      selector:
+        number: {min: 0, max: 200, step: 0.1, mode: box, unit_of_measurement: kWh}
+
+
+strom_sparen_apply:
+  name: Strom sparen anwenden
+  description: Snapshot der mit "strom_sparen_restore" gelabelten Entities + schaltet alle Entities mit "strom_sparen_restore" oder "strom_sparen_off_only" aus. Legacy-Label "strom_sparen" zählt als restore.
+  fields:
+    skip_snapshot:
+      name: Snapshot überspringen
+      description: Bei HA-Startup-Fall (strom_sparen war bereits on vor Restart). Default false.
+      required: false
+      default: false
+      selector:
+        boolean:
+
+
+session_end:
+  name: Session-Consumer End
+  description: End an active session (plug-out, target reached, or cancelled).
+  fields:
+    slot:
+      name: Consumer slot
+      required: true
+      example: 11
+      selector:
+        number: {min: 1, max: 15, mode: box}
+    reason:
+      name: End reason
+      required: false
+      example: plug_removed
+      selector:
+        select:
+          options:
+            - plug_removed
+            - target_reached
+            - cancelled
+            - timeout
+            - heartbeat_stale

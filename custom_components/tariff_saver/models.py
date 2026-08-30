@@ -35,6 +35,10 @@ class PriceSlot:
 
 
 
+CONSUMER_KIND_DAILY = "daily_fixed"
+CONSUMER_KIND_SESSION = "session"
+
+
 @dataclass(frozen=True)
 class ConsumerConfig:
     """Configuration for one flexible consumer."""
@@ -57,6 +61,17 @@ class ConsumerConfig:
     pv_opportunist: bool = False
     min_runtime_minutes: int = 0
     run_order: int = 0  # 0=keine Einschränkung, 1=zuerst, 2=danach, etc.
+    trigger_entity: str = ""  # if set → on_demand consumer (handled by on_demand.py, skipped by global scheduler)
+    skip_next_run: bool = False  # OneShot: skip next planned run, auto-reset at midnight
+    allowed_from: str = ""  # "HH:MM" — earliest planning time; empty = anytime
+    allowed_until: str = ""  # "HH:MM" — latest planning time (can cross midnight); empty = anytime
+    demand_entity: str = ""  # Bedarfs-Signal (binary_sensor/input_boolean): on → fällig (forced, auch mehrfach/Tag), off → waiting_demand. Ersetzt days_since-Fälligkeit (Audit 9.1 / WW1).
+    runtime_sensor: str = ""  # entity_id of a sensor reporting today's runtime (hours). Skip planning for today if value*60 >= duration_minutes.
+    pause_on_vacation: bool = False  # Overlay: im Ferienmodus nicht planen/starten (enabled bleibt unangetastet)
+    is_battery_charger: bool = False  # If true, battery assessment decides whether consumer runs (Consumer 9 pattern). Otherwise ignored.
+
+    # --- Session-Consumer (kind=session, e.g. Wallbox) ---
+    kind: str = CONSUMER_KIND_DAILY  # "daily_fixed" (default) | "session"
 
     @property
     def configured_name(self) -> str:
@@ -69,6 +84,28 @@ class ConsumerConfig:
         if self.power_kw > 0 and self.duration_minutes > 0:
             return float(self.power_kw) * float(self.duration_minutes) / 60.0
         return None
+
+
+@dataclass
+class SessionState:
+    """Transient session state for kind=session consumers (e.g. Wallbox).
+
+    Set via tariff_saver.session_start service, updated via session_update,
+    cleared via session_end. Persisted in storage so an HA-restart while
+    a session is active doesn't lose context.
+    """
+
+    slot: int
+    active: bool = False
+    energy_needed_kwh: float = 0.0
+    deadline_utc: datetime | None = None
+    min_power_w: int = 1380  # Huawei SCharger 1-phase minimum
+    max_power_w: int = 11000  # Huawei SCharger 3-phase nominal
+    prefer_pv: bool = True
+    started_utc: datetime | None = None
+    last_update_utc: datetime | None = None
+    # Heartbeat from huawei_solar — if stale (>5 min) the session is auto-ended
+    last_heartbeat_utc: datetime | None = None
 
 
 @dataclass(frozen=True)

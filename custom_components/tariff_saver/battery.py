@@ -81,16 +81,9 @@ async def async_battery_tick(
         score = 50
 
     # PV surplus
-    pv_surplus_kw = 0.0
+    from .slot_helpers import state_to_kw
     pv_surplus_entity = str(config.get(CONF_PV_SURPLUS_ENTITY, "") or "").strip()
-    if pv_surplus_entity:
-        pv_state = hass.states.get(pv_surplus_entity)
-        if pv_state and pv_state.state not in ("unavailable", "unknown", ""):
-            try:
-                val = float(pv_state.state)
-                pv_surplus_kw = val / 1000.0 if abs(val) > 100 else val
-            except (ValueError, TypeError):
-                pass
+    pv_surplus_kw = state_to_kw(hass.states.get(pv_surplus_entity)) if pv_surplus_entity else 0.0
 
     # Consumer 9 should_run state
     consumer9_active = False
@@ -98,13 +91,21 @@ async def async_battery_tick(
     if consumer9_state and consumer9_state.state == "on":
         consumer9_active = True
 
-    # Consumer 9 plan target SOC
+    # Consumer 9 plan target SOC — prefer scheduler's assessment (in store), fallback to naive sensor
     target_soc_from_plan = None
-    energy_until_pv = hass.states.get("sensor.tariff_saver_energy_until_pv")
-    if energy_until_pv and energy_until_pv.state not in ("unavailable", "unknown", ""):
-        rec = energy_until_pv.attributes.get("recommended_target_soc")
-        if isinstance(rec, (int, float)) and rec > 0:
-            target_soc_from_plan = int(rec)
+    store_for_target = getattr(coordinator, "store", None)
+    if store_for_target and store_for_target.consumer_plans:
+        plan9 = store_for_target.consumer_plans.get("9") or store_for_target.consumer_plans.get(9)
+        if isinstance(plan9, dict):
+            t = plan9.get("battery_target_soc_pct")
+            if isinstance(t, (int, float)) and t > 0:
+                target_soc_from_plan = int(round(float(t)))
+    if target_soc_from_plan is None:
+        energy_until_pv = hass.states.get("sensor.tariff_saver_energy_until_pv")
+        if energy_until_pv and energy_until_pv.state not in ("unavailable", "unknown", ""):
+            rec = energy_until_pv.attributes.get("recommended_target_soc")
+            if isinstance(rec, (int, float)) and rec > 0:
+                target_soc_from_plan = int(rec)
 
     # --- State machine ---
     store = getattr(coordinator, "store", None)

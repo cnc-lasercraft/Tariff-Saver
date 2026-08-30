@@ -23,13 +23,17 @@ class EkzTariffSettingsCard extends HTMLElement {
     return state.attributes.settings;
   }
 
-  async _save(key, value) {
-    if (!this._hass) return;
-    try {
-      await this._hass.callService('ekz_tariff', 'update_setting', { key, value });
-    } catch (e) {
-      alert('Speichern fehlgeschlagen: ' + e.message);
-    }
+  _save(key, value) {
+    if (!this._debounceTimers) this._debounceTimers = {};
+    clearTimeout(this._debounceTimers[key]);
+    this._debounceTimers[key] = setTimeout(async () => {
+      if (!this._hass) return;
+      try {
+        await this._hass.callService('ekz_tariff', 'update_setting', { key, value });
+      } catch (e) {
+        alert('Speichern fehlgeschlagen: ' + e.message);
+      }
+    }, 500);
   }
 
   _render() {
@@ -54,9 +58,8 @@ class EkzTariffSettingsCard extends HTMLElement {
       {
         title: 'Validierung',
         icon: 'mdi:check-decagram',
-        desc: 'Qualitätsprüfung der empfangenen Tarif-Slots.',
+        desc: 'Preisgrenzen für die Qualitätsprüfung. Slot-Anzahl wird automatisch geprüft (96, DST-aware).',
         fields: [
-          { key: 'min_slots_per_day', label: 'Min. Slots pro Tag', type: 'number', min: 1, max: 200, step: 1, hint: 'Normal: 96, DST: 92/100 (automatisch)' },
           { key: 'min_price_chf_per_kwh', label: 'Min. Preis (CHF/kWh)', type: 'number', min: 0, max: 1, step: 0.01, hint: 'Darunter = Dummy-Preis' },
           { key: 'max_price_chf_per_kwh', label: 'Max. Preis (CHF/kWh)', type: 'number', min: 0.1, max: 5, step: 0.01, hint: 'Darüber = Ausreisser' },
         ]
@@ -64,28 +67,29 @@ class EkzTariffSettingsCard extends HTMLElement {
       {
         title: 'Retry',
         icon: 'mdi:refresh',
-        desc: 'Wiederholungsversuche bei Fehlern.',
+        desc: 'Wiederholungsversuche bei Fehlern (keine Daten oder ungültig).',
         fields: [
-          { key: 'max_retries_no_data', label: 'Max. Retries (keine Daten)', type: 'number', min: 0, max: 20, step: 1 },
-          { key: 'max_retries_invalid_data', label: 'Max. Retries (ungültige Daten)', type: 'number', min: 0, max: 20, step: 1 },
-          { key: 'retry_interval_minutes', label: 'Retry-Intervall (Min.)', type: 'number', min: 1, max: 120, step: 1 },
+          { key: 'max_retries', label: 'Max. Retries', type: 'number', min: 0, max: 20, step: 1, hint: 'Standard: 4' },
+          { key: 'retry_interval_minutes', label: 'Retry-Intervall (Min.)', type: 'number', min: 1, max: 120, step: 1, hint: 'Standard: 15' },
+        ]
+      },
+      {
+        title: 'Public-API-Fallback',
+        icon: 'mdi:cloud-refresh',
+        desc: 'Wenn die Kunden-API nicht liefert (Auth-Fehler, 5xx, leer), werden die Preise aus der öffentlichen EKZ-API rekonstruiert: electricity_dynamic (identisch) + Netztarif + Offset.',
+        fields: [
+          { key: 'public_fallback_enabled', label: 'Fallback aktivieren', type: 'toggle' },
+          { key: 'public_fallback_grid_tariff', label: 'Netztarif-Name (Public API)', type: 'text', hint: 'Standard: grid_400d' },
+          { key: 'public_fallback_grid_offset_chf_per_kwh', label: 'Netz-Offset (CHF/kWh)', type: 'number', min: 0, max: 0.2, step: 0.0001, hint: 'Kundenpreis − Public-Preis. Standard: 0.0276' },
+          { key: 'public_fallback_regional_fees_chf_per_kwh', label: 'Regionale Abgaben (CHF/kWh)', type: 'number', min: 0, max: 0.1, step: 0.0001, hint: 'Standard: 0.0016' },
         ]
       },
       {
         title: 'Debug',
         icon: 'mdi:bug',
-        desc: 'API-Responses werden nach /config/ekz_tariff_debug.log geschrieben.',
+        desc: 'Jeder API-Call wird als einzelne JSON-Datei in /config/ekz_tariff_debug/ gespeichert.',
         fields: [
-          { key: 'debug_mode', label: 'Debug Modus', type: 'toggle' },
-        ]
-      },
-      {
-        title: 'Baseline',
-        icon: 'mdi:chart-line-variant',
-        desc: 'Berechneter Flat-Tarif als Vergleichswert (netto, ohne MWST).',
-        fields: [
-          { key: 'baseline_chf_per_kwh', label: 'Baseline (CHF/kWh)', type: 'info' },
-          { key: 'baseline_quarter', label: 'Quartal', type: 'info' },
+          { key: 'debug_mode', label: 'API-Dump aktivieren', type: 'toggle' },
         ]
       },
     ];

@@ -81,8 +81,8 @@ def _consumer_defaults(slot: int, source: dict[str, Any] | None = None) -> dict[
         "priority": max(1, min(10, int(source.get("priority", 5) or 5))),
         "pv_required": bool(source.get("pv_required", False)),
         "learning_enabled": bool(source.get("learning_enabled", True)),
-        "min_days": int(source.get("min_days", DEFAULT_CONSUMER10_MIN_DAYS if slot == CONSUMER_COUNT else 0) or (DEFAULT_CONSUMER10_MIN_DAYS if slot == CONSUMER_COUNT else 0)),
-        "max_days": int(source.get("max_days", DEFAULT_CONSUMER10_MAX_DAYS if slot == CONSUMER_COUNT else 0) or (DEFAULT_CONSUMER10_MAX_DAYS if slot == CONSUMER_COUNT else 0)),
+        "min_days": int(source.get("min_days", DEFAULT_CONSUMER10_MIN_DAYS if slot == 10 else 0) or (DEFAULT_CONSUMER10_MIN_DAYS if slot == 10 else 0)),
+        "max_days": int(source.get("max_days", DEFAULT_CONSUMER10_MAX_DAYS if slot == 10 else 0) or (DEFAULT_CONSUMER10_MAX_DAYS if slot == 10 else 0)),
         "max_grid_score": max(0, min(100, int(source.get("max_grid_score", 100) or 100))),
         "tariff_only": bool(source.get("tariff_only", False)),
         "slot": slot,
@@ -280,7 +280,7 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
             if updated["measurement_entity"] and "." not in updated["measurement_entity"]:
                 errors["measurement_entity"] = "invalid_entity"
 
-            if self._selected_consumer == CONSUMER_COUNT:
+            if self._selected_consumer == 10:
                 if updated["min_days"] < 0 or updated["max_days"] < 0:
                     errors[CONF_CONSUMER_MIN_DAYS] = "invalid_number"
                 elif updated["max_days"] < updated["min_days"]:
@@ -309,7 +309,7 @@ class TariffSaverOptionsFlowHandler(config_entries.OptionsFlow):
                 **({
                     vol.Optional(CONF_CONSUMER_MIN_DAYS, default=int((user_input or {}).get(CONF_CONSUMER_MIN_DAYS, current["min_days"]))): vol.Coerce(int),
                     vol.Optional(CONF_CONSUMER_MAX_DAYS, default=int((user_input or {}).get(CONF_CONSUMER_MAX_DAYS, current["max_days"]))): vol.Coerce(int),
-                } if self._selected_consumer == CONSUMER_COUNT else {}),
+                } if self._selected_consumer == 10 else {}),
             }
         )
         return self.async_show_form(
