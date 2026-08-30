@@ -36,6 +36,35 @@ DEFAULT_DEADLINE_HOURS = 24
 OPPORTUNISTIC_BUFFER_KW = 1.0          # Headroom über consumer.power_kw (Wolken-Reserve)
 OPPORTUNISTIC_STABLE_SECONDS = 180     # Surplus muss N Sekunden stabil über Schwelle sein
 OPPORTUNISTIC_TICK_SECONDS = 30        # Tick-Frequenz
+# Notbremse: so oft darf ein Plan innerhalb EINES Trigger-Ereignisses vorgezogen
+# werden. Normal ist genau einmal — danach laeuft das Fenster und der Tick haelt
+# ohnehin still. Zaehlt es hoeher, nimmt das Geraet den Startbefehl nicht an.
+MAX_OPPORTUNISTIC_ADVANCES = 3
+
+
+def _episode_consumed(store, slot: str, plan: dict[str, Any]) -> bool:
+    """True, wenn seit Beginn des laufenden Trigger-Ereignisses ein Lauf verbucht wurde.
+
+    Miele laesst den Smart-Status nach einem fertigen Programm auf `on` stehen,
+    solange die Maschine offen ist. Ohne diese Pruefung liest on_demand das
+    dauerhaft als „Auftrag offen" und plant immer weiter — die Start-Automation
+    laeuft dann gegen ein fertiges Geraet und scheitert (30.08.: 56 Fehlerzeilen
+    am Geschirrspueler). Anker ist `trigger_on_utc` (gesetzt beim echten off→on);
+    ein danach verbuchter Lauf verbraucht das Ereignis. Erst das naechste off→on
+    macht wieder auf — das entspricht einem neuen Beladen.
+    """
+    anchor = plan.get("trigger_on_utc")
+    if not anchor:
+        return False
+    anchor_dt = dt_util.parse_datetime(str(anchor))
+    if anchor_dt is None:
+        return False
+    learning = store.get_consumer_learning(str(slot)) or {}
+    last_run = learning.get("last_run_end_utc")
+    if not last_run:
+        return False
+    run_dt = dt_util.parse_datetime(str(last_run))
+    return run_dt is not None and run_dt >= anchor_dt
 
 
 def _get_consumers(entry: ConfigEntry) -> dict[str, Any]:
@@ -386,6 +415,7 @@ async def _plan_run(
 
     # Clear bumped plans from a working copy
     new_plans = dict(store.consumer_plans or {})
+    prev_plans = dict(new_plans)   # fuer trigger_on_utc: Anker der nicht-getriggerten Slots erhalten
     for s in to_bump:
         new_plans.pop(s, None)
         new_plans.pop(int(s) if s.isdigit() else s, None)
@@ -484,6 +514,16 @@ async def _plan_run(
             "run_order": int(c.get("run_order") or 0),
             "slot_count": max(1, c_duration // SLOT_MINUTES),
         }
+        # Trigger-Ereignis: fuer den Slot, dessen Trigger gerade off→on ging, beginnt
+        # ein neues; die anderen werden nur mitgeplant und behalten ihren Anker.
+        prev = prev_plans.get(str(s)) or prev_plans.get(s) or {}
+        if str(s) == str(slot):
+            plan["trigger_on_utc"] = dt_util.utcnow().isoformat()
+            plan["opportunistic_advances"] = 0
+        else:
+            if prev.get("trigger_on_utc"):
+                plan["trigger_on_utc"] = prev["trigger_on_utc"]
+            plan["opportunistic_advances"] = int(prev.get("opportunistic_advances") or 0)
         new_plans[str(s)] = plan
         src_lbl = {"pv": "PV", "battery": "Akku", "grid": "Netz", "mixed": "gemischt"}[plan["energy_source"]]
         kind = "PV" if grid_cost < 0.001 else f"{src_lbl}, {grid_cost*100:.1f} Rp"
@@ -583,6 +623,11 @@ async def _create_or_advance_plan(
     new_plan["slot_count"] = max(1, duration_min // SLOT_MINUTES)
     new_plan["expected_energy_kwh"] = round(power_kw * (duration_min / 60.0), 3)
     new_plan["opportunistic_now"] = True
+    # Fehlt der Anker (Trigger stand schon vor dem Start von HA auf on), hier setzen —
+    # sonst haette das Ereignis keine Bezugszeit und koennte nie verbraucht werden.
+    new_plan.setdefault("trigger_on_utc", dt_util.utcnow().isoformat())
+    new_plan["opportunistic_advances"] = int(existing.get("opportunistic_advances") or 0) + 1
+    new_plan.pop("opportunistic_capped", None)
     if original_cs:
         new_plan["original_chosen_start"] = original_cs
 
@@ -683,8 +728,31 @@ def async_setup_on_demand(
             if power_kw <= 0:
                 surplus_stable_since.pop(slot, None)
                 continue
-            # Skip wenn Plan-Window aktuell läuft (start <= now < end)
             plan = plans.get(str(slot)) or plans.get(slot) or {}
+            # Trigger-Ereignis bereits durch einen Lauf verbraucht? Dann steht der
+            # Smart-Status nur noch an, weil die Maschine offen ist.
+            if _episode_consumed(store, slot, plan):
+                surplus_stable_since.pop(slot, None)
+                continue
+            advances = int(plan.get("opportunistic_advances") or 0)
+            if advances >= MAX_OPPORTUNISTIC_ADVANCES:
+                if not plan.get("opportunistic_capped"):
+                    _LOGGER.warning(
+                        "on_demand slot %s: %dx vorgezogen ohne verbuchten Lauf — "
+                        "opportunistic_now gestoppt bis zum naechsten off→on des Triggers",
+                        slot, advances,
+                    )
+                    plan["opportunistic_capped"] = True
+                    store.consumer_plans = {**plans, str(slot): plan}
+                    store.dirty = True
+                    store.log_activity(
+                        "🛑",
+                        f"{cfg.get('name') or f'Consumer {slot}'}: {advances}x vorgezogen, "
+                        "aber kein Lauf verbucht — warte auf neuen Trigger",
+                    )
+                surplus_stable_since.pop(slot, None)
+                continue
+            # Skip wenn Plan-Window aktuell läuft (start <= now < end)
             cs = plan.get("chosen_start")
             ce = plan.get("chosen_end")
             if cs and ce:
