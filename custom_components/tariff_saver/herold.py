@@ -20,11 +20,6 @@ QUELLE = "custom_components.tariff_saver"
 # im Herold-UI. default_severity ist nur Fallback, der Producer setzt sie i.d.R.
 # explizit beim senden().
 TOPICS: dict[str, dict[str, Any]] = {
-    "tariff_saver/boiler/hygiene_ueberfaellig": {
-        "name": "Boiler Hygiene überfällig",
-        "beschreibung": "Consumer-10-Zyklus (Legionellen-Schutz) konnte nicht im Plan-Fenster laufen und ist überfällig.",
-        "default_severity": "warnung",
-    },
     "tariff_saver/boiler/uebertemperatur": {
         "name": "Boiler Übertemperatur",
         "beschreibung": "Boiler über Soll — Watchdog meldet hängende Hygiene-Freigabe oder Defekt.",
@@ -71,8 +66,8 @@ TOPICS: dict[str, dict[str, Any]] = {
         "default_severity": "warnung",
     },
     "tariff_saver/hygiene_overdue": {
-        "name": "Hygiene-Consumer überfällig",
-        "beschreibung": "Ein Daily-Hygiene-Consumer (z.B. Boiler) ist überfällig und es existiert kein gültiger Plan für heute/morgen.",
+        "name": "Consumer überfällig",
+        "beschreibung": "Ein intervallgesteuerter Consumer (Boiler daily, Boiler-Hygiene, …) ist über sein max_days hinaus und hat keinen gültigen Plan für heute/morgen.",
         "default_severity": "warnung",
     },
     "tariff_saver/standby_off": {

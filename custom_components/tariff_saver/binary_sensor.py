@@ -411,13 +411,18 @@ class TariffSaverHygieneOverdueBinarySensor(CoordinatorEntity[TariffSaverCoordin
     async def _on_overdue(self, overdue: list[str]) -> None:
         store = getattr(self.coordinator, "store", None)
         if store:
-            store.log_activity("⚠️", f"Hygiene überfällig: {', '.join(overdue)}")
+            store.log_activity("⚠️", f"Consumer überfällig: {', '.join(overdue)}")
+        # Der Titel nennt die Namen: der Watchdog deckt ALLE intervallgesteuerten
+        # Consumer ab, nicht nur die Boiler-Hygiene. Der alte Titel
+        # "Hygiene-Consumer überfällig" liess eine Meldung über "Boiler daily"
+        # wie einen Hygiene-Ausfall aussehen (26.08.).
+        names = ", ".join(overdue[:2]) + (f" +{len(overdue) - 2}" if len(overdue) > 2 else "")
         try:
             from . import herold as _herold
             await _herold.senden(
                 self.hass,
                 topic="tariff_saver/hygiene_overdue",
-                titel="Hygiene-Consumer überfällig",
+                titel=f"Consumer überfällig: {names}",
                 message=(
                     f"Diese Consumer sind überfällig und haben keinen gültigen Plan "
                     f"für heute/morgen: {', '.join(overdue)}"

@@ -23,9 +23,14 @@ Schutzmechanismen:
     (verhindert Flattern bei "alle gleichzeitig", wenn Gerätelast > Überschuss).
   - Nur eigene Geräte: das Modul schaltet nur Geräte AUS, die es selbst
     eingeschaltet hat. Ein manuell eingeschaltetes Gerät wird nie ausgeknipst.
+    Aus `managed` entlassen wird ein Gerät nur, wenn es explizit `off` meldet —
+    `unavailable` oder eine noch nicht geladene Entity zählen NICHT als aus.
+  - Abschalten mit Quittung: `managed` wird erst geleert, wenn die Geräte
+    bestätigt aus sind; sonst schaltet `_settle_off` auf den Folgeticks nach.
 
 Persistierter State (store.pv_dump_state):
-  {"active": bool, "on_since_iso": str|None, "managed": {entity_id: on_ts_iso}}
+  {"active": bool, "on_since_iso": str|None, "managed": {entity_id: on_ts_iso},
+   "off_attempts": int}
 """
 from __future__ import annotations
 
@@ -59,6 +64,7 @@ from .const import (
     DEFAULT_PV_DUMP_PAUSE_ON_VACATION,
     DEFAULT_PV_DUMP_PV_POWER_ENTITY,
     PV_DUMP_LABEL,
+    PV_DUMP_OFF_MAX_ATTEMPTS,
     PV_DUMP_PV_ZERO_WATTS,
     PV_DUMP_TICK_SECONDS,
 )
@@ -105,6 +111,20 @@ def discover_entities(hass: HomeAssistant) -> list[str]:
 def _is_on(hass: HomeAssistant, entity_id: str) -> bool:
     st = hass.states.get(entity_id)
     return bool(st and st.state == "on")
+
+
+def _is_off(hass: HomeAssistant, entity_id: str) -> bool:
+    """True nur bei explizitem `off`.
+
+    `unavailable`, `unknown` und eine noch gar nicht angelegte Entity (direkt
+    nach einem HA-Restart, bevor die Shelly-Integration soweit ist) sind
+    KEIN Aus — sie sagen nur, dass wir es gerade nicht wissen. Das
+    auseinanderzuhalten ist der ganze Punkt: „kein Signal" als „der User hat
+    ausgeschaltet" zu lesen hat Geräte aus `managed` geworfen und damit
+    dauerhaft anbleiben lassen.
+    """
+    st = hass.states.get(entity_id)
+    return bool(st and st.state == "off")
 
 
 class PvDumpManager:
@@ -192,13 +212,56 @@ class PvDumpManager:
         return managed
 
     async def _turn_off_managed(self, managed: dict[str, str]) -> int:
-        """Turn off only devices WE turned on that are still on. Return count."""
-        to_switch = [eid for eid in managed if _is_on(self.hass, eid)]
+        """Turn off devices WE turned on. Return count of commanded entities.
+
+        Angesprochen wird alles, was nicht explizit `off` ist — ein
+        `unavailable`-Blip im Moment des Abschaltens darf kein Gerät
+        überspringen. `managed` bleibt stehen; erst `_settle_off` entlässt ein
+        Gerät, das bestätigt aus ist.
+        """
+        to_switch = [eid for eid in managed if not _is_off(self.hass, eid)]
         if to_switch:
             await self.hass.services.async_call(
                 "homeassistant", "turn_off", {"entity_id": to_switch}, blocking=False,
             )
         return len(to_switch)
+
+    async def _settle_off(self, state: dict[str, Any], managed: dict[str, str]) -> dict[str, str]:
+        """Abschaltversuch quittieren: bestätigt aus → raus, Rest nachschalten.
+
+        Läuft auf den Ticks NACH einem Abschaltbefehl. Geräte, die inzwischen
+        `off` melden, verlassen `managed` (Zuständigkeit beendet). Alles andere
+        bekommt erneut `turn_off`, bis `PV_DUMP_OFF_MAX_ATTEMPTS` erreicht ist —
+        dann aufgeben und melden, statt still im Kreis zu laufen.
+        """
+        remaining = {eid: ts for eid, ts in managed.items() if not _is_off(self.hass, eid)}
+        prev_attempts = int(state.get("off_attempts") or 0)
+        attempts = prev_attempts
+        if remaining:
+            attempts += 1
+            if attempts > PV_DUMP_OFF_MAX_ATTEMPTS:
+                _LOGGER.warning(
+                    "pv_dump: %s liess sich in %d Versuchen nicht ausschalten — aufgegeben",
+                    ", ".join(sorted(remaining)), PV_DUMP_OFF_MAX_ATTEMPTS,
+                )
+                self._log(
+                    "🛑",
+                    f"PV-Überschuss: {len(remaining)} Gerät(e) liessen sich nicht "
+                    f"ausschalten — aufgegeben",
+                )
+                remaining = {}
+                attempts = 0
+            else:
+                await self.hass.services.async_call(
+                    "homeassistant", "turn_off", {"entity_id": list(remaining)}, blocking=False,
+                )
+        else:
+            attempts = 0
+        if remaining != managed or attempts != prev_attempts:
+            state["managed"] = remaining
+            state["off_attempts"] = attempts
+            self._save_state()
+        return remaining
 
     # ---------- core tick ----------
 
@@ -216,8 +279,12 @@ class PvDumpManager:
                     self._log("🏖️", f"PV-Überschuss: Ferienmodus — {n} Gerät(e) aus")
                 else:
                     self._log("🛑", f"PV-Überschuss deaktiviert — {n} Gerät(e) aus")
-                state.update({"active": False, "on_since_iso": None, "managed": {}})
+                state.update({"active": False, "on_since_iso": None, "off_attempts": 1})
                 self._save_state()
+            elif managed:
+                # Reste aus einem früheren Abschaltversuch auch im deaktivierten
+                # Zustand nachziehen — sonst bliebe ein Gerät ewig hängen.
+                await self._settle_off(state, managed)
             self._above_since = None
             self._below_since = None
             return
@@ -232,10 +299,10 @@ class PvDumpManager:
         entities = discover_entities(self.hass)
 
         if not active:
-            # Prune managed falls alt (sollte leer sein) — Konsistenz
+            # Reste eines Abschaltversuchs quittieren/nachschalten. Erst wenn ein
+            # Gerät bestätigt aus ist, endet unsere Zuständigkeit.
             if managed:
-                state["managed"] = {}
-                self._save_state()
+                managed = await self._settle_off(state, managed)
             self._below_since = None
             on_watts = self._on_watts()
             if grid_out is not None and grid_out >= on_watts:
@@ -245,33 +312,37 @@ class PvDumpManager:
                     # EINSCHALTEN
                     if not entities:
                         return  # nichts getaggt
-                    new_managed = await self._turn_on_all(entities)
+                    switched_on = await self._turn_on_all(entities)
                     self._above_since = None
-                    if new_managed:
-                        state.update({
-                            "active": True,
-                            "on_since_iso": now.isoformat(),
-                            "managed": new_managed,
-                        })
-                        self._save_state()
+                    # Noch nicht bestätigt ausgeschaltete Geräte bleiben unsere —
+                    # `_turn_on_all` überspringt sie (schon `on`) und würde sie
+                    # sonst aus `managed` fallen lassen.
+                    new_managed = {**managed, **switched_on}
+                    state.update({
+                        "active": True,
+                        "on_since_iso": now.isoformat(),
+                        "managed": new_managed,
+                        "off_attempts": 0,
+                    })
+                    self._save_state()
+                    if switched_on:
                         self._log(
                             "☀️",
                             f"PV-Überschuss: {grid_out/1000:.1f} kW ins Netz → "
-                            f"{len(new_managed)} Gerät(e) ein",
+                            f"{len(switched_on)} Gerät(e) ein",
                         )
-                    else:
-                        # Alle getaggten Geräte waren schon an (User) → als aktiv markieren
-                        # ohne managed, damit wir sie nicht ausschalten.
-                        state.update({"active": True, "on_since_iso": now.isoformat(), "managed": {}})
-                        self._save_state()
+                    # Sonst waren alle getaggten Geräte schon an (User) → aktiv
+                    # markieren, aber nicht übernehmen (managed bleibt wie es war).
             else:
                 self._above_since = None
             return
 
         # active == True
         self._above_since = None
-        # Manuell ausgeschaltete Geräte aus managed entfernen (nicht wieder anfassen)
-        pruned = {eid: ts for eid, ts in managed.items() if _is_on(self.hass, eid)}
+        # Manuell ausgeschaltete Geräte aus managed entfernen (nicht wieder anfassen).
+        # NUR bei explizitem `off` — `unavailable`/noch nicht geladen heisst nicht
+        # "der User hat ausgeschaltet", sondern "gerade unbekannt" (siehe `_is_off`).
+        pruned = {eid: ts for eid, ts in managed.items() if not _is_off(self.hass, eid)}
         if pruned != managed:
             managed = pruned
             state["managed"] = managed
@@ -298,7 +369,10 @@ class PvDumpManager:
                 # AUSSCHALTEN (nur eigene Geräte)
                 n = await self._turn_off_managed(managed)
                 self._below_since = None
-                state.update({"active": False, "on_since_iso": None, "managed": {}})
+                # `managed` bleibt stehen: die nächsten Ticks quittieren das Aus
+                # (`_settle_off`) und schalten nach, falls ein Gerät den Befehl
+                # nicht mitbekommen hat.
+                state.update({"active": False, "on_since_iso": None, "off_attempts": 1})
                 self._save_state()
                 if grid_in_off:
                     reason = f"{grid_in/1000:.1f} kW Netzbezug"

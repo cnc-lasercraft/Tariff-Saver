@@ -195,6 +195,9 @@ PV_DUMP_PV_ZERO_WATTS = 50  # PV-Produktion darunter (für Dwell) gilt als "aus"
                             # Abends deckt der Hausakku die Last → grid_in erreicht off_watts nie.
 PV_DUMP_LABEL = "pv_ueberschuss"
 PV_DUMP_TICK_SECONDS = 30
+# So viele Ticks lang wird ein Gerät nachgeschaltet, das beim Ausschalten nicht
+# bestätigt aus war (z.B. `unavailable`-Blip). Danach: WARNING + aufgeben.
+PV_DUMP_OFF_MAX_ATTEMPTS = 10
 
 # Standby-Wächter (seit 2026-08-19)
 # Switches mit Label STANDBY_WATCH_LABEL werden überwacht: Gerät ist an, zieht
