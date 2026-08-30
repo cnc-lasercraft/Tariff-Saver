@@ -1,19 +1,4 @@
 {
-  "step": {
-    "init": {
-      "title": "Tariff Saver options",
-      "data": {
-        "consumption_energy_entity": "Consumption energy entity",
-        "ekz_entry_id": "EKZ entry ID",
-        "pv_forecast_entity": "PV forecast entity",
-        "pv_forecast_attribute": "PV forecast attribute",
-        "feed_in_price_mode": "Feed-in price mode",
-        "feed_in_fixed_price": "Feed-in fixed price (CHF/kWh)",
-        "feed_in_price_entity": "Feed-in price entity",
-        "publish_time": "Publish time"
-      }
-    }
-  },
   "config": {
     "step": {
       "user": {
