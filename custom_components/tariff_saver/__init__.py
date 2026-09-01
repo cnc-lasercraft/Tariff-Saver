@@ -403,6 +403,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as _err:
             _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "async_save", _err)
 
+    def _rolling_target_date() -> str | None:
+        """Zieltag für die Re-Plan-Trigger: der geplante Tag, aber nie einer in der Vergangenheit.
+
+        `plans_tariff_date` wird nur beim EKZ-Event bzw. bei der Invalidierung
+        fortgeschrieben — einen Mitternachts-Rollover gibt es nicht. Bleibt EKZ aus,
+        stünde der Wert weiter auf gestern, und die Ticks wuerden einen vergangenen
+        Tag neu planen, dessen Slots noch im Store liegen. Der `no slots`-Zweig griffe
+        nie, `error_no_data` würde nie gesetzt, und der PV-Notlauf schärfte genau an
+        dem Tag nicht, für den er gebaut ist. Belegt am 01.09.2026: EKZ lieferte
+        8/96 Slots für den 01.09., die Pläne standen den ganzen Morgen auf dem 31.08.
+        """
+        if coordinator.store is None:
+            return None
+        today = dt_util.now().date()
+        stored = coordinator.store.plans_tariff_date
+        stored_dt = dt_util.parse_date(stored) if stored else None
+        if stored_dt is None or stored_dt < today:
+            return today.isoformat()
+        return stored_dt.isoformat()
+
     async def _invalidate_plans_no_data(target_dt, reason: str) -> None:
         """Markiere alle bestehenden Consumer-Pläne als 'error_no_data'.
 
@@ -437,11 +457,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             coordinator.async_set_updated_data(updated_data)
         except Exception as _err:
             _LOGGER.debug("silent %s in invalidate updated_data: %s", type(_err).__name__, _err)
-        coordinator.store.log_activity(
-            "⚠️", f"Keine Tarif-Daten für {target_dt.strftime('%d.%m.%Y')} — Pläne invalidiert ({reason})"
-        )
-        # Push only on ok→error transition to avoid spam (e.g. timer_15min ticks)
+        # Activity-Log UND Push nur beim ok→error-Übergang: der 15-Min-Tick läuft an
+        # einem No-Data-Tag sonst dauerhaft hier durch und spült das Log (Cap 30) leer.
         if had_valid:
+            coordinator.store.log_activity(
+                "⚠️", f"Keine Tarif-Daten für {target_dt.strftime('%d.%m.%Y')} — Pläne invalidiert ({reason})"
+            )
             try:
                 from . import herold as _herold
                 await _herold.senden(
@@ -671,9 +692,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Nur an Slot-Grenzen (0/15/30/45). async_track_time_change mit */15 feuert exakt dort.
         if coordinator.store is None:
             return
-        target_date = coordinator.store.plans_tariff_date
+        target_date = _rolling_target_date()
         if not target_date:
-            target_date = (dt_util.now() + timedelta(days=1)).date().isoformat()
+            return
         try:
             from .abort import evaluate_aborts
             aborted = evaluate_aborts(hass, coordinator.entry, coordinator)
@@ -712,7 +733,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _soc_last_seen["soc"] = new_soc
         if coordinator.store is None:
             return
-        target_date = coordinator.store.plans_tariff_date
+        target_date = _rolling_target_date()
         if not target_date:
             return
         hass.async_create_task(_compute_and_persist_plans(
@@ -727,7 +748,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("PV-Forecast update fehlgeschlagen: %s", err)
         if coordinator.store is None:
             return
-        target_date = coordinator.store.plans_tariff_date
+        target_date = _rolling_target_date()
         if not target_date:
             return
         try:
@@ -793,7 +814,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     store.log_activity("🏖️", "Ferienmodus aktiv — markierte Consumer & Dump-Loads pausiert")
                 else:
                     store.log_activity("🏠", "Ferienmodus beendet — Normalbetrieb")
-            target_date = store.plans_tariff_date if store is not None else None
+            target_date = _rolling_target_date()
             if not target_date:
                 return
             hass.async_create_task(_compute_and_persist_plans(
@@ -810,9 +831,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """tariff_saver.replan: manueller Re-Plan (ohne Hysterese — User will Update jetzt)."""
         if coordinator.store is None:
             return
-        target_date = call.data.get("date") or coordinator.store.plans_tariff_date
+        target_date = call.data.get("date") or _rolling_target_date()
         if not target_date:
-            target_date = (dt_util.now() + timedelta(days=1)).date().isoformat()
+            target_date = dt_util.now().date().isoformat()
         await _compute_and_persist_plans(target_date=str(target_date), reason="manual", hysteresis=False)
 
     if not hass.services.has_service(DOMAIN, "replan"):
