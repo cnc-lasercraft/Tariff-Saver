@@ -60,6 +60,12 @@ TOPICS: dict[str, dict[str, Any]] = {
         "beschreibung": "Ein Raumlicht brennt länger als erlaubt. Push mit Schnoozen oder Auto-Off nach Timeout.",
         "default_severity": "info",
     },
+    "tariff_saver/light_auto_off/vollzug": {
+        "name": "Licht-Wächter: ausgeschaltet",
+        "beschreibung": "Vollzugsmeldung nach dem Auto-Off. Bewusst log_only: der Push ist die Vorwarnung 'Licht brennt noch' mit den Snooze-Buttons; das Ausschalten selbst braucht keine zweite Notification (User 09.09.2026). Bleibt in History und Log-View sichtbar.",
+        "default_severity": "info",
+        "log_only": True,
+    },
     "tariff_saver/plan_no_data": {
         "name": "Keine Tarif-Daten — Pläne invalidiert",
         "beschreibung": "EKZ hat keine validen Slots für den Plan-Zieltag geliefert. Alle Consumer-Pläne wurden auf 'error_no_data' gesetzt.",

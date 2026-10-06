@@ -16,7 +16,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import CONSUMER_COUNT, CONF_CONSUMERS, DOMAIN, SLOT_MINUTES, SLOTS_PER_HOUR, SLOTS_PER_DAY
+from .const import CONSUMER_COUNT, CONF_CONSUMERS, DOMAIN, SLOT_MINUTES, SLOTS_PER_HOUR, SLOTS_PER_DAY, SLOT_HOUR_FRACTION
 from .coordinator import PriceSlot, TariffSaverCoordinator, _slot_total_price
 from .models import ConsumerConfig
 from .consumer_helpers import build_consumer_plan, effective_energy_kwh, get_consumer_config
@@ -1164,7 +1164,8 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
         now_utc = dt_util.utcnow()
         now_local = dt_util.as_local(now_utc)
         result = {
-            "base_load_kwh": 0.0, "heating_kwh": 0.0, "consumer_kwh": 0.0,
+            "base_load_kwh": 0.0, "base_load_gross_kwh": 0.0, "pv_ramp_kwh": 0.0,
+            "heating_kwh": 0.0, "consumer_kwh": 0.0,
             "total_kwh": 0.0, "pv_start_time": None, "slots_until_pv": 0,
             "heating_slots": 0, "available_kwh": 0.0, "missing_kwh": 0.0,
             "recommended_target_soc": 0,
@@ -1184,9 +1185,12 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
             if tomorrow_entity != pv_entity:
                 forecast_entities.append(tomorrow_entity)
 
+        # Alle Prognose-Punkte sammeln (heute + morgen) — sie liefern den PV-Start
+        # UND den PV-Anlauf davor, der die Grundlast schon teilweise deckt.
+        pv_points: list[tuple[datetime, float]] = []
         for fc_entity in forecast_entities:
-            if not fc_entity or pv_start_utc is not None:
-                break
+            if not fc_entity:
+                continue
             state = self.hass.states.get(fc_entity)
             if not state:
                 continue
@@ -1198,14 +1202,30 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
                     continue
                 period = slot.get("period_start")
                 pv_est = slot.get("pv_estimate", 0)
-                if period and isinstance(pv_est, (int, float)) and pv_est >= pv_threshold:
-                    try:
-                        slot_dt = dt_util.parse_datetime(str(period))
-                        if slot_dt and slot_dt > now_utc:
-                            pv_start_utc = slot_dt
-                            break
-                    except Exception as _err:
-                        _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "break", _err)
+                if not period or not isinstance(pv_est, (int, float)):
+                    continue
+                try:
+                    slot_dt = dt_util.parse_datetime(str(period))
+                except Exception as _err:
+                    _LOGGER.debug("silent %s in %s: %s", type(_err).__name__, "pv_points", _err)
+                    continue
+                if slot_dt:
+                    pv_points.append((dt_util.as_utc(slot_dt), float(pv_est)))
+        pv_points.sort(key=lambda p: p[0])
+
+        for slot_dt, pv_est in pv_points:
+            if pv_est >= pv_threshold and slot_dt > now_utc:
+                pv_start_utc = slot_dt
+                break
+
+        def _pv_kw_at(when_utc: datetime) -> float:
+            """Prognostizierte PV-Leistung der Periode, in der when_utc liegt."""
+            found = 0.0
+            for start, kw in pv_points:
+                if start > when_utc:
+                    break
+                found = kw if when_utc - start < timedelta(hours=1) else 0.0
+            return found
 
         if pv_start_utc is None:
             # No PV in any forecast — use noon tomorrow as fallback
@@ -1231,11 +1251,26 @@ class EnergyUntilPvSensor(CoordinatorEntity[TariffSaverCoordinator], SensorEntit
         profile = store.get_seasonal_load_profile(current_season) if store else {}
         # Fallback per slot = 0.3 kWh war Default für 30-min Slots → bei 15-min entsprechend halbiert
         fallback_per_slot = 0.3 / (SLOTS_PER_HOUR / 2)  # 0.15 bei 15-min
+        # Netto: pro Slot nur, was die PV-Prognose von der Grundlast nicht deckt.
+        # Vorher zählte die volle Grundlast bis zum PV-Start — der Anlauf unter der
+        # Schwelle (morgens rund 1 kWh) fehlte, die Akku-Lücke war zu gross.
         base_load_kwh = 0.0
+        base_load_gross_kwh = 0.0
         for i in range(now_idx, now_idx + slots_until_pv):
             idx = i % SLOTS_PER_DAY
-            base_load_kwh += float(profile.get(idx, fallback_per_slot))
+            slot_load = float(profile.get(idx, fallback_per_slot))
+            slot_start_local = now_local.replace(
+                hour=idx // SLOTS_PER_HOUR, minute=(idx % SLOTS_PER_HOUR) * SLOT_MINUTES,
+                second=0, microsecond=0,
+            )
+            if i >= SLOTS_PER_DAY:
+                slot_start_local += timedelta(days=1)
+            slot_pv = _pv_kw_at(dt_util.as_utc(slot_start_local)) * SLOT_HOUR_FRACTION
+            base_load_gross_kwh += slot_load
+            base_load_kwh += max(0.0, slot_load - slot_pv)
         result["base_load_kwh"] = round(base_load_kwh, 1)
+        result["base_load_gross_kwh"] = round(base_load_gross_kwh, 1)
+        result["pv_ramp_kwh"] = round(base_load_gross_kwh - base_load_kwh, 1)
 
         # --- Heating (WP) consumption based on score per slot ---
         heating_kwh = 0.0

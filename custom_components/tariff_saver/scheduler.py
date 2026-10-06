@@ -28,6 +28,16 @@ _LOGGER = logging.getLogger(__name__)
 # Maximum combinations before falling back to greedy
 _MAX_COMBINATIONS = 500_000
 
+# Karenz für die Past-Slot-Sperre. Der Re-Plan-Timer feuert `second=5` nach der
+# Slot-Grenze; ohne Karenz gilt der gerade begonnene Slot dann schon als Vergangenheit
+# und der frühestmögliche Start rutscht eine Viertelstunde nach hinten. Für gepinnte
+# Consumer fällt das nicht auf, für den Akku-Lader (vom Pin ausgenommen) schon: er
+# verlor nach jedem abgelaufenen Fenster die unmittelbar folgende Viertelstunde und lud
+# im Takt 15 min ein / 15 min aus (Nacht 10.09.2026, ~5 Rappen + 3 zusätzliche
+# Forcible-Charge-Zyklen). 90 s decken den Tick ab, ein Start zehn Minuten in den Slot
+# hinein bleibt ausgeschlossen.
+_START_GRACE = timedelta(seconds=90)
+
 # Battery-Assessment-Log: das Assessment läuft bei jedem Re-Plan (15 min, 2x pro Plan)
 # und lieferte damit ~220 identische INFO-Zeilen/Tag. Auf INFO kommt nur noch der
 # Zustandswechsel; der Heartbeat sorgt dafür, dass der aktuelle Stand auch nach
@@ -475,10 +485,15 @@ def optimize_consumer_plans(
     slots = sorted(active_slots, key=lambda s: s.start)
     num_slots = len(slots)
 
-    # Past-slot exclusion: never plan a start into the past
+    # Past-slot exclusion: never plan a start into the past.
+    # Mit _START_GRACE, damit der gerade begonnene Slot beim :05-Re-Plan-Tick noch
+    # wählbar bleibt (siehe Kommentar bei _START_GRACE).
     now_local = dt_util.now()
     now_utc = dt_util.utcnow()
-    past_indices = {i for i, s in enumerate(slots) if dt_util.as_local(s.start) < now_local}
+    past_indices = {
+        i for i, s in enumerate(slots)
+        if dt_util.as_local(s.start) < now_local - _START_GRACE
+    }
 
     # Pin: Consumer die JETZT laufen (persistierter Plan, chosen_start ≤ now < chosen_end)
     # werden nicht neu geplant — ihr Original-Fenster wird unverändert weitergetragen.

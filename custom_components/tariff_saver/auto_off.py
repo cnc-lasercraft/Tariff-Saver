@@ -256,7 +256,7 @@ class LightAutoOff:
             _herold.HEROLD_DOMAIN,
             "senden",
             {
-                "topic": "tariff_saver/light_auto_off",
+                "topic": "tariff_saver/light_auto_off/vollzug",
                 "titel": "Licht-Wächter",
                 "message": f"{friendly} nach Timeout automatisch ausgeschaltet.",
                 "severity": "info",
