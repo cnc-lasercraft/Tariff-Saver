@@ -116,6 +116,16 @@ DEFAULT_HEATING_FROST_MIN = 16.0
 CONF_STROM_SPAREN_SCORE = "strom_sparen_score"
 DEFAULT_STROM_SPAREN_SCORE = 60
 
+# Restore-Sperre (seit 2026-10-10)
+# Solange die Sperr-Entity einen der konfigurierten States hat (z.B.
+# input_select.system_status = "Gute Nacht" / "Abwesend"), schaltet der
+# Snapshot-Restore am Ende einer Strom-Sparen-Phase nichts EIN — sonst hebt er
+# eine Abschaltung auf, die waehrend der Phase angeordnet wurde (das turn_off
+# von "Gute Nacht" laeuft auf ein bereits ausgeschaltetes Geraet ins Leere).
+# Ausschalten laut Snapshot bleibt erlaubt. Leere Entity = Funktion aus.
+CONF_STROM_SPAREN_RESTORE_BLOCK_ENTITY = "strom_sparen_restore_block_entity"
+CONF_STROM_SPAREN_RESTORE_BLOCK_STATES = "strom_sparen_restore_block_states"
+
 # Baseline tariff per season (netto CHF/kWh, without VAT)
 CONF_BASELINE_WINTER = "baseline_winter"
 CONF_BASELINE_FRUEHLING = "baseline_fruehling"

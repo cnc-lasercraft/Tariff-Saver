@@ -174,6 +174,8 @@ class TariffSaverSettingsCard extends HTMLElement {
           { key: 'ampel_score_bad', label: 'Score Grenze teuer', type: 'number', min: 0, max: 100, step: 5, hint: 'Darüber = rot' },
           { key: 'ampel_battery_margin_kwh', label: 'Akku Sicherheitsmarge (kWh)', type: 'number', min: 0, max: 20, step: 0.5, hint: 'Reserve für Waschmaschine etc. bei grün (Standard: 5 kWh)' },
           { key: 'strom_sparen_score', label: 'Strom sparen ab Score', type: 'number', min: 0, max: 100, step: 5, hint: 'Über diesem Score: binary_sensor.tariff_saver_strom_sparen = on → nicht-essentielle Geräte abschalten' },
+          { key: 'strom_sparen_restore_block_entity', label: 'Restore-Sperre: Entity', type: 'text', hint: 'z.B. input_select.system_status. Solange sie einen der States unten hat, schaltet der Restore am Ende einer Strom-sparen-Phase nichts ein. Leer = Funktion aus.' },
+          { key: 'strom_sparen_restore_block_states', label: 'Restore-Sperre: States', type: 'text', hint: 'Kommagetrennt, z.B. "Gute Nacht, Abwesend"' },
         ]
       },
       {

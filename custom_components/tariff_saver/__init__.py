@@ -1236,6 +1236,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(DOMAIN, "strom_sparen_apply", _strom_sparen_apply)
 
+    def _restore_turn_on_block_state() -> str | None:
+        """State der Sperr-Entity, falls er das Einschalten beim Restore sperrt."""
+        from .const import (
+            CONF_STROM_SPAREN_RESTORE_BLOCK_ENTITY,
+            CONF_STROM_SPAREN_RESTORE_BLOCK_STATES,
+        )
+        src = entry.options if entry.options else entry.data
+        block_entity = str(src.get(CONF_STROM_SPAREN_RESTORE_BLOCK_ENTITY, "") or "").strip()
+        if not block_entity:
+            return None
+        block_states = {
+            s.strip()
+            for s in str(src.get(CONF_STROM_SPAREN_RESTORE_BLOCK_STATES, "") or "").split(",")
+            if s.strip()
+        }
+        st = hass.states.get(block_entity)
+        if st is None or st.state not in block_states:
+            return None
+        return st.state
+
     async def _restore_strom_sparen_snapshot(call: ServiceCall) -> None:
         """Restore device states from persistent storage."""
         store = getattr(coordinator, "store", None)
@@ -1243,10 +1263,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("No strom_sparen_snapshot to restore")
             return
         snapshot = store.strom_sparen_snapshot
+        block_state = _restore_turn_on_block_state()
         restored = 0
+        skipped: list[str] = []
         for entity_id in _get_snapshot_entities():
             saved_state = snapshot.get(entity_id)
             if saved_state is None:
+                continue
+            if block_state is not None and saved_state != "off":
+                skipped.append(entity_id)
                 continue
             attrs = snapshot.get(entity_id + "_attrs", {})
             try:
@@ -1272,8 +1297,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 restored += 1
             except Exception as err:
                 _LOGGER.error("Failed to restore %s: %s", entity_id, err)
-        store.log_activity("♻️", f"Strom-Sparen Snapshot restored ({restored} Geräte)")
-        _LOGGER.info("Strom-Sparen snapshot restored: %d devices", restored)
+        if skipped:
+            store.log_activity(
+                "♻️",
+                f"Strom-Sparen Snapshot restored ({restored} Geräte, "
+                f"{len(skipped)} nicht eingeschaltet — Status «{block_state}»)",
+            )
+            _LOGGER.info(
+                "Strom-Sparen snapshot restored: %d devices, turn-on blocked by state %r for %s",
+                restored, block_state, skipped,
+            )
+        else:
+            store.log_activity("♻️", f"Strom-Sparen Snapshot restored ({restored} Geräte)")
+            _LOGGER.info("Strom-Sparen snapshot restored: %d devices", restored)
 
     hass.services.async_register(DOMAIN, "restore_strom_sparen_snapshot", _restore_strom_sparen_snapshot)
 
